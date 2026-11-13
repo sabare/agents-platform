@@ -337,7 +337,7 @@ function renderSupervisor() {
     .filter((ev) => ev.payload.mentions?.includes("supervisor"))
     .slice(0, 8);
   $("#content").innerHTML =
-    `<div class="supervisor-grid"><div class="notice"><strong>Operator overview</strong> / The supervisor delegates approved records scope and reviews material outcomes. Human review requests remain unresolved until the objective is explicitly revised; comments are guidance, not approval.</div><section><div class="section-heading">Case progress <span>${cases.length} cases</span></div>${cases
+    `<div class="supervisor-grid"><div class="notice"><strong>Operator overview</strong> / The supervisor delegates approved records scope and reviews material outcomes. Client-report reviews can be decided on their task. Other review questions still need explicit operator guidance or objective revision; comments are not approval.</div><section><div class="section-heading">Case progress <span>${cases.length} cases</span></div>${cases
       .map((c) => {
         const total = Object.values(c.counts).reduce((a, b) => a + b, 0),
           done = c.counts.COMPLETED || 0,
@@ -354,6 +354,7 @@ function renderSupervisor() {
       )}</section><section><div class="section-heading">Needs review <span>Loaded tasks</span></div>${needs.length ? needs.map((t) => `<button class="attention-row" data-task="${e(t.id)}">${badge(t.status)}<span class="task-title">${e(t.objective)}</span><p>${e(t.progress.last_reason || t.progress.last_summary || "Review the latest execution and add guidance.")}</p>${taskSub(t)}</button>`).join("") : '<div class="attention-empty">No blockers in the loaded tasks.<br>Case totals above include all persisted tasks.</div>'}<div class="section-heading" style="margin-top:28px">Supervisor mentions <span>Recent activity</span></div>${mentions.length ? mentions.map(eventHTML).join("") : '<div class="attention-empty">Tag @supervisor in a comment to wake the configured case coordinator.</div>'}</section></div>`;
 }
 const eventTitles = {
+  "client.review_decided": "Teammate recorded a client-report decision",
   "case.objective_submitted": "Case objective submitted",
   "supervisor.review_completed": "Supervisor reviewed case",
   "supervisor.failed": "Supervisor needs recovery",
@@ -457,6 +458,7 @@ function renderDetail() {
   $("#detail-id").textContent = short(t.id);
   $("#detail-heading").innerHTML =
     `${badge(t.task_type === "case.coordination" ? state.overview.supervisors?.find((s) => s.group_task_id === t.id)?.status || t.status : t.status)}<h2>${e(t.objective)}</h2><dl class="detail-props"><dt>Task ID</dt><dd><code>${e(t.id)}</code></dd><dt>Assigned to</dt><dd>${agent(t)}</dd><dt>Case</dt><dd>${e(caseName(t))}</dd><dt>Part of</dt><dd>${e(group?.objective || "Standalone task")}</dd><dt>Next step</dt><dd>${e(reason || "Agent will assess the task.")}</dd>${outcome?.wake_at ? `<dt>Scheduled wake</dt><dd>${e(date(outcome.wake_at, true))}</dd>` : ""}<dt>Workflow</dt><dd><code>${e(t.workflow_id || state.overview.supervisors?.find((s) => s.group_task_id === t.id)?.workflow_id)}</code></dd></dl>${t.records_request ? `<div class="requirements">${t.records_request.requirements.map((r) => `<span>${e(statusName(r.record_type))} / ${r.all_dates ? "all dates" : `${e(r.from_date)} ${e(r.through_date)}`}</span>`).join("")}<span>${e(statusName(t.records_request.status))}</span></div>${!closed(t) ? '<button class="text-button" data-provider>Simulate provider response</button>' : ""}` : ""}`;
+  $("#detail-heading").insertAdjacentHTML("beforeend", clientReviewHTML(t));
   $$(".detail-tabs button").forEach((b) =>
     b.classList.toggle("selected", b.dataset.tab === state.tab),
   );
@@ -1002,7 +1004,7 @@ function supervisorPanel(c) {
   if (!supervisor)
     return `<div class="case-objective"><p>No case objective assigned.</p><button class="primary" data-objective="${e(c.id)}">Assign case objective</button></div>`;
   const plan = supervisor.plan || {};
-  return `<div class="case-objective">${badge(supervisor.status)}<h4>${e(supervisor.objective.objective)}</h4><p>${e(plan.summary || "Supervisor activation queued.")}</p>${(plan.actions || []).map((a) => `<p><button class="task-link" data-task="${e(a.task_id)}">${short(a.task_id)}</button> ${e(statusName(a.type))}</p>`).join("")}${(plan.client_updates || []).map((u) => `<div class="instructions"><strong>Client-reported update</strong><p>${e(u.message)}</p><p>${e(u.changes.reasons.join("; "))}</p><button class="task-link" data-task="${e(u.task_id)}">${short(u.task_id)} / inspect report</button></div>`).join("")}${(plan.reviews || []).map((r) => `<div class="review-question"><strong>Unresolved review</strong><p>${e(r.question)}</p></div>`).join("")}<div class="objective-actions"><button class="text-button" data-task="${e(supervisor.group_task_id)}">Decisions, context & guidance</button><button class="text-button" data-objective="${e(c.id)}">Replace objective</button></div></div>`;
+  return `<div class="case-objective">${badge(supervisor.status)}<h4>${e(supervisor.objective.objective)}</h4><p>${e(plan.summary || "Supervisor activation queued.")}</p>${(plan.actions || []).map((a) => `<p><button class="task-link" data-task="${e(a.task_id)}">${short(a.task_id)}</button> ${e(statusName(a.type))}</p>`).join("")}${(plan.client_updates || []).map((u) => `<div class="instructions"><strong>Client-reported update</strong><p>${e(u.message)}</p><p>${e(u.changes.reasons.join("; "))}</p><button class="task-link" data-task="${e(u.task_id)}">${short(u.task_id)} / inspect report</button></div>`).join("")}${(plan.client_review_outcomes || []).filter((r) => r.decision).map((r) => `<div class="instructions"><strong>Client review / ${e(statusName(r.decision))}</strong><p>${e(r.reason)}</p><p>${e(r.decided_by)} / Task ${e(statusName(r.task_status || "pending"))}</p><button class="task-link" data-task="${e(r.task_id)}">Open reviewed task</button></div>`).join("")}${(plan.reviews || []).map((r) => `<div class="review-question"><strong>Unresolved review</strong><p>${e(r.question)}</p>${r.task_id ? `<button class="task-link" data-task="${e(r.task_id)}">Review task</button>` : ""}</div>`).join("")}<div class="objective-actions"><button class="text-button" data-task="${e(supervisor.group_task_id)}">Decisions, context & guidance</button><button class="text-button" data-objective="${e(c.id)}">Replace objective</button></div></div>`;
 }
 const objectiveDialog = document.createElement("dialog");
 objectiveDialog.id = "objective-modal";
@@ -1111,4 +1113,53 @@ $("#objective-form").addEventListener("submit", async (event) => {
   } finally {
     button.disabled = false;
   }
+});
+
+
+function clientReviewHTML(task) {
+  const report = task.client_check_in?.report;
+  const review = report?.human_review;
+  if (!review) return "";
+  const draft = state.reviewDraft?.id === review.id ? state.reviewDraft : {reason:"", decision:"ALLOW_COMPLETION"};
+  const actionable = review.status === "OPEN" && task.status === "BLOCKED";
+  return `<section class="task-memory" aria-label="Client report review"><h3>Teammate review / ${e(statusName(review.status))}</h3>
+    <p><strong>${e(review.question)}</strong></p><blockquote>${e(report.report.message)}</blockquote>
+    <p class="inline-note">This decision concerns this client report only. Contact holds and open obligations remain enforced. No message will be sent by this form.</p>
+    ${report.review_stale ? `<p role="alert">The report changed after acknowledgement. This decision no longer permits completion; the report needs a new correction/review process.</p>` : ""}
+    ${review.reason ? `<p>Last decision: <strong>${e(statusName(review.decision))}</strong> / ${e(review.reason)}</p><small>${e(review.decided_by)} / ${e(date(review.decided_at,true))}</small>` : ""}
+    ${actionable ? `<form data-client-review="${e(review.id)}" data-task="${e(task.id)}" data-version="${task.version}" data-review-version="${review.version}">
+      <label>Decision<select name="decision"><option value="ALLOW_COMPLETION" ${draft.decision === "ALLOW_COMPLETION" ? "selected" : ""}>Allow completion / I have handled this report</option><option value="REQUEST_CHANGES" ${draft.decision === "REQUEST_CHANGES" ? "selected" : ""}>Request changes / give guidance and keep review open</option></select></label>
+      <label>Reason or instructions<textarea name="reason" required maxlength="2000" rows="3" placeholder="Record what you reviewed, handled, or need the agent to change">${e(draft.reason)}</textarea></label>
+      <p class="inline-note">Recorded under the authenticated local operator credential. Requesting changes wakes the agent once; completion still needs an explicit acknowledgement.</p>
+      <button type="submit" class="primary">Record decision & wake same task</button></form>` : `<p>${review.status === "RESOLVED" ? "Acknowledgement saved. The agent resumes on this same task; other blockers still apply." : "Wait for the agent to block for review, then decide here."}</p>`}
+  </section>`;
+}
+
+document.addEventListener("input", (event) => {
+  const form = event.target.closest("[data-client-review]");
+  if (!form) return;
+  state.reviewDraft = {id:form.dataset.clientReview, reason:form.elements.reason.value, decision:form.elements.decision.value};
+});
+
+document.addEventListener("submit", async (event) => {
+  const form = event.target.closest("[data-client-review]");
+  if (!form) return;
+  event.preventDefault();
+  const button = form.querySelector("button[type=submit]");
+  const target = `${taskRoot(form.dataset.task)}/client-reviews/${form.dataset.clientReview}/decisions`;
+  const payload = {expected_task_version:Number(form.dataset.version), expected_review_version:Number(form.dataset.reviewVersion), decision:form.elements.decision.value, reason:form.elements.reason.value.trim()};
+  if (!payload.reason) { toast("A review reason is required."); return; }
+  const intent = JSON.stringify({decision:payload.decision,reason:payload.reason});
+  if (state.reviewWrite?.target !== target || state.reviewWrite?.intent !== intent)
+    state.reviewWrite = {target,intent,key:crypto.randomUUID(),body:JSON.stringify(payload)};
+  button.disabled = true;
+  try {
+    await api(target, {method:"POST",headers:{"Idempotency-Key":state.reviewWrite.key},body:state.reviewWrite.body});
+    state.reviewWrite = null; state.reviewDraft = null;
+    toast("Decision recorded. Same task and supervisor wake queued.");
+    await refreshDetail(true); await refresh();
+  } catch (err) {
+    if (err.status === 409) { state.reviewWrite = null; await refreshDetail(true); }
+    toast(err.message);
+  } finally { button.disabled = false; }
 });
