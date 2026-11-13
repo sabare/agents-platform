@@ -1,0 +1,32 @@
+:root {
+  --color-paper: oklch(98% 0.003 55);
+  --color-sidebar: oklch(95.5% 0.005 55);
+  --color-well: oklch(96.5% 0.004 55);
+  --color-ink: oklch(23% 0.012 38);
+  --color-muted: oklch(46% 0.013 45);
+  --color-rule: oklch(87% 0.009 55);
+  --color-field-edge: oklch(57% 0.013 45);
+  --color-selected: oklch(91.5% 0.009 55);
+  --color-accent: oklch(28% 0.013 40);
+  --color-accent-ink: oklch(98% 0.003 55);
+  --color-focus: oklch(49% 0.16 30);
+  --color-success: oklch(38% 0.08 155);
+  --color-warning: oklch(40% 0.09 65);
+  --color-error: oklch(43% 0.15 28);
+  --color-running: oklch(41% 0.1 250);
+  --color-notice: oklch(94% 0.022 65);
+  --color-error-bg: oklch(96% 0.018 30);
+  --color-scrim: oklch(23% 0.012 38 / 0.22);
+  --color-transparent: transparent;
+  --font-body: "General Sans", Arial, sans-serif;
+  --font-display: var(--font-body);
+  --font-code: ui-monospace, SFMono-Regular, Consolas, monospace;
+  --sidebar: 208px;
+  --radius: 4px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+}

@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="theme-color" content="#f8f7f5" />
+    <meta
+      name="description"
+      content="Assign agent tasks, review progress, and inspect saved execution history."
+    />
+    <link
+      href="https://api.fontshare.com/v2/css?f[]=general-sans@400,500,600&display=swap"
+      rel="stylesheet"
+    />
+    <title>HelloCounsel · Agent workspace</title>
+    <link rel="stylesheet" href="/assets/style.css" />
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <noscript
+      ><p class="error">
+        JavaScript is required to load tasks and post comments. The API is
+        available at <a href="/docs">/docs</a>.
+      </p></noscript
+    >
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="HelloCounsel home">
+        <div>HelloCounsel<small>Agent workspace</small></div></a
+      >
+      <div class="workspace-label">Workspace</div>
+      <label class="sr-only" for="firm">Firm</label
+      ><select id="firm" aria-label="Select firm"></select>
+      <nav aria-label="Main navigation">
+        <button class="nav active" data-view="tasks">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <rect x="4" y="3" width="12" height="14" rx="1" />
+            <path d="M7 7h6M7 10h6M7 13h4" />
+          </svg>
+          All tasks <b id="nav-count">0</b>
+        </button>
+        <button class="nav" data-view="supervisor">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M10 3v4M4 12V7h12v5M10 7v5" />
+            <rect x="2" y="12" width="4" height="5" rx="1" />
+            <rect x="8" y="12" width="4" height="5" rx="1" />
+            <rect x="14" y="12" width="4" height="5" rx="1" />
+          </svg>
+          Supervisor
+        </button>
+        <button class="nav" data-view="activity">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <circle cx="10" cy="10" r="7" />
+            <path d="M10 6v4l3 2" />
+          </svg>
+          Activity & audit
+        </button>
+        <button class="nav" data-view="agents">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <rect x="3" y="3" width="14" height="14" rx="2" />
+            <path d="M3 10h14M10 3v14" />
+          </svg>
+          Agents
+        </button>
+      </nav>
+      <div class="sidebar-caption">Cases <span id="case-count"></span></div>
+      <div id="case-nav"></div>
+      <div class="sidebar-bottom">
+        <div class="system-state">
+          <span id="system-label">Connecting…</span>
+        </div>
+
+        <button id="connection" class="operator">
+          <span class="avatar">OP</span
+          ><span>Local operator<small>Internal demo workspace</small></span
+          ><span aria-hidden="true">Settings</span>
+        </button>
+      </div>
+    </aside>
+    <main>
+      <header class="topbar">
+        <div class="crumb">
+          Workspace <span>/</span> <strong id="crumb-title">All tasks</strong>
+        </div>
+        <div class="top-actions">
+          <span id="mode" class="mode">DEMO</span
+          ><a href="/docs" target="_blank" rel="noreferrer">API</a
+          ><a href="http://localhost:8233" target="_blank" rel="noreferrer"
+            >Temporal</a
+          >
+        </div>
+      </header>
+      <div class="page">
+        <div class="page-heading">
+          <div>
+            <h1 id="page-title">Tasks</h1>
+            <p id="page-description">
+              Assign work, review blockers, and follow agent progress.
+            </p>
+          </div>
+          <button class="primary" id="new-task">New task</button>
+        </div>
+        <div id="error" class="error" role="alert" hidden></div>
+        <section
+          id="metrics"
+          class="metrics"
+          aria-label="Workspace metrics"
+        ></section>
+        <section class="workspace-panel">
+          <div class="toolbar">
+            <div class="view-tabs" id="view-tabs">
+              <button class="selected" data-layout="list">List</button
+              ><button data-layout="board">Board</button>
+            </div>
+            <div class="section-label" id="section-label" hidden>
+              Workspace overview
+            </div>
+            <div class="filters">
+              <label class="search"
+                ><input
+                  id="search"
+                  placeholder="Search tasks or ID…"
+                  aria-label="Search tasks" /></label
+              ><select id="status" aria-label="Filter status">
+                <option value="">All statuses</option>
+                <option value="RUNNING">Running</option>
+                <option value="WAITING">Waiting</option>
+                <option value="BLOCKED">Blocked</option>
+                <option value="PENDING">Pending</option>
+                <option value="COMPLETED">Completed</option>
+                <option value="FAILED">Failed</option>
+                <option value="CANCELLED">Cancelled</option></select
+              ><button
+                id="refresh"
+                class="icon-button"
+                aria-label="Refresh workspace"
+              >
+                ↻
+              </button>
+            </div>
+          </div>
+          <div id="content" aria-live="polite">
+            <div class="empty">Connecting to your workspace…</div>
+          </div>
+          <footer class="panel-footer">
+            <span id="result-count">Loading tasks</span
+            ><button id="load-more" class="text-button" hidden>Load more</button
+            ><span id="last-sync">Live updates every 5s</span>
+          </footer>
+        </section>
+        <p class="demo-note">
+          Provider messages and records are simulated. Times use your local
+          timezone.
+        </p>
+      </div>
+    </main>
+    <div id="drawer-backdrop" class="backdrop" hidden></div>
+    <aside
+      id="drawer"
+      class="drawer"
+      aria-label="Task details"
+      role="dialog"
+      aria-modal="true"
+      hidden
+    >
+      <header class="drawer-header">
+        <span id="detail-id"></span>
+        <div>
+          <button id="copy-id" class="text-button">Copy ID</button
+          ><button
+            id="close-detail"
+            class="icon-button"
+            aria-label="Close task details"
+          >
+            ×
+          </button>
+        </div>
+      </header>
+      <div class="drawer-body">
+        <div id="detail-heading"></div>
+        <div class="detail-tabs">
+          <button class="selected" data-tab="activity">
+            Activity & comments</button
+          ><button data-tab="executions">Executions</button
+          ><button data-tab="context">Memory & context</button>
+        </div>
+        <div id="detail-content"></div>
+      </div>
+      <form id="comment-form" class="composer">
+        <label for="comment">Leave a comment or tag an agent</label
+        ><textarea
+          id="comment"
+          maxlength="4000"
+          rows="3"
+          placeholder="Add context, ask for a follow-up, or tag @supervisor…"
+          required
+        ></textarea>
+        <div id="mention-options" class="mention-options"></div>
+        <div class="composer-bottom">
+          <label class="wake-label"
+            ><input type="checkbox" id="wake" /> Wake assigned agent</label
+          ><button class="primary" type="submit">Post comment</button>
+        </div>
+        <small id="wake-help">Mentions are saved to the audit trail.</small>
+      </form>
+    </aside>
+    <dialog id="create-modal">
+      <form id="create-form">
+        <div class="modal-heading">
+          <div>
+            <h2>Assign an agent</h2>
+          </div>
+          <button
+            type="button"
+            data-close="create-modal"
+            class="icon-button"
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </div>
+        <p>The agent starts automatically and reports back to this task.</p>
+        <label>Case<select id="create-case" required></select></label
+        ><label
+          >Part of<select id="create-parent">
+            <option value="">No parent task</option>
+          </select></label
+        ><label
+          >Agent<select id="create-agent">
+            <option value="medical_records">Medical records (v2)</option><option value="check_in">Client check-in (v1)</option>
+          </select></label
+        ><label
+          >Task objective<textarea
+            id="create-objective"
+            rows="3"
+            required
+            maxlength="2000"
+            placeholder="Collect records and imaging from the provider…"
+          ></textarea>
+        </label>
+        <div class="form-row">
+          <label
+            >Client / patient<select
+              id="create-patient"
+              required
+            ></select></label
+          ><label id="create-provider-field"
+            >Medical provider<select id="create-provider" required></select
+          ></label>
+        </div>
+        <div id="create-records-fields"><label>Required documents</label>
+        <div class="checks">
+          <label
+            ><input type="checkbox" name="record" value="RECORDS" checked />
+            Records</label
+          ><label
+            ><input type="checkbox" name="record" value="BILLS" /> Bills</label
+          ><label
+            ><input type="checkbox" name="record" value="IMAGING" checked />
+            Imaging</label
+          >
+        </div>
+        <label class="wake-label"
+          ><input type="checkbox" id="all-dates" checked /> All dates</label
+        >
+        <div class="form-row" id="date-range" hidden>
+          <label>From<input id="from-date" type="date" /></label
+          ><label>Through<input id="through-date" type="date" /></label>
+        </div>
+        </div><div id="create-checkin-fields" hidden><label>Send at (local time)<input id="checkin-at" type="datetime-local" /></label><label>Check-in message<textarea id="checkin-message" rows="3" maxlength="2000">How have you been since our last check-in? Please share changes in how you feel, daily activities, treatment, or anything you would like the firm to know.</textarea></label><p class="muted">One send and one reply per task. Schedule another small task for the next check-in.</p></div>
+        <div id="create-error" class="error" role="alert" hidden></div>
+        <div class="modal-footer">
+          <span>All external communication is simulated.</span
+          ><button type="submit" class="primary">Create & start task</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="connect-modal">
+      <form id="connect-form">
+        <div class="modal-heading">
+          <h2>Connect to workspace</h2>
+          <button
+            type="button"
+            data-close="connect-modal"
+            class="icon-button"
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </div>
+        <p>
+          Enter the local operator API credential. This is separate from the
+          OpenAI API key.
+        </p>
+        <label
+          >Operator credential<input
+            id="credential"
+            type="password"
+            autocomplete="off"
+            required
+        /></label>
+        <p class="muted">
+          Kept in this browser tab’s session only. The default demo credential
+          is <code>local-development-only</code>.
+        </p>
+        <div class="modal-footer">
+          <button class="primary" type="submit">Connect</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="client-reply-modal"><form id="client-reply-form">
+      <div class="modal-heading"><h2>Simulate client reply</h2><button type="button" class="icon-button" data-close="client-reply-modal" aria-label="Close">×</button></div>
+      <p>Recorded as an unverified client self-report. No real message is sent.</p>
+      <label>Client message<textarea name="message" required maxlength="4000" rows="3"></textarea></label>
+      <div class="form-row"><label>Pain score (optional, 0–10)<input name="pain_score" type="number" min="0" max="10" /></label>
+      <label>Daily function<select name="daily_function"><option value="NOT_REPORTED">Not reported</option><option value="UNCHANGED">Unchanged</option><option value="BETTER">Better</option><option value="WORSE">Worse</option></select></label></div>
+      <label>Treatment update<textarea name="treatment_update" maxlength="2000" rows="2"></textarea></label>
+      <label class="wake-label"><input name="treatment_changed" type="checkbox" /> Client reports a treatment change</label>
+      <label>Concern<textarea name="concern" maxlength="2000" rows="2"></textarea></label>
+      <label class="wake-label"><input name="requests_help" type="checkbox" /> Client requests a teammate's help</label>
+      <div class="error" id="client-reply-error" role="alert" hidden></div>
+      <div class="modal-footer"><button type="submit" class="primary">Save simulated reply</button></div>
+    </form></dialog>
+    <div id="toast" role="status" hidden></div>
+  </body>
+</html>
