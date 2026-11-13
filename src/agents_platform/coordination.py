@@ -13,6 +13,7 @@ from pydantic import Field, model_validator
 from sqlalchemy import select
 from temporalio import activity
 
+from agents_platform.client_reviews import review_view
 from agents_platform.context import (
     PLATFORM_INSTRUCTIONS,
     ContextBudgetExceeded,
@@ -28,6 +29,7 @@ from agents_platform.models import (
     Case,
     CaseContact,
     CaseCoordination,
+    ClientReview,
     Contact,
     Execution,
     OutboxMessage,
@@ -451,7 +453,11 @@ class SupervisorActivities:
         ):
             updates = [e for e in context["new_events"] if e["type"] == "client.meaningful_update"]
             return SupervisorDecision(
-                summary=f"Monitoring client self-reports; {len(updates)} new meaningful updates.",
+                summary=(
+                    f"Monitoring client self-reports; {len(updates)} new meaningful updates, "
+                    f"{sum(e['type'] == 'client.review_decided' for e in context['new_events'])} "
+                    "human decisions received."
+                ),
                 evidence_event_ids=[UUID(e["id"]) for e in updates],
                 actions=[],
                 objective_satisfied=False,
@@ -555,7 +561,28 @@ class SupervisorActivities:
                 )
                 return run.outcome_json
             targets = coord.objective_json.get("targets", [])
-            reviews = list(coord.plan_json.get("reviews", []))
+            client_reviews = (
+                await session.scalars(
+                    select(ClientReview)
+                    .where(
+                        ClientReview.tenant_id == coord.tenant_id,
+                        ClientReview.case_id == coord.case_id,
+                    )
+                    .order_by(ClientReview.created_at, ClientReview.id)
+                )
+            ).all()
+            client_review_tasks = {str(r.task_id) for r in client_reviews}
+            # Rebuild only client-report reviews from authoritative decision state.
+            # Leave records/objective reviews untouched, including other blockers on the same case.
+            reviews = [
+                r
+                for r in coord.plan_json.get("reviews", [])
+                if r.get("kind") != "CLIENT_REPORT"
+                and not (
+                    r.get("task_id") in client_review_tasks
+                    and r.get("question", "").startswith("Client self-report")
+                )
+            ]
             applied, rejected = [], []
             event_ids = {e["id"] for e in context["new_events"]}
             retrieval_calls = await session.scalars(
@@ -593,12 +620,29 @@ class SupervisorActivities:
                     if update["report_id"] not in known_reports:
                         client_updates.append(update)
                         known_reports.add(update["report_id"])
-                    if update.get("needs_review"):
-                        review(
-                            "Client self-report needs teammate review: "
-                            + "; ".join(update["changes"]["reasons"]),
-                            update["task_id"],
-                        )
+            reviews.extend(
+                {
+                    "key": f"client-review/{r.id}",
+                    "kind": "CLIENT_REPORT",
+                    "review_id": str(r.id),
+                    "report_id": str(r.report_id),
+                    "task_id": str(r.task_id),
+                    "question": r.question,
+                    "status": "UNRESOLVED",
+                }
+                for r in client_reviews
+                if r.status == "OPEN"
+            )
+            review_by_report = {str(r.report_id): review_view(r) for r in client_reviews}
+            task_statuses = {t["id"]: t["status"] for t in tasks}
+            client_updates = [
+                {
+                    **u,
+                    "human_review": review_by_report.get(u["report_id"]),
+                    "task_status": task_statuses.get(u["task_id"]),
+                }
+                for u in client_updates
+            ]
             if truncated or (
                 not targets and not coord.objective_json.get("monitor_client_updates")
             ):
@@ -760,6 +804,10 @@ class SupervisorActivities:
                 outcome["wake_at"] = next_review.isoformat()
             plan = {
                 "client_updates": client_updates[-20:],
+                "client_review_outcomes": [
+                    {**review_view(r), "task_status": task_statuses.get(str(r.task_id))}
+                    for r in client_reviews[-20:]
+                ],
                 "decision_count": coord.plan_json.get("decision_count", 0) + 1,
                 "next_review_at": outcome.get("wake_at"),
                 "summary": decision.summary,

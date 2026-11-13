@@ -9,6 +9,13 @@ from pydantic import AwareDatetime, Field
 from sqlalchemy import select
 
 from agents_platform.client_check_in import report_view
+from agents_platform.client_reviews import (
+    ReviewDecision,
+    acknowledged,
+    create_review,
+    decide_review,
+    review_for_report,
+)
 from agents_platform.coordination import digest, enqueue_supervisor
 from agents_platform.memory import policy_lock
 from agents_platform.memory_api import Key, wake_task
@@ -26,7 +33,7 @@ from agents_platform.models import (
 )
 from agents_platform.task_api import Session, require_operator
 from agents_platform.task_contracts import Contract
-from agents_platform.tasks import read_task
+from agents_platform.tasks import TaskError, read_task
 
 router = APIRouter(
     prefix="/v1/firms/{tenant_id}",
@@ -311,7 +318,11 @@ async def receive_reply(
                     ClientReport.tenant_id == tenant_id, ClientReport.source_id == existing.id
                 )
             )
-            return {"report": report_view(report), "replayed": True}
+            review = await review_for_report(session, report)
+            return {
+                "report": report_view(report, review, await acknowledged(session, report, review)),
+                "replayed": True,
+            }
         if not row.sent_at:
             raise HTTPException(409, "Cannot reply before the simulated check-in was sent")
         if task.status in ("COMPLETED", "CANCELLED", "FAILED"):
@@ -364,6 +375,7 @@ async def receive_reply(
         )
         session.add(report)
         await session.flush()
+        review = await create_review(session, task, report, source) if review else None
         event = ActivityEvent(
             id=uuid4(),
             tenant_id=tenant_id,
@@ -379,7 +391,8 @@ async def receive_reply(
                 "task_id": str(task_id),
                 "client_contact_id": str(row.client_contact_id),
                 "meaningful": meaningful,
-                "needs_review": review,
+                "needs_review": bool(review),
+                "review_id": str(review.id) if review else None,
                 "changes": changes,
                 "message": body.message,
             },
@@ -405,7 +418,7 @@ async def receive_reply(
                     payload={"tenant_id": str(tenant_id), "task_id": str(task_id)},
                 )
             )
-        return {"report": report_view(report), "replayed": False}
+        return {"report": report_view(report, review), "replayed": False}
 
 
 @router.get("/cases/{case_id}/client-reports")
@@ -426,4 +439,25 @@ async def client_reports(
             query.order_by(ClientReport.reported_at.desc(), ClientReport.id.desc()).limit(100)
         )
     ).all()
-    return [report_view(r) for r in rows]
+    result = []
+    for report in rows:
+        review = await review_for_report(session, report)
+        result.append(report_view(report, review, await acknowledged(session, report, review)))
+    return result
+
+
+@router.post("/tasks/{task_id}/client-reviews/{review_id}/decisions")
+async def decide_client_review(
+    tenant_id: UUID,
+    task_id: UUID,
+    review_id: UUID,
+    body: ReviewDecision,
+    session: Session,
+    key: Key,
+):
+    if not key.strip():
+        raise HTTPException(422, "Idempotency-Key must not be blank")
+    try:
+        return await decide_review(session, tenant_id, task_id, review_id, body, key.strip())
+    except TaskError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc

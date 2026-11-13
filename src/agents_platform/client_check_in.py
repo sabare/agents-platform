@@ -10,6 +10,7 @@ from openai.types.responses import (
 )
 from sqlalchemy import select
 
+from agents_platform.client_reviews import acknowledged, review_for_report, review_view
 from agents_platform.domains import DomainSnapshot, DomainValidation, ToolResult, ToolSpec
 from agents_platform.models import ClientCheckIn, ClientReport
 from agents_platform.schemas import SpecialistResult
@@ -44,7 +45,7 @@ class CheckInDecision(AgentDecision):
     report_id: UUID | None
 
 
-def report_view(report):
+def report_view(report, review=None, is_acknowledged=False):
     if report is None:
         return None
     return {
@@ -57,7 +58,12 @@ def report_view(report):
         "previous_report_id": str(report.previous_report_id) if report.previous_report_id else None,
         "changes": report.changes,
         "meaningful": report.meaningful,
-        "needs_review": report.needs_review,
+        "needs_review": report.needs_review and not is_acknowledged,
+        "flagged_for_review": report.needs_review,
+        "review_stale": bool(
+            report.needs_review and review and review.status == "RESOLVED" and not is_acknowledged
+        ),
+        "human_review": review_view(review),
     }
 
 
@@ -78,6 +84,7 @@ async def check_in_view(session, task):
             ClientReport.check_in_id == row.id,
         )
     )
+    review = await review_for_report(session, report)
     return {
         "id": str(row.id),
         "client_contact_id": str(row.client_contact_id),
@@ -85,7 +92,7 @@ async def check_in_view(session, task):
         "sent_at": row.sent_at.isoformat() if row.sent_at else None,
         "message": row.message,
         "status": "REPLIED" if report else "SENT" if row.sent_at else "SCHEDULED",
-        "report": report_view(report),
+        "report": report_view(report, review, await acknowledged(session, report, review)),
     }
 
 
@@ -135,6 +142,9 @@ class ClientCheckInAdapter:
             action_requirements={
                 "before_waiting": "Send once when due, then wait for a reply.",
                 "reports_are_unverified_client_statements": True,
+                "human_review": view["report"].get("human_review") if view["report"] else None,
+                "review_guidance": "A recorded ALLOW_COMPLETION acknowledges this report only. "
+                "REQUEST_CHANGES supplies guidance but leaves review required. Never clear holds.",
             },
         )
 
@@ -163,7 +173,7 @@ class ClientCheckInAdapter:
             )
         )
         return ToolResult(
-            {"report": report_view(report), "simulated": True},
+            {"report": (await check_in_view(session, task))["report"], "simulated": True},
             (report.source_id,) if report else (),
             "SIMULATED_CLIENT_REPLY_READ",
         )
@@ -205,7 +215,8 @@ class ClientCheckInAdapter:
                 "meaningful_update": report["meaningful"] if report else False,
                 "client_report": report,
             },
-            notify_supervisor=action.type != "complete",
+            notify_supervisor=action.type != "complete"
+            or bool(report and report.get("human_review")),
         )
 
     def scripted_model(self, context, follow_up_seconds):

@@ -540,3 +540,42 @@ class ClientReport(TenantRow, Base):
             "ix_client_reports_history", "tenant_id", "case_id", "client_contact_id", "reported_at"
         ),
     )
+
+
+class ClientReview(TenantRow, Base):
+    """One review per sensitive report; decision history is retained as Sources/events."""
+
+    __tablename__ = "client_reviews"
+    case_id: Mapped[UUID]
+    task_id: Mapped[UUID]
+    report_id: Mapped[UUID]
+    report_fingerprint: Mapped[str]
+    question: Mapped[str]
+    status: Mapped[str] = mapped_column(default="OPEN")
+    version: Mapped[int] = mapped_column(default=1)
+    decision: Mapped[str | None]
+    reason: Mapped[str | None]
+    decided_by: Mapped[str | None]
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    decision_source_id: Mapped[UUID | None]
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "report_id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "task_id"], ["tasks.tenant_id", "tasks.case_id", "tasks.id"]
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "report_id"],
+            ["client_reports.tenant_id", "client_reports.case_id", "client_reports.id"],
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "decision_source_id"],
+            ["sources.tenant_id", "sources.case_id", "sources.id"],
+        ),
+        CheckConstraint("version > 0", name="client_review_version"),
+        CheckConstraint("status IN ('OPEN','RESOLVED')", name="client_review_status"),
+        CheckConstraint(
+            "(status = 'RESOLVED' AND COALESCE(decision, '') = 'ALLOW_COMPLETION') OR "
+            "(status = 'OPEN' AND (decision IS NULL OR decision = 'REQUEST_CHANGES'))",
+            name="client_review_decision",
+        ),
+    )
