@@ -1,0 +1,18 @@
+{
+  "case_id": "d6f330a4-a1a8-560a-b39c-0776e3defb9f",
+  "parent_task_id": "966e90cb-5be8-5221-b9a3-5907d5247d2c",
+  "patient_contact_id": "11fc00ef-b98f-5217-ba39-3511e317fbab",
+  "provider_contact_id": "54c40454-4a13-5a4d-9402-4be1115d5442",
+  "agent_version": 2,
+  "objective": "Collect medical records and imaging from Example Hospital",
+  "requirements": [
+    {
+      "record_type": "RECORDS",
+      "all_dates": true
+    },
+    {
+      "record_type": "IMAGING",
+      "all_dates": true
+    }
+  ]
+}
