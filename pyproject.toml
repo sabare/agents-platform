@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hellocounsel-agents-platform"
+version = "0.1.0"
+description = "Minimal supervisor and specialist agents for HelloCounsel"
+requires-python = ">=3.11"
+dependencies = [
+    "openai-agents==0.24.0",
+    "python-dotenv==1.2.4",
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+    "sqlalchemy[asyncio]>=2.0,<3",
+    "psycopg[binary]>=3.2,<4",
+    "alembic>=1.14,<2",
+    "pydantic-settings>=2.6,<3",
+    "temporalio>=1.9,<2",
+    "pgvector>=0.3,<1",
+    "tiktoken>=0.8,<1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "httpx>=0.27,<1", "ruff>=0.9,<1"]
+
+[project.scripts]
+agents-platform = "agents_platform.cli:main"
+agents-worker = "agents_platform.orchestration.worker:main"
+agents-seed = "agents_platform.seed:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+agents_platform = ["definitions/*.json", "static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = ["integration: requires running PostgreSQL and Temporal services"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

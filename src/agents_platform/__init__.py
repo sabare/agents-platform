@@ -1,0 +1,1 @@
+"""HelloCounsel agent platform prototype."""
