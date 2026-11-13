@@ -35,9 +35,10 @@ Default `AGENT_MODE=scripted` needs no OpenAI key. For real model calls, set `AG
 - One scheduled check-in and attributed reply per task, comparison with the client's prior report, and review of sensitive updates.
 - A case supervisor that delegates records work and monitors meaningful client updates.
 - Approved instruction revisions, obligations, task/case contact holds, historical keyword/vector search, and question-specific context tools.
+- A client-report human-review loop: explicit decisions/reasons, same-task resumption and supervisor outcomes, without clearing contact holds.
 - An operator dashboard with task progress, comments, history, tool results, usage and saved context.
 
-Formal approval/takeover, recurring check-in series, temporal fact reconciliation and production integrations remain unfinished. This is a local prototype with a development operator credential, not production firm-user access control.
+Broader approval/takeover flows beyond client-report review, recurring check-in series, temporal fact reconciliation and production integrations remain unfinished. This is a local prototype with a development operator credential, not production firm-user access control.
 
 ## Check changes
 

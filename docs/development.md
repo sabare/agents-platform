@@ -61,6 +61,8 @@ docker compose logs -f api worker
 
 Use the dashboard to create a records task or client check-in. Open a task for comments, event history, executions, tool results, usage and starting context. A plain comment is recorded; use **Wake assigned agent** for an explicit specialist wake. Supervisor mentions wake configured case coordination.
 
+A blocked sensitive client report shows a **Teammate review** panel on every task tab. Choose **Allow completion** or **Request changes**, enter a reason, and record the decision. The same task and case supervisor wake. Allow completion acknowledges only that report; requesting changes leaves its review open. Other restrictions remain active. Decisions appear in task history and the supervisor overview.
+
 The memory/context area supports obligations, task/case/provider holds, explicit resolution, history search and source inspection. Provider updates and client replies are entered through simulation controls. Instruction revisions and focused retrieval are also available through the API; not every API has a dedicated dashboard editor.
 
 In **Supervisor**, submit an objective with approved records targets. The current UI supports one provider with all dates; the API supports up to ten explicit targets. Editing preserves existing multi-provider/date scope. Client check-ins are manually assigned and monitored; autonomous check-in delegation is not implemented.
@@ -74,6 +76,7 @@ Run from the repo in the activated host environment while the stack is up:
 | `python examples/demo.py --restart-worker` | Records request, durable wait, worker restart, simulated receipt and completion |
 | `python examples/supervisor_demo.py --restart-worker` | Objective replay, duplicate-safe delegation, specialist completion and objective verification |
 | `python examples/memory_demo.py` | Old evidence retrieval, case hold/release, obligations and worker restart |
+| `python examples/client_review_demo.py` | Blocked report → guidance → explicit acknowledgement → same-task completion → supervisor outcome |
 | `python examples/check_in_demo.py` | Scheduled sends, baseline/changed client reports, restart recovery and teammate review |
 
 Scripts create fictional data. Restart scenarios stop/restart the Compose worker and temporarily affect other local demo work. They never send real communications. The legacy `agents-platform "assignment"` CLI calls specialists inline; it is not the durable API/worker path. `agents-platform --check` only checks its wiring.
@@ -88,6 +91,7 @@ All business routes use the development operator credential. Prefix these with `
 | `POST /tasks/{task}/provider-updates` | Simulate `PENDING` or `RECEIVED`; received documents are synthetic |
 | `POST /tasks/client-check-in` | Schedule one check-in for a case/client with a timezone-aware send time |
 | `POST /tasks/{task}/client-replies` | Record one attributed reply after the simulated send |
+| `POST /tasks/{task}/client-reviews/{review}/decisions` | Decide a blocked report using `decision`, `reason`, `expected_task_version` and `expected_review_version`; requires `Idempotency-Key` |
 | `GET /cases/{case}/client-reports` | Latest 100 reports; optional client filter |
 | `GET/POST /cases/{case}/supervisor` | Read coordinator state or submit/replace a records objective |
 | `GET /tasks/{task}` | Read current state and domain projection |
@@ -95,6 +99,8 @@ All business routes use the development operator credential. Prefix these with `
 | `GET /tasks/{task}/executions` | Read saved context, tools, decisions, outcome and usage |
 
 Creation/intake endpoints require `Idempotency-Key`: same key/body reuses the result; conflicting reuse returns `409`. Replacing a supervisor objective requires its `expected_revision`. Terminal records tasks reject late updates. A check-in accepts one reply; another check-in requires another task. Memory/retrieval routes are listed in the [memory guide](memory-and-retrieval.md).
+
+Client review decisions are `ALLOW_COMPLETION` or `REQUEST_CHANGES`. A successful response includes the current review, saved decision and task version; replay returns `replayed: true`. The task itself resumes through its existing workflow rather than being completed directly by the HTTP request. `ClientReport.needs_review` remains the original flag; API `needs_review` reflects current effective review state, while `flagged_for_review` retains the original value. `human_review` includes the question, version, last decision, reason, local actor and decision-source reference. Changed evidence sets `review_stale` and prevents completion. The narrow API does not resolve records/objective reviews or consent holds.
 
 ## Checks and evidence
 
@@ -106,7 +112,7 @@ make smoke   # PostgreSQL + Temporal integration tests
 
 Integration tests create disposable databases and isolated workflow queues. PostgreSQL test credentials need create/drop-database permission; `TEST_POSTGRES_ADMIN_URL` can override the default local connection. Tests do not clear the application database. Use `pytest --collect-only -q` for the current inventory rather than treating a count in prose as a guarantee.
 
-Coverage includes scope/relationship checks, duplicate intake, transactional rollback, migrations, restart/timer recovery, stale decisions, completion evidence, contact holds, client-report comparisons and SDK tool invocation. Focused retrieval tests include 240 distracting updates across seven months, provider/date selection, exact/vector scope checks, evidence pagination and context overflow.
+Coverage includes scope/relationship checks, duplicate intake, transactional rollback, migrations, restart/timer recovery, stale decisions, completion evidence, contact holds, client-report comparisons and SDK tool invocation. Human-review tests cover same-task completion, guidance without premature closure, version conflicts, concurrent/replayed decisions, scope/authentication, transactional rollback, contact holds/obligations, migration backfill and worker restart with a decision saved offline. Focused retrieval tests include 240 distracting updates across seven months, provider/date selection, exact/vector scope checks, evidence pagination and context overflow.
 
 Scripted tests establish execution behavior, not real-model answer quality. Synthetic vectors establish SQL ranking/isolation, not embedding relevance. Past real-model demos are useful smoke checks, not a production benchmark or proof of months of continuous operation. This documentation cleanup does not rerun those demos.
 
@@ -129,7 +135,7 @@ All Python modules below are in `src/agents_platform/`.
 
 | Area | Files |
 |---|---|
-| HTTP and dashboard | `api.py`, `task_api.py`, `check_in_api.py`, `supervisor_api.py`, `dashboard.py`, `static/` |
+| HTTP and dashboard | `api.py`, `task_api.py`, `check_in_api.py`, `client_reviews.py`, `supervisor_api.py`, `dashboard.py`, `static/` |
 | Tasks and storage | `tasks.py`, `models.py`; schema history in root `migrations/` |
 | Durable execution | `dispatch.py`, `orchestration/workflows.py`, `orchestration/worker.py` |
 | Agent runtime and domains | `execution.py`, `coordination.py`, `domains.py`, `medical_records.py`, `client_check_in.py` |

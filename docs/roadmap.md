@@ -6,7 +6,7 @@ Reviewed 14 November 2026. Everything under “Remaining work” is unfinished; 
 
 | Priority | Work | What is still missing |
 |---|---|---|
-| 1 | Formal human intervention | Recorded approve/reject/takeover decisions, review resolution and controlled resumption. Comments, unresolved reviews and memory-item resolution exist, but do not complete this workflow. |
+| 1 | Broader human intervention | Client-report acknowledgement/guidance and same-task resumption are implemented. Records/objective review resolution, takeover, per-user reviewer identity and correction/re-review flows remain unfinished. |
 | 2 | Retrieval quality and changing facts | Better document/section boundaries, question-specific reranking, explicit fact revisions with effective/recorded time, conflict handling and a representative labelled benchmark. Existing search filters source recording time. |
 | 3 | Broader workflow support | Recurring check-in series, reply corrections/late responses, richer history pagination, generic intake and explicit supervisor delegation beyond records. |
 | 4 | Real integrations | Messaging/provider portals, document intake, durable outbound action intents and reconciliation when delivery outcome is uncertain. Database-only simulated sends do not solve real delivery duplicates. |

@@ -92,6 +92,17 @@ These are demo rules, not clinical findings. Missing values mean “not reported
 
 Operators can comment, explicitly wake work, add/resolve typed memory items, publish instruction revisions, submit provider/client updates and revise objectives. A plain comment does not wake a specialist; an explicit wake does. Supervisor mentions wake a configured coordinator.
 
-Resolving a memory item records a reason and can resume work. It is not the full approve/reject/takeover workflow. Review questions are persisted, but guidance does not count as approval. External content remains evidence, even after being stored or retrieved.
+Resolving a memory item records a reason and can resume work. It is separate from the client-report review flow and does not provide general approve/reject/takeover behavior. For sensitive client reports, a saved review now supports explicit human decisions. Other review questions remain outside this narrow decision flow; comments alone do not count as acknowledgement. External content remains evidence, even after being stored or retrieved.
+
+### Client-report review loop
+
+A sensitive client reply creates one review bound to that report and task. The original self-report and its flag remain unchanged. The task panel shows the question and original message once the agent blocks.
+
+- **Allow completion:** a teammate records that they handled this report, with a reason. The backend resolves this review and wakes the same task. The agent can finish only if reply evidence and all other platform checks pass.
+- **Request changes:** a teammate records guidance. The same task wakes once to process it, but review stays open and completion remains blocked until explicit acknowledgement.
+
+Decisions require the current task/review versions and an idempotency key. The backend rejects stale, closed, changed-report or out-of-scope decisions. A source, event and wake requests for the specialist and supervisor commit together; uncertain retries reuse the original decision. Decisions are recorded under the development operator identity, not an inferred individual user.
+
+Contact holds and obligations are never removed by these decisions. The supervisor reads authoritative review state, records the decision and the resumed task's outcome, and does not reopen a resolved review from an older report event. Existing active sensitive reports receive review records through the migration. Changed source/report content invalidates acknowledgement; a correction workflow remains future work.
 
 All outreach and received records are simulated. The development operator credential can access multiple firms; scoped queries and database relationships do not replace production user permissions. Remaining work is listed once in the [roadmap](roadmap.md).
