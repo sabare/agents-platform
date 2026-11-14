@@ -252,8 +252,14 @@ async def search_history(
             scores[passage.id] += (10 if name == "exact" else 1) / (60 + rank)
             rows[passage.id] = (passage, source)
             lanes[passage.id].append(name)
+    ranked = sorted(scores, key=lambda k: (-scores[k], str(k)))
+    if semantic:
+        # Many weak keyword+vector hits can otherwise crowd out the best semantic-only
+        # answer. Keep that candidate visible even under a small context/tool budget.
+        anchor = semantic[0][0].id
+        ranked = [anchor] + [key for key in ranked if key != anchor]
     results = []
-    for key in sorted(scores, key=lambda k: (-scores[k], str(k)))[:limit]:
+    for key in ranked[:limit]:
         passage, source = rows[key]
         results.append(
             {
@@ -271,6 +277,7 @@ async def search_history(
         "query": query,
         "profile": PROFILE,
         "method": "hybrid-rrf" if cached and semantic else "exact+keyword",
+        "selection": "semantic anchor then rank fusion" if semantic else "keyword rank",
         "results": results,
     }
 

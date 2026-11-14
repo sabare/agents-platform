@@ -13,8 +13,28 @@ from openai.types.responses import (
 from pydantic import Field
 from sqlalchemy import select
 
-from agents_platform.domains import DomainSnapshot, DomainValidation, ToolResult, ToolSpec
-from agents_platform.models import Contact, RecordEvidence, RecordRequirement, RecordsRequest
+from agents_platform.domains import (
+    ActionNotDue,
+    ActionStateChanged,
+    DecisionValidationError,
+    DomainSnapshot,
+    DomainValidation,
+    ToolResult,
+    ToolSpec,
+)
+from agents_platform.models import (
+    Case,
+    CaseContact,
+    Contact,
+    RecordEvidence,
+    RecordRequirement,
+    RecordsRequest,
+)
+from agents_platform.record_receipts import (
+    follow_up_content,
+    missing_requirements,
+    requirement_coverage,
+)
 from agents_platform.registry import load_definition
 from agents_platform.schemas import SpecialistResult
 from agents_platform.task_contracts import Contract, NextAction, Observation, RecordsDecision
@@ -36,6 +56,33 @@ class RecordsInput(Contract):
 
 class ReminderArguments(Contract):
     occurrence: int = Field(ge=1, le=3)
+
+
+async def contact_scope_reason(session, task, request):
+    case = await session.scalar(
+        select(Case).where(
+            Case.tenant_id == task.tenant_id,
+            Case.id == task.case_id,
+        )
+    )
+    if not case or case.status != "OPEN":
+        return "The case is closed; do not contact the provider."
+    for contact_id, roles in (
+        (request.patient_contact_id, {"CLIENT", "PATIENT"}),
+        (request.provider_contact_id, {"MEDICAL_PROVIDER"}),
+    ):
+        participant = await session.scalar(
+            select(CaseContact).where(
+                CaseContact.tenant_id == task.tenant_id,
+                CaseContact.case_id == task.case_id,
+                CaseContact.contact_id == contact_id,
+            )
+        )
+        if not participant or not roles.intersection(participant.roles):
+            return (
+                "Records participant roles changed; review the patient and provider before contact."
+            )
+    return None
 
 
 class MedicalRecordsAdapter:
@@ -66,6 +113,16 @@ class MedicalRecordsAdapter:
         ),
     )
 
+    async def advance_human_work(self, session, task):
+        from agents_platform.human_request_handlers import advance_records_intervention
+
+        return await advance_records_intervention(session, task)
+
+    async def request_human_help(self, session, task, reason):
+        from agents_platform.human_request_handlers import ensure_records_request
+
+        return await ensure_records_request(session, task, reason)
+
     async def load(self, session, task):
         assignment = RecordsInput.model_validate(task.input_json)
         request = await session.scalar(
@@ -79,6 +136,7 @@ class MedicalRecordsAdapter:
         if request is None:
             raise ValueError("Records assignment has no matching request")
         view = (await read_task(session, task.tenant_id, task.id)).model_dump(mode="json")
+        scope_reason = await contact_scope_reason(session, task, request)
         reminder = {
             "enabled": task.agent_version >= 3,
             "count": request.reminder_count,
@@ -92,15 +150,24 @@ class MedicalRecordsAdapter:
                 task.agent_version >= 3
                 and request.next_reminder_at
                 and request.next_reminder_at <= datetime.now(timezone.utc)
-                and request.status in ("SENT", "PENDING")
+                and request.status in ("SENT", "PENDING", "PARTIAL")
                 and request.reminder_count < request.max_reminders
             ),
         }
         return DomainSnapshot(
             state={"records_request": view["records_request"], "reminder": reminder},
+            evidence_source_ids=tuple(
+                UUID(source_id)
+                for requirement in view["records_request"]["requirements"]
+                for source_id in requirement["evidence_source_ids"]
+            ),
+            ready_at=(request.callback_at or request.next_reminder_at)
+            if request.status != "RECEIVED" and not scope_reason
+            else None,
             instruction_provider_ids=(request.provider_contact_id,),
             task_fields={"records_request": view["records_request"]},
             action_requirements={
+                "suspension_reason": scope_reason,
                 "request_state": request.status,
                 "before_waiting": "If DRAFT, send the initial request once before waiting. "
                 "A prior resolved hold does not forbid contact. Open holds still block it.",
@@ -119,6 +186,10 @@ class MedicalRecordsAdapter:
         if request is None:
             raise ValueError("Records request missing")
         evidence_ids = ()
+        if name in ("send_records_request", "send_records_reminder"):
+            reason = await contact_scope_reason(session, task, request)
+            if reason:
+                raise ActionStateChanged(reason)
         if name == "get_provider_details":
             provider = await session.scalar(
                 select(Contact).where(
@@ -133,21 +204,32 @@ class MedicalRecordsAdapter:
                     request.next_reminder_at = datetime.now(timezone.utc) + timedelta(
                         seconds=request.reminder_interval_seconds
                     )
-            data = {"request_ref": f"SIM-{request.id}", "simulated": True}
+            data = {
+                "request_ref": f"SIM-{request.id}",
+                "simulated": True,
+                **follow_up_content(await missing_requirements(session, task, request)),
+            }
         elif name == "send_records_reminder":
             if task.agent_version < 3:
                 raise ValueError("This pinned agent version cannot send reminders")
-            if request.status not in ("SENT", "PENDING"):
+            if request.status not in ("SENT", "PENDING", "PARTIAL"):
                 raise ValueError("Reminders require an outstanding sent request")
             if (
                 arguments.occurrence != request.reminder_count + 1
                 or request.reminder_count >= request.max_reminders
             ):
                 raise ValueError("Reminder occurrence is not the next permitted occurrence")
-            if request.next_reminder_at is None or request.next_reminder_at > datetime.now(
-                timezone.utc
-            ):
+            if request.next_reminder_at is None:
                 raise ValueError("Reminder is not due")
+            if request.next_reminder_at > datetime.now(timezone.utc):
+                raise ActionNotDue(request.next_reminder_at)
+            missing = await missing_requirements(session, task, request)
+            if not missing:
+                raise ValueError("No required items remain outstanding; do not send a reminder")
+            callback_at, callback_timezone = request.callback_at, request.callback_timezone
+            if callback_at and callback_at > datetime.now(timezone.utc):
+                raise ActionNotDue(callback_at)
+            request.callback_at = request.callback_timezone = None
             request.reminder_count += 1
             request.next_reminder_at = (
                 datetime.now(timezone.utc) + timedelta(seconds=request.reminder_interval_seconds)
@@ -158,7 +240,12 @@ class MedicalRecordsAdapter:
                 {
                     "occurrence": arguments.occurrence,
                     "request_ref": f"SIM-{request.id}",
-                    "summary": f"Simulated provider reminder {arguments.occurrence} sent.",
+                    "summary": f"Simulated provider reminder {arguments.occurrence} sent for "
+                    + ", ".join(r["record_type"].lower() for r in missing)
+                    + ".",
+                    **follow_up_content(missing),
+                    "callback_at": callback_at.isoformat() if callback_at else None,
+                    "callback_timezone": callback_timezone,
                     "next_due_at": request.next_reminder_at.isoformat()
                     if request.next_reminder_at
                     else None,
@@ -184,7 +271,12 @@ class MedicalRecordsAdapter:
                     )
                 ).all()
             )
+            coverage = await requirement_coverage(session, task.tenant_id, request.id)
             data = {
+                "requirements": coverage,
+                "outstanding_requirement_ids": [
+                    r["id"] for r in coverage if r["required"] and r["status"] == "OUTSTANDING"
+                ],
                 "status": request.status,
                 "received_source_ids": [str(i) for i in evidence_ids],
                 "simulated": True,
@@ -206,9 +298,15 @@ class MedicalRecordsAdapter:
 
     async def validate(self, session, task, context, decision, results, action):
         documents = {x for r in results for x in r.get("received_source_ids", [])}
+        documents.update(context.get("domain", {}).get("evidence_source_ids", []))
         requested = {str(i) for i in decision.received_source_ids}
         if not requested.issubset(documents):
-            raise ValueError("Agent invented received document evidence")
+            raise DecisionValidationError(
+                "Agent invented received document evidence. received_source_ids must contain only "
+                "document evidence IDs from the domain snapshot or check_request_status. "
+                f"Currently available document evidence IDs: {sorted(documents)}. "
+                "A sent request or reminder is not a received document."
+            )
         request_id = UUID(context["domain"]["state"]["records_request"]["id"])
         requirements = (
             await session.scalars(
@@ -237,7 +335,9 @@ class MedicalRecordsAdapter:
         if action.type == "complete" and (
             request.status != "RECEIVED" or covered != {r.id for r in requirements}
         ):
-            raise ValueError("Completion requires saved evidence for every required item")
+            raise DecisionValidationError(
+                "Completion requires saved evidence for every required item"
+            )
         if (
             task.agent_version >= 3
             and action.type == "wait"
@@ -251,7 +351,7 @@ class MedicalRecordsAdapter:
         due_reminder = bool(
             task.agent_version >= 3
             and action.type == "wait"
-            and request.status in ("SENT", "PENDING")
+            and request.status in ("SENT", "PENDING", "PARTIAL")
             and request.next_reminder_at
             and request.next_reminder_at <= datetime.now(timezone.utc)
             and request.reminder_count < request.max_reminders
@@ -285,7 +385,9 @@ class MedicalRecordsAdapter:
                 "reminder_replans": replans + 1 if due_reminder else 0,
                 "validation_feedback": feedback,
                 "outstanding_requirement_ids": [
-                    str(r.id) for r in requirements if r.id not in covered
+                    str(r.id)
+                    for r in requirements
+                    if r.id not in {requirement_id for requirement_id, _ in evidence}
                 ],
             },
         )
@@ -328,7 +430,13 @@ class ScriptedModel(Model):
             decision = RecordsDecision(
                 summary="All required simulated records received."
                 if complete
-                else "Provider processing is pending.",
+                else "Outstanding items: "
+                + ", ".join(
+                    r["record_type"].lower()
+                    for r in state["requirements"]
+                    if r["required"] and r["status"] == "OUTSTANDING"
+                )
+                + ".",
                 observations=[
                     Observation(
                         statement="Simulated provider status: " + state["status"],

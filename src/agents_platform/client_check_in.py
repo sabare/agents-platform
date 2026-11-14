@@ -11,7 +11,14 @@ from openai.types.responses import (
 from sqlalchemy import select
 
 from agents_platform.client_reviews import acknowledged, review_for_report, review_view
-from agents_platform.domains import DomainSnapshot, DomainValidation, ToolResult, ToolSpec
+from agents_platform.domains import (
+    ActionStateChanged,
+    DecisionValidationError,
+    DomainSnapshot,
+    DomainValidation,
+    ToolResult,
+    ToolSpec,
+)
 from agents_platform.models import ClientCheckIn, ClientReport
 from agents_platform.schemas import SpecialistResult
 from agents_platform.task_contracts import AgentDecision, Contract, NextAction, Observation
@@ -165,6 +172,11 @@ class ClientCheckInAdapter:
         )
         return DomainSnapshot(
             state={"check_in": view, "previous_report": report_view(previous)},
+            evidence_source_ids=tuple(
+                UUID(report["source_id"])
+                for report in (view.get("report"), report_view(previous))
+                if report and report.get("source_id")
+            ),
             ready_at=(
                 None
                 if view.get("suspension_reason")
@@ -206,7 +218,7 @@ class ClientCheckInAdapter:
                 current_task_id=task.id,
             )
             if row.sent_at is None and assessment["code"] != "ELIGIBLE":
-                raise ValueError(assessment["reason"])
+                raise ActionStateChanged(assessment["reason"])
             gate = await check_in_gate(session, row)
             if gate and gate["suspension_reason"]:
                 raise ValueError(gate["suspension_reason"])
@@ -249,16 +261,16 @@ class ClientCheckInAdapter:
         if decision.report_id and (
             not report or str(decision.report_id) != report["id"] or report["id"] not in exposed
         ):
-            raise ValueError("Agent cited a client report it was not given")
+            raise DecisionValidationError("Agent cited a client report it was not given")
         if view.get("suspension_reason"):
-            action = self.review(view["series"]["suspension_reason"]).next_action
+            action = self.review(view["suspension_reason"]).next_action
         elif report and report["needs_review"]:
             action = self.review(
                 "Client-reported change requires teammate review: "
                 + "; ".join(report["changes"]["reasons"])
             ).next_action
         elif action.type == "complete" and (not report or str(decision.report_id) != report["id"]):
-            raise ValueError("Check-in completion requires a saved attributed reply")
+            raise DecisionValidationError("Check-in completion requires a saved attributed reply")
         elif action.type == "wait" and view["sent_at"] is None:
             action = self.review(
                 "Agent tried to wait before sending the scheduled check-in."

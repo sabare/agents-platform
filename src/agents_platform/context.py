@@ -61,6 +61,18 @@ def clip(text, limit):
 
 
 PLATFORM_INSTRUCTIONS = """
+The operator-approved task.objective defines the work to accomplish, subject to current
+rules and restrictions. Address its information requests as well as the domain workflow.
+If a requested historical detail is absent from the starting context, use retrieve_context
+BEFORE concluding it was not recorded. Current entity details do not replace historical
+search. Try a focused alternative question if the first result is empty or irrelevant.
+Do not claim that a person, promise or earlier instruction was never mentioned just because
+it is missing from the initial context. Ask for review if an essential prerequisite remains unknown.
+If a tool returns NOT_DUE, no action happened. Do not repeat that premature action;
+finish your summary with the evidence already found and wait until its ready_at time.
+Give newly assigned work a concise task_title describing its business purpose. Do not use
+the word 'demo', internal versions, or test labels in titles. Preserve an existing display_title.
+For supervisor create_task actions, supply task_title for each specialist assignment.
 Read-only context tools are supplied by the platform, independently of domain tools.
 Use retrieve_context for a specific historical question, with provider and recording-date
 filters when justified. Use read_evidence to expand a cited source. Do not keep repeating
@@ -346,7 +358,8 @@ class RetrievalService:
             date_semantics="recorded_after inclusive; recorded_before exclusive; ingestion time",
             indexing={"unindexed_sources": pending, "complete": pending == 0},
             selection=(
-                "hybrid rank fusion; duplicate text removed within each source; no learned reranker"
+                "strongest semantic candidate retained first, then hybrid rank fusion; "
+                "duplicates removed within each source; no learned reranker"
             ),
             results=[],
             truncated=False,

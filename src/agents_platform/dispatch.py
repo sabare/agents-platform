@@ -12,6 +12,7 @@ from temporalio.service import RPCError, RPCStatusCode
 
 from agents_platform.execution import now
 from agents_platform.models import (
+    ActivityEvent,
     CaseCoordination,
     CheckInSeries,
     MonthlyCheckInSchedule,
@@ -24,6 +25,7 @@ from agents_platform.orchestration.workflows import (
     MonthlyCheckInWorkflow,
     TaskWorkflow,
 )
+from agents_platform.telemetry import emit
 
 
 async def dispatch_once(database, client, task_queue: str, tenant_id=None) -> bool:
@@ -40,6 +42,7 @@ async def dispatch_once(database, client, task_queue: str, tenant_id=None) -> bo
         )
         if message is None:
             return False
+        source_event = await session.get(ActivityEvent, message.event_id)
         try:
             if message.destination == "temporal.wake_monthly":
                 row = await session.scalar(
@@ -94,6 +97,17 @@ async def dispatch_once(database, client, task_queue: str, tenant_id=None) -> bo
                 task = await session.get(Task, UUID(message.payload["task_id"]))
                 if task is None or str(task.tenant_id) != message.payload["tenant_id"]:
                     raise ValueError("Outbox task scope mismatch")
+                if task.workflow_id != message.destination_key:
+                    message.status = "DELIVERED"  # Saved wake belongs to a superseded generation.
+                    return True
+                generation = task.progress_json.get("recovery_generation", 0)
+                if generation:
+                    message.payload = {
+                        **message.payload,
+                        "generation": generation,
+                        "cycle": task.progress_json["recovery_cycle"],
+                        "trigger": "recovery",
+                    }
                 target = TaskWorkflow.run
                 active = task.status not in ("COMPLETED", "FAILED", "CANCELLED")
             else:
@@ -115,7 +129,18 @@ async def dispatch_once(database, client, task_queue: str, tenant_id=None) -> bo
         except Exception as exc:
             message.attempts += 1
             message.available_at = now() + timedelta(seconds=min(30, 2 ** min(message.attempts, 5)))
-            logging.getLogger(__name__).warning("Outbox delivery failed (%s)", type(exc).__name__)
+            emit(
+                "outbox.delivery_failed",
+                logging.WARNING,
+                firm_id=message.tenant_id,
+                task_id=source_event.task_id if source_event else message.payload.get("task_id"),
+                case_id=source_event.case_id if source_event else message.payload.get("case_id"),
+                event_id=message.event_id,
+                workflow_id=message.destination_key,
+                outbox_id=message.id,
+                attempts=message.attempts,
+                error_type=type(exc).__name__,
+            )
         return True
 
 
@@ -124,6 +149,6 @@ async def dispatch_loop(database, client, task_queue: str):
         try:
             delivered = await dispatch_once(database, client, task_queue)
         except Exception as exc:
-            logging.getLogger(__name__).warning("Outbox unavailable (%s)", type(exc).__name__)
+            emit("outbox.unavailable", logging.ERROR, error_type=type(exc).__name__)
             delivered = False
         await asyncio.sleep(0.05 if delivered else 0.5)

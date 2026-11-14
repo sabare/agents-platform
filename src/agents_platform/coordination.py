@@ -13,6 +13,7 @@ from pydantic import Field, model_validator
 from sqlalchemy import select
 from temporalio import activity
 
+from agents_platform.capabilities import discover_capabilities
 from agents_platform.client_reviews import review_view
 from agents_platform.context import (
     PLATFORM_INSTRUCTIONS,
@@ -41,27 +42,46 @@ from agents_platform.models import (
 )
 from agents_platform.task_contracts import Contract, CreateRecordsTask, RecordRequirementInput
 from agents_platform.tasks import TaskError, create_records_task_in_transaction, read_task
+from agents_platform.telemetry import bind_context, observed_activity
 
 
 class RecordsTarget(Contract):
+    task_title: str | None = Field(default=None, min_length=1, max_length=160)
     patient_contact_id: UUID
     provider_contact_id: UUID
     requirements: list[RecordRequirementInput] = Field(min_length=1, max_length=20)
 
     @model_validator(mode="after")
     def validate_assignment(self):
-        CreateRecordsTask(case_id=UUID(int=0), objective="Validate target", **self.model_dump())
+        CreateRecordsTask(
+            case_id=UUID(int=0),
+            objective="Validate target",
+            **self.model_dump(exclude={"task_title"}),
+        )
         return self
+
+
+class ApprovedAssignment(Contract):
+    agent_key: str
+    agent_version: int = Field(gt=0)
+    objective: str = Field(min_length=1, max_length=2000)
+    assignment: dict
 
 
 class CaseObjective(Contract):
     objective: str = Field(min_length=1, max_length=2000)
     targets: list[RecordsTarget] = Field(default_factory=list, max_length=10)
+    approved_assignments: list[ApprovedAssignment] = Field(default_factory=list, max_length=10)
     expected_revision: int | None = Field(default=None, ge=1)
 
 
 class SupervisorAction(Contract):
-    type: Literal["create_task", "request_human_review"]
+    task_title: str | None = Field(default=None, min_length=1, max_length=160)
+    type: Literal["create_task", "delegate_task", "request_human_review"]
+    agent_key: str | None = None
+    agent_version: int | None = None
+    task_objective: str | None = Field(default=None, min_length=1, max_length=2000)
+    assignment_json: str | None = Field(default=None, max_length=20000)
     target_index: int | None
     question: str | None
 
@@ -216,112 +236,157 @@ async def enqueue_supervisor(session, event, *, force=False):
 
 async def submit_objective(session, tenant_id, case_id, body, key):
     async with session.begin():
-        case = await session.scalar(
-            select(Case).where(Case.tenant_id == tenant_id, Case.id == case_id).with_for_update()
+        return await submit_objective_in_transaction(session, tenant_id, case_id, body, key)
+
+
+async def submit_objective_in_transaction(session, tenant_id, case_id, body, key):
+    case = await session.scalar(
+        select(Case).where(Case.tenant_id == tenant_id, Case.id == case_id).with_for_update()
+    )
+    if case is None:
+        raise TaskError(404, "Case not found")
+    if case.status != "OPEN":
+        raise TaskError(409, "Supervisor requires an open case")
+    coord = await session.scalar(
+        select(CaseCoordination)
+        .where(CaseCoordination.tenant_id == tenant_id, CaseCoordination.case_id == case_id)
+        .with_for_update()
+    )
+    # Keep pre-catalog objective retries compatible when the new optional list is empty.
+    request_body = body.model_dump(mode="json")
+    if not body.approved_assignments:
+        request_body.pop("approved_assignments", None)
+    request_hash = digest(request_body)
+    dedupe = f"objective/{case_id}/{key}"
+    existing = await session.scalar(
+        select(ActivityEvent).where(
+            ActivityEvent.tenant_id == tenant_id,
+            ActivityEvent.producer == "case-operator",
+            ActivityEvent.dedupe_key == dedupe,
         )
-        if case is None:
-            raise TaskError(404, "Case not found")
-        if case.status != "OPEN":
-            raise TaskError(409, "Supervisor requires an open case")
-        coord = await session.scalar(
-            select(CaseCoordination)
-            .where(CaseCoordination.tenant_id == tenant_id, CaseCoordination.case_id == case_id)
-            .with_for_update()
-        )
-        dedupe = f"objective/{case_id}/{key}"
-        existing = await session.scalar(
-            select(ActivityEvent).where(
-                ActivityEvent.tenant_id == tenant_id,
-                ActivityEvent.producer == "case-operator",
-                ActivityEvent.dedupe_key == dedupe,
-            )
-        )
-        if existing:
-            if existing.payload["hash"] != digest(body.model_dump(mode="json")):
-                raise TaskError(409, "Idempotency key used for a different objective")
-            return coord.group_task_id, False
-        if coord and body.expected_revision != coord.revision:
-            raise TaskError(409, "Objective revision changed; reload and explicitly replace it")
-        if not coord and body.expected_revision is not None:
-            raise TaskError(409, "There is no objective to replace")
-        if (
-            await session.get(
-                AgentVersion, ("case_supervisor", coord.agent_version if coord else 2)
-            )
-            is None
+    )
+    if existing:
+        if existing.payload["hash"] != request_hash:
+            raise TaskError(409, "Idempotency key used for a different objective")
+        return coord.group_task_id, False
+    if coord and body.expected_revision != coord.revision:
+        raise TaskError(409, "Objective revision changed; reload and explicitly replace it")
+    if not coord and body.expected_revision is not None:
+        raise TaskError(409, "There is no objective to replace")
+    if await session.get(AgentVersion, ("case_supervisor", 3)) is None:
+        raise TaskError(422, "Publish the supervisor definition with agents-seed first")
+    for target in body.targets:
+        for contact, roles in (
+            (target.patient_contact_id, {"PATIENT", "CLIENT"}),
+            (target.provider_contact_id, {"MEDICAL_PROVIDER"}),
         ):
-            raise TaskError(422, "Publish the supervisor definition with agents-seed first")
-        for target in body.targets:
-            for contact, roles in (
-                (target.patient_contact_id, {"PATIENT", "CLIENT"}),
-                (target.provider_contact_id, {"MEDICAL_PROVIDER"}),
-            ):
-                entry = await session.scalar(
-                    select(CaseContact).where(
-                        CaseContact.tenant_id == tenant_id,
-                        CaseContact.case_id == case_id,
-                        CaseContact.contact_id == contact,
-                    )
+            entry = await session.scalar(
+                select(CaseContact).where(
+                    CaseContact.tenant_id == tenant_id,
+                    CaseContact.case_id == case_id,
+                    CaseContact.contact_id == contact,
                 )
-                if not entry or not roles.intersection(entry.roles):
-                    raise TaskError(
-                        422, "Target participants must have the required roles in this case"
-                    )
-        if coord is None:
-            group = Task(
-                id=uuid4(),
-                tenant_id=tenant_id,
-                case_id=case_id,
-                kind="GROUP",
-                task_type="case.coordination",
-                objective="Case coordination",
-                input_schema="group.v1",
-                input_json={},
-                progress_json={},
-                completion_json={},
-                status="PENDING",
             )
-            session.add(group)
-            await session.flush()
-            coord = CaseCoordination(
-                id=uuid4(),
-                tenant_id=tenant_id,
-                case_id=case_id,
-                group_task_id=group.id,
-                workflow_id=f"firm/{tenant_id}/case/{case_id}/supervisor",
-                objective_json={},
-                agent_version=2,
-            )
-            session.add(coord)
-            await session.flush()
-        coord.objective_json = body.model_dump(mode="json", exclude={"expected_revision"})
-        coord.plan_json = {}
-        coord.status, coord.stall_count = "PENDING", 0
-        event = ActivityEvent(
+            if not entry or not roles.intersection(entry.roles):
+                raise TaskError(
+                    422, "Target participants must have the required roles in this case"
+                )
+    if coord is None:
+        group = Task(
             id=uuid4(),
             tenant_id=tenant_id,
             case_id=case_id,
-            task_id=coord.group_task_id,
-            event_type="case.objective_submitted",
-            producer="case-operator",
-            dedupe_key=dedupe,
-            actor_ref="local-operator",
-            payload={
-                "objective": body.objective,
-                "hash": digest(body.model_dump(mode="json")),
-                "targets": len(body.targets),
-            },
+            kind="GROUP",
+            task_type="case.coordination",
+            objective="Case coordination",
+            input_schema="group.v1",
+            input_json={},
+            progress_json={},
+            completion_json={},
+            status="PENDING",
         )
-        session.add(event)
-        await enqueue_supervisor(session, event, force=True)
-        return coord.group_task_id, True
+        session.add(group)
+        await session.flush()
+        coord = CaseCoordination(
+            id=uuid4(),
+            tenant_id=tenant_id,
+            case_id=case_id,
+            group_task_id=group.id,
+            workflow_id=f"firm/{tenant_id}/case/{case_id}/supervisor",
+            objective_json={},
+            agent_version=3,
+        )
+        session.add(coord)
+        await session.flush()
+    catalog = discover_capabilities()
+    cards = await catalog.available(session)
+    normalized_assignments = []
+    for assignment in body.approved_assignments:
+        from agents_platform.delegation import validate_delegation
+
+        try:
+            _, normalized = validate_delegation(
+                catalog,
+                cards,
+                SupervisorAction(
+                    type="delegate_task",
+                    target_index=None,
+                    question=None,
+                    agent_key=assignment.agent_key,
+                    agent_version=assignment.agent_version,
+                    task_objective=assignment.objective,
+                    assignment_json=json.dumps(assignment.assignment),
+                ),
+                [],
+            )
+            normalized_assignments.append(
+                {
+                    **assignment.model_dump(mode="json"),
+                    "assignment": normalized,
+                }
+            )
+        except ValueError as exc:
+            raise TaskError(422, str(exc)) from exc
+    coord.agent_version = 3
+    coord.objective_json = body.model_dump(mode="json", exclude={"expected_revision"})
+    coord.objective_json = {
+        **coord.objective_json,
+        "approved_assignments": normalized_assignments,
+    }
+    coord.plan_json = {}
+    coord.status, coord.stall_count = "PENDING", 0
+    from agents_platform.human_requests import retire_requests
+
+    await retire_requests(
+        session, await session.get(Task, coord.group_task_id), handler="supervisor_objective.v1"
+    )
+    event = ActivityEvent(
+        id=uuid4(),
+        tenant_id=tenant_id,
+        case_id=case_id,
+        task_id=coord.group_task_id,
+        event_type="case.objective_submitted",
+        producer="case-operator",
+        dedupe_key=dedupe,
+        actor_ref="local-operator",
+        payload={
+            "objective": body.objective,
+            "hash": request_hash,
+            "targets": len(body.targets),
+        },
+    )
+    session.add(event)
+    await enqueue_supervisor(session, event, force=True)
+    return coord.group_task_id, True
 
 
 class SupervisorActivities:
-    def __init__(self, database, settings):
+    def __init__(self, database, settings, catalog=None):
         self.database, self.settings = database, settings
+        self.catalog = catalog or discover_capabilities()
 
     @activity.defn
+    @observed_activity
     async def coordinate_case(self, activation: dict):
         # Calendar cadence is operator-approved. Its deterministic delegation belongs to
         # case coordination; published records-only model definitions remain unchanged.
@@ -359,6 +424,12 @@ class SupervisorActivities:
             if case.status != "OPEN":
                 return {"status": "CLOSED"}
             run_id = uuid5(coord.group_task_id, f"supervisor/{activation['cycle']}")
+            bind_context(
+                case_id=case_id,
+                task_id=coord.group_task_id,
+                execution_id=run_id,
+                workflow_id=coord.workflow_id,
+            )
             run = await session.get(Execution, run_id)
             if run and run.outcome_json is not None:
                 return run.outcome_json
@@ -366,6 +437,15 @@ class SupervisorActivities:
                 return {"status": "WAITING"}
             if run:
                 if "memory" not in run.context_json:
+                    run.status, run.finished_at, run.outcome_json = (
+                        "STALE",
+                        now(),
+                        {"status": "CONTINUE"},
+                    )
+                    return run.outcome_json
+                if coord.agent_version >= 3 and run.context_json.get("capabilities") != (
+                    await self.catalog.available(session)
+                ):
                     run.status, run.finished_at, run.outcome_json = (
                         "STALE",
                         now(),
@@ -434,12 +514,22 @@ class SupervisorActivities:
                 "history": await historical_context(
                     session, tenant, case_id, coord.objective_json.get("objective", "case history")
                 ),
-                "capabilities": [
-                    {
-                        "agent_key": "medical_records_collector",
-                        "version": 3 if coord.agent_version >= 2 else 2,
-                        "stage": "durable_demo",
-                    }
+                "capabilities": await self.catalog.available(session),
+                "contacts": [
+                    {"id": str(contact.id), "name": contact.display_name, "roles": link.roles}
+                    for contact, link in (
+                        await session.execute(
+                            select(Contact, CaseContact)
+                            .join(
+                                CaseContact,
+                                (Contact.id == CaseContact.contact_id)
+                                & (Contact.tenant_id == CaseContact.tenant_id),
+                            )
+                            .where(CaseContact.tenant_id == tenant, CaseContact.case_id == case_id)
+                            .order_by(Contact.id)
+                            .limit(201)
+                        )
+                    ).all()
                 ],
                 "agent_definition_hash": definition.definition_hash,
                 "inbox_ids": [str(i.id) for i in inbox],
@@ -493,11 +583,21 @@ class SupervisorActivities:
         model = SupervisorScriptedModel(context) if run.mode == "scripted" else definition["model"]
         retrieval = ExecutionRetrieval(self.database, self.settings, run, context)
         budget = ModelBudget(context, self.settings)
+        from agents_platform.delegation import delegation_tools
+
+        proposals = []
+        specialist_tools = (
+            delegation_tools(
+                self.catalog, context.get("capabilities", []), proposals, SupervisorAction
+            )
+            if definition["version"] >= 3
+            else []
+        )
         agent = Agent(
             name=definition["name"],
             model=model,
             instructions=definition["instructions"] + PLATFORM_INSTRUCTIONS,
-            tools=retrieval.tools(),
+            tools=[*retrieval.tools(), *specialist_tools],
             model_settings=ModelSettings(max_tokens=self.settings.context_output_tokens),
             output_type=SupervisorDecision,
         )
@@ -524,8 +624,14 @@ class SupervisorActivities:
                 objective_satisfied=False,
                 next_review_at=None,
             ), {"context_budget_exceeded": True, "context_budget": budget.report()}
+        decision = result.final_output
+        for proposal in proposals:
+            if proposal not in decision.actions:
+                decision.actions.append(proposal)
+        if len(decision.actions) > 3:
+            raise ValueError("Supervisor exceeded the three-action budget")
         usage = result.context_wrapper.usage
-        return result.final_output, {
+        return decision, {
             **{
                 k: getattr(usage, k)
                 for k in ("requests", "input_tokens", "output_tokens", "total_tokens")
@@ -656,8 +762,13 @@ class SupervisorActivities:
                 }
                 for u in client_updates
             ]
+            generic_mode = coord.agent_version >= 3 and (
+                not targets or bool(coord.objective_json.get("approved_assignments"))
+            )
             if truncated or (
-                not targets and not coord.objective_json.get("monitor_client_updates")
+                not generic_mode
+                and not targets
+                and not coord.objective_json.get("monitor_client_updates")
             ):
                 review("Clarify the records targets; a complete task overview is required.")
             if any(
@@ -666,6 +777,30 @@ class SupervisorActivities:
                 for a in decision.actions
             ):
                 rejected.append("Assignment refers to an unapproved target")
+            from agents_platform.delegation import apply_delegation, validate_delegation
+
+            validated_delegations = {}
+            for index, action in enumerate(decision.actions):
+                if action.type != "delegate_task":
+                    continue
+                try:
+                    if coord.agent_version < 3:
+                        raise ValueError(
+                            "This supervisor version does not support generic delegation"
+                        )
+                    if targets and action.agent_key == "medical_records_collector":
+                        raise ValueError("Use approved target indices for this records objective")
+                    card, payload = validate_delegation(
+                        self.catalog,
+                        context.get("capabilities", []),
+                        action,
+                        coord.objective_json.get("approved_assignments", []),
+                    )
+                    if card not in await self.catalog.available(session):
+                        raise ValueError("Capability is no longer published or exposed")
+                    validated_delegations[index] = (card, payload)
+                except ValueError as exc:
+                    rejected.append(str(exc))
             # Re-check participants before applying any action in the batch.
             for action in decision.actions:
                 if (
@@ -691,7 +826,32 @@ class SupervisorActivities:
                             "Approved participant roles changed; operator review required"
                         )
             if not rejected and not truncated:
-                for action in decision.actions:
+                for index, action in enumerate(decision.actions):
+                    if action.type == "delegate_task":
+                        from fastapi import HTTPException
+
+                        card, payload = validated_delegations[index]
+                        try:
+                            # Domain rejection rolls back its business rows/outbox as one unit.
+                            async with session.begin_nested():
+                                task_row, created = await apply_delegation(
+                                    session, self.catalog, coord, action, card, payload
+                                )
+                                task = (
+                                    await read_task(session, coord.tenant_id, task_row.id)
+                                ).model_dump(mode="json")
+                            if not any(t["id"] == task["id"] for t in tasks):
+                                tasks.append(task)
+                            applied.append(
+                                {
+                                    "type": "create_task" if created else "reuse_task",
+                                    "task_id": task["id"],
+                                    "agent_key": card["agent_key"],
+                                }
+                            )
+                        except (TaskError, HTTPException, ValueError) as exc:
+                            review(str(getattr(exc, "detail", exc)))
+                        continue
                     if action.type == "request_human_review":
                         review(action.question or "Clarify the next permitted step.")
                         continue
@@ -741,7 +901,7 @@ class SupervisorActivities:
                         parent_task_id=coord.group_task_id,
                         agent_version=3 if coord.agent_version >= 2 else 2,
                         objective=f"Collect {record_names} from {provider.display_name}",
-                        **target,
+                        **{k: v for k, v in target.items() if k != "task_title"},
                     )
                     view, created = await create_records_task_in_transaction(
                         session,
@@ -753,6 +913,10 @@ class SupervisorActivities:
                     task = view.model_dump(mode="json")
                     task["verified_requirement_ids"] = []
                     tasks.append(task)
+                    title = action.task_title or target.get("task_title")
+                    if created and title:
+                        assigned = await session.get(Task, view.id)
+                        assigned.progress_json = {**assigned.progress_json, "display_title": title}
                     applied.append(
                         {
                             "type": "create_task" if created else "reuse_task",
@@ -788,11 +952,71 @@ class SupervisorActivities:
                     for target in targets
                 )
             )
+            delegated = [
+                t
+                for t in tasks
+                if t["parent_task_id"] == str(coord.group_task_id)
+                and t["progress_json"].get("supervisor_delegation")
+            ]
+            if generic_mode:
+                completed = set(
+                    (
+                        await session.scalars(
+                            select(Execution.task_id).where(
+                                Execution.tenant_id == coord.tenant_id,
+                                Execution.case_id == coord.case_id,
+                                Execution.task_id.in_([UUID(t["id"]) for t in delegated]),
+                                Execution.status == "SUCCEEDED",
+                                Execution.outcome_json["status"].as_string() == "COMPLETED",
+                            )
+                        )
+                    ).all()
+                )
+                approved = coord.objective_json.get("approved_assignments", [])
+                approved_covered = all(
+                    any(
+                        t["agent_key"] == a["agent_key"]
+                        and t["agent_version"] == a["agent_version"]
+                        and t["progress_json"]["supervisor_delegation"]["assignment"]
+                        == a["assignment"]
+                        for t in delegated
+                    )
+                    for a in approved
+                )
+                records_covered = all_covered if targets else True
+                all_covered = (
+                    records_covered
+                    and bool(delegated)
+                    and approved_covered
+                    and not truncated
+                    and all(
+                        t["status"] == "COMPLETED" and UUID(t["id"]) in completed for t in delegated
+                    )
+                )
+                for task in delegated:
+                    if task["status"] in ("BLOCKED", "FAILED", "CANCELLED"):
+                        review(
+                            task["progress_json"].get("last_reason", "Specialist needs review."),
+                            task["id"],
+                        )
+                if (
+                    not delegated
+                    and not applied
+                    and not reviews
+                    and not coord.objective_json.get("monitor_client_updates")
+                ):
+                    review(
+                        "No specialist assignment covers the objective; clarify required inputs."
+                    )
             if decision.objective_satisfied and not all_covered:
                 review("Completion proposed without verified evidence for every approved target.")
             if coord.stall_count >= 2:
                 review("Repeated invalid decisions; explicit operator revision is required.")
-            uncovered = any(not covering_tasks(t, tasks) for t in targets)
+            uncovered = (
+                (not approved_covered or any(not covering_tasks(t, tasks) for t in targets))
+                if generic_mode
+                else any(not covering_tasks(t, tasks) for t in targets)
+            )
             if not reviews and uncovered and not applied:
                 review("No assignment covers the approved scope; clarify the next action.")
             if all_covered and not decision.objective_satisfied and not decision.actions:
@@ -831,9 +1055,13 @@ class SupervisorActivities:
                 "target_task_ids": [
                     [t["id"] for t in covering_tasks(target, tasks)] for target in targets
                 ],
+                "delegated_task_ids": [t["id"] for t in delegated],
                 "last_execution_id": str(run.id),
             }
             coord.plan_json, coord.status = plan, status
+            from agents_platform.human_request_handlers import sync_supervisor_request
+
+            await sync_supervisor_request(session, coord)
             coord.revision += 1
             run.status, run.decision_json, run.outcome_json, run.usage_json, run.finished_at = (
                 "SUCCEEDED",
@@ -879,6 +1107,7 @@ class SupervisorActivities:
             return outcome
 
     @activity.defn
+    @observed_activity
     async def fail_supervisor(self, activation):
         async with self.database.sessions.begin() as session:
             coord = await session.scalar(
@@ -940,7 +1169,28 @@ class SupervisorScriptedModel(Model):
                 actions.append(
                     SupervisorAction(type="create_task", target_index=index, question=None)
                 )
-        if not targets or ctx["tasks_truncated"]:
+        approved = ctx["objective"].get("approved_assignments", [])
+        delegated = [t for t in tasks if t["progress_json"].get("supervisor_delegation")]
+        for assignment in approved:
+            if not any(
+                t["agent_key"] == assignment["agent_key"]
+                and t["agent_version"] == assignment["agent_version"]
+                and t["progress_json"]["supervisor_delegation"]["assignment"]
+                == assignment["assignment"]
+                for t in delegated
+            ):
+                actions.append(
+                    SupervisorAction(
+                        type="delegate_task",
+                        target_index=None,
+                        question=None,
+                        agent_key=assignment["agent_key"],
+                        agent_version=assignment["agent_version"],
+                        task_objective=assignment["objective"],
+                        assignment_json=json.dumps(assignment["assignment"]),
+                    )
+                )
+        if (not targets and not approved and not delegated) or ctx["tasks_truncated"]:
             actions = [
                 SupervisorAction(
                     type="request_human_review",
@@ -951,8 +1201,14 @@ class SupervisorScriptedModel(Model):
         complete = bool(targets) and all(
             any(verified(t, target) for t in covering_tasks(target, tasks)) for target in targets
         )
+        if delegated:
+            complete = (
+                (complete if targets else True)
+                and all(t["status"] == "COMPLETED" for t in delegated)
+                and not actions
+            )
         decision = SupervisorDecision(
-            summary="Approved records targets are verified complete."
+            summary="Approved specialist work is verified complete."
             if complete
             else "Review approved targets and monitor existing specialist work.",
             evidence_event_ids=[UUID(e["id"]) for e in ctx["new_events"]],

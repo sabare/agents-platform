@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from contextlib import asynccontextmanager
+import time
+from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -9,22 +10,30 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from temporalio.api.workflowservice.v1 import DescribeNamespaceRequest
 from temporalio.client import WorkflowExecutionStatus
 from temporalio.service import RPCError, RPCStatusCode
 
+from agents_platform.assignment_router import router as assignment_router
 from agents_platform.check_in_api import router as check_in_router
 from agents_platform.check_in_series import router as series_router
 from agents_platform.config import Settings, get_settings
 from agents_platform.dashboard import router as dashboard_router
 from agents_platform.db import Database
+from agents_platform.human_requests import router as human_router
 from agents_platform.memory_api import router as memory_router
+from agents_platform.models import Task
 from agents_platform.monthly_check_ins import router as monthly_router
+from agents_platform.operations import monitor_loop
+from agents_platform.operations import router as operations_router
 from agents_platform.orchestration.client import connect_temporal
 from agents_platform.orchestration.contracts import ProbeInput, ProbeResult
 from agents_platform.orchestration.workflows import InfrastructureProbe
+from agents_platform.recovery import router as recovery_router
 from agents_platform.supervisor_api import router as supervisor_router
 from agents_platform.task_api import router as task_router
+from agents_platform.telemetry import configure_logging, emit, log_context
 
 logger = logging.getLogger(__name__)
 
@@ -38,25 +47,87 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        logging.basicConfig(level=settings.log_level)
+        configure_logging(settings.log_level)
         app.state.settings = settings
         app.state.database = Database(settings.database_url)
         app.state.temporal = None
         # Clients connect lazily so liveness/docs remain available during an outage.
         app.state.temporal_lock = asyncio.Lock()
+        monitor = asyncio.create_task(monitor_loop(app.state.database, settings))
         try:
             yield
         finally:
+            monitor.cancel()
+            with suppress(asyncio.CancelledError):
+                await monitor
             await app.state.database.close()
 
     app = FastAPI(title="HelloCounsel Agents Platform", version="0.1.0", lifespan=lifespan)
+    app.include_router(operations_router)
     app.include_router(task_router)
+    app.include_router(assignment_router)
+    app.include_router(recovery_router)
+    app.include_router(human_router)
     app.include_router(check_in_router)
     app.include_router(series_router)
     app.include_router(memory_router)
     app.include_router(monthly_router)
     app.include_router(supervisor_router)
     app.include_router(dashboard_router)
+
+    @app.middleware("http")
+    async def correlated_request(request: Request, call_next):
+        request_id = str(uuid4())
+        started = time.monotonic()
+        with log_context(request_id=request_id):
+            try:
+                response = await call_next(request)
+            except Exception as exc:
+                emit(
+                    "http.failed",
+                    logging.ERROR,
+                    error_type=type(exc).__name__,
+                    firm_id=request.path_params.get("tenant_id"),
+                    case_id=request.path_params.get("case_id"),
+                    task_id=request.path_params.get("task_id"),
+                )
+                raise
+            params = request.path_params
+            case_id, workflow_id = params.get("case_id"), None
+            if params.get("task_id") and response.status_code < 400:
+                try:
+                    async with request.app.state.database.sessions() as session:
+                        linked = (
+                            await session.execute(
+                                select(Task.case_id, Task.workflow_id).where(
+                                    Task.id == UUID(str(params["task_id"])),
+                                    Task.tenant_id == UUID(str(params["tenant_id"])),
+                                )
+                            )
+                        ).first()
+                        if linked:
+                            case_id, workflow_id = linked
+                except Exception as exc:
+                    emit(
+                        "http.correlation_lookup_failed",
+                        logging.WARNING,
+                        error_type=type(exc).__name__,
+                    )
+            if not request.url.path.startswith("/assets/"):
+                emit(
+                    "http.finished",
+                    method=request.method,
+                    route=getattr(request.scope.get("route"), "path", "unmatched"),
+                    status_code=response.status_code,
+                    duration_ms=round((time.monotonic() - started) * 1000, 2),
+                    firm_id=params.get("tenant_id"),
+                    case_id=case_id,
+                    workflow_id=workflow_id,
+                    task_id=params.get("task_id"),
+                )
+            response.headers["X-Request-ID"] = request_id
+            return response
+
     static = Path(__file__).parent / "static"
     app.mount("/assets", StaticFiles(directory=static), name="assets")
 

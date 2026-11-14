@@ -3,6 +3,7 @@
 from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -50,6 +51,8 @@ class CreateRecordsTask(Contract):
 
 class RequirementView(RecordRequirementInput):
     id: UUID
+    status: Literal["RECEIVED", "OUTSTANDING"] = "OUTSTANDING"
+    evidence_source_ids: list[UUID] = Field(default_factory=list)
 
 
 class RecordsRequestView(Contract):
@@ -62,6 +65,8 @@ class RecordsRequestView(Contract):
     reminder_count: int = 0
     max_reminders: int = 3
     next_reminder_at: datetime | None = None
+    callback_at: datetime | None = None
+    callback_timezone: str | None = None
 
 
 class TaskSnapshot(Contract):
@@ -100,8 +105,42 @@ class EventView(Contract):
 
 
 class ProviderUpdate(Contract):
-    status: Literal["PENDING", "RECEIVED"]
+    status: Literal["PENDING", "PARTIAL", "RECEIVED"]
     message: str = Field(min_length=1, max_length=2000)
+    received_requirement_ids: list[UUID] | None = Field(default=None, max_length=20)
+    callback_at: datetime | None = None
+    callback_date: date | None = None
+    callback_timezone: str | None = Field(default=None, max_length=100)
+    callback_local_time: str = Field(default="09:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    clear_callback: bool = False
+
+    @model_validator(mode="after")
+    def valid_callback(self):
+        ids = self.received_requirement_ids
+        if ids is not None and (not ids or len(ids) != len(set(ids))):
+            raise ValueError("Provide a nonempty list of distinct received requirement IDs")
+        if self.status == "PARTIAL" and ids is None:
+            raise ValueError("Partial receipt requires explicit received_requirement_ids")
+        if self.status == "PENDING" and ids is not None:
+            raise ValueError("Use PARTIAL or RECEIVED when attaching received items")
+        if self.callback_timezone:
+            try:
+                ZoneInfo(self.callback_timezone)
+            except (ZoneInfoNotFoundError, ValueError) as exc:
+                raise ValueError(
+                    "Use a valid hospital IANA timezone, e.g. America/New_York"
+                ) from exc
+        if self.callback_at and self.callback_at.tzinfo is None:
+            raise ValueError("callback_at requires a timezone offset")
+        if self.callback_at and self.callback_date:
+            raise ValueError("Provide callback_at or callback_date, not both")
+        if self.callback_date and not self.callback_timezone:
+            raise ValueError("callback_date requires the hospital timezone")
+        if self.clear_callback and (self.callback_at or self.callback_date):
+            raise ValueError("Cannot clear and schedule a callback together")
+        if self.status == "RECEIVED" and (self.callback_at or self.callback_date):
+            raise ValueError("Received records cannot have a pending callback")
+        return self
 
 
 class Observation(Contract):
@@ -116,6 +155,7 @@ class NextAction(Contract):
 
 
 class AgentDecision(Contract):
+    task_title: str | None = Field(default=None, min_length=1, max_length=160)
     summary: str
     observations: list[Observation]
     next_action: NextAction

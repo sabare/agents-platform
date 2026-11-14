@@ -153,7 +153,7 @@ async def ensure_monitor(session, tenant_id, case_id):
         tenant_id=tenant_id,
         case_id=case_id,
         group_task_id=group.id,
-        agent_version=2 if await session.get(AgentVersion, ("case_supervisor", 2)) else 1,
+        agent_version=3 if await session.get(AgentVersion, ("case_supervisor", 3)) else 2,
         workflow_id=f"firm/{tenant_id}/case/{case_id}/supervisor",
         objective_json={
             "objective": "Monitor client reports and surface meaningful changes for the firm.",

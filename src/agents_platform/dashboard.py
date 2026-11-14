@@ -2,7 +2,7 @@
 
 import hashlib
 from collections import Counter
-from typing import Annotated, Literal
+from typing import Annotated
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
@@ -10,6 +10,7 @@ from pydantic import Field
 from sqlalchemy import Integer, cast, func, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from agents_platform.capabilities import discover_capabilities
 from agents_platform.db import session_dependency
 from agents_platform.models import (
     ActivityEvent,
@@ -21,6 +22,7 @@ from agents_platform.models import (
     Execution,
     Firm,
     OutboxMessage,
+    RecordsRequest,
     Source,
     Task,
     TaskInbox,
@@ -36,9 +38,7 @@ Session = Annotated[AsyncSession, Depends(session_dependency)]
 
 class CommentInput(Contract):
     text: str = Field(min_length=1, max_length=4000)
-    mentions: list[Literal["supervisor", "medical_records_collector", "client_check_in"]] = Field(
-        default_factory=list, max_length=3
-    )
+    mentions: list[str] = Field(default_factory=list, max_length=3)
     wake_agent: bool = False
 
 
@@ -52,18 +52,18 @@ async def workspace(session: Session, request: Request):
             {
                 "key": "supervisor",
                 "name": "Case supervisor",
-                "capability": "Durable case coordinator (v1)",
+                "capability": "Durable case coordinator",
+                "description": "Assign specialists and review case progress.",
             },
-            {
-                "key": "medical_records_collector",
-                "name": "Medical records",
-                "capability": "Durable workflow · v2",
-            },
-            {
-                "key": "client_check_in",
-                "name": "Client check-in",
-                "capability": "Durable scheduled check-in · v1",
-            },
+            *[
+                {
+                    "key": c["agent_key"],
+                    "name": c["name"],
+                    "capability": c["description"],
+                    "description": c["description"],
+                }
+                for c in await discover_capabilities().available(session)
+            ],
         ],
     }
 
@@ -158,7 +158,15 @@ async def overview(tenant_id: UUID, session: Session):
             {"id": c.id, "name": c.display_name, "case_id": cc.case_id, "roles": cc.roles}
             for cc, c in contacts
         ],
-        "groups": [{"id": g.id, "case_id": g.case_id, "objective": g.objective} for g in groups],
+        "groups": [
+            {
+                "id": g.id,
+                "case_id": g.case_id,
+                "objective": g.objective,
+                "progress": g.progress_json,
+            }
+            for g in groups
+        ],
         "versions": [v.version for v in versions if v.version >= 2],
     }
 
@@ -243,10 +251,23 @@ async def comment(
                 "woke_agent": existing.payload["woke_agent"],
                 "replayed": True,
             }
+        catalog = discover_capabilities()
+        if not set(body.mentions) <= {"supervisor", *catalog.capabilities}:
+            raise HTTPException(422, "Mention refers to an unregistered agent")
+        runnable = False
+        if body.wake_agent and task.kind == "AGENT":
+            published = await session.get(AgentVersion, (task.agent_key, task.agent_version))
+            if published:
+                try:
+                    catalog.adapters.for_execution(task, published.definition_snapshot)
+                    runnable = (
+                        published.definition_snapshot.get("capability_stage") == "durable_demo"
+                    )
+                except ValueError:
+                    pass
         if body.wake_agent and (
             task.kind != "AGENT"
-            or task.agent_key not in ("medical_records_collector", "client_check_in")
-            or (task.agent_key == "medical_records_collector" and task.agent_version < 2)
+            or not runnable
             or task.status in ("COMPLETED", "FAILED", "CANCELLED")
             or task.agent_key not in body.mentions
         ):
@@ -323,7 +344,12 @@ async def activity_feed(
     before: UUID | None = None,
     limit: int = Query(default=100, ge=1, le=200),
 ):
-    query = select(ActivityEvent).where(ActivityEvent.tenant_id == tenant_id)
+    # Naming is presentation metadata, not another assignment or business update.
+    # Keep its audit row, but exclude it before pagination of the operator feed.
+    query = select(ActivityEvent).where(
+        ActivityEvent.tenant_id == tenant_id,
+        ActivityEvent.event_type != "task.title_assigned",
+    )
     if task_id:
         query = query.where(ActivityEvent.task_id == task_id)
     if case_id:
@@ -347,6 +373,28 @@ async def activity_feed(
             )
         )
     ).all()
+    provider_task_ids = [
+        e.task_id for e in events[:limit] if e.event_type == "provider.response_received"
+    ]
+    providers = {}
+    if provider_task_ids:
+        rows = (
+            await session.execute(
+                select(RecordsRequest.task_id, Contact.id, Contact.display_name)
+                .join(
+                    Contact,
+                    (Contact.id == RecordsRequest.provider_contact_id)
+                    & (Contact.tenant_id == RecordsRequest.tenant_id),
+                )
+                .where(
+                    RecordsRequest.tenant_id == tenant_id,
+                    RecordsRequest.task_id.in_(provider_task_ids),
+                )
+            )
+        ).all()
+        providers = {
+            task_id: {"id": str(contact_id), "name": name} for task_id, contact_id, name in rows
+        }
     return {
         "items": [
             {
@@ -355,6 +403,18 @@ async def activity_feed(
                 "case_id": e.case_id,
                 "type": e.event_type,
                 "actor": e.actor_ref,
+                "source_actor": (
+                    {"id": e.payload["provider_contact_id"], "name": e.payload["provider_name"]}
+                    if e.event_type == "provider.response_received"
+                    and e.payload.get("provider_name")
+                    else providers.get(e.task_id)
+                    if e.event_type == "provider.response_received"
+                    else None
+                ),
+                "recorded_by": e.actor_ref
+                if e.event_type == "provider.response_received"
+                else None,
+                "simulated": bool(e.payload.get("simulated") or e.producer == "demo-provider"),
                 "payload": e.payload,
                 "created_at": e.created_at,
             }

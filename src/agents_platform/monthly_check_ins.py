@@ -30,6 +30,7 @@ from agents_platform.models import (
 )
 from agents_platform.task_api import Session, require_operator
 from agents_platform.task_contracts import Contract
+from agents_platform.telemetry import observed_activity
 
 router = APIRouter(
     prefix="/v1/firms/{tenant_id}/cases/{case_id}/monthly-check-ins",
@@ -212,109 +213,113 @@ async def read_schedule(session, row):
 async def create_monthly(
     tenant_id: UUID, case_id: UUID, body: CreateMonthly, session: Session, key: Key
 ):
+    async with session.begin():
+        return await create_monthly_in_transaction(session, tenant_id, case_id, body, key)
+
+
+async def create_monthly_in_transaction(session, tenant_id, case_id, body, key):
     from agents_platform.check_in_api import ensure_monitor
     from agents_platform.coordination import digest
 
     if not key.strip():
         raise HTTPException(422, "Idempotency-Key must not be blank")
-    async with session.begin():
-        await policy_lock(session, tenant_id, publishing=True)
-        case = await session.scalar(
-            select(Case).where(Case.tenant_id == tenant_id, Case.id == case_id).with_for_update()
+    await policy_lock(session, tenant_id, publishing=True)
+    case = await session.scalar(
+        select(Case).where(Case.tenant_id == tenant_id, Case.id == case_id).with_for_update()
+    )
+    if not case:
+        raise HTTPException(404, "Case not found")
+    previous = await session.scalar(
+        select(MonthlyCheckInSchedule).where(
+            MonthlyCheckInSchedule.tenant_id == tenant_id,
+            MonthlyCheckInSchedule.creation_key == key,
         )
-        if not case:
-            raise HTTPException(404, "Case not found")
-        previous = await session.scalar(
-            select(MonthlyCheckInSchedule).where(
-                MonthlyCheckInSchedule.tenant_id == tenant_id,
-                MonthlyCheckInSchedule.creation_key == key,
+    )
+    fingerprint = digest({"case_id": str(case_id), **body.model_dump(mode="json")})
+    if previous:
+        if previous.creation_hash != fingerprint:
+            raise HTTPException(409, "Idempotency key conflicts with another schedule")
+        return {**await read_schedule(session, previous), "replayed": True}
+    if case.status != "OPEN":
+        raise HTTPException(409, "Monthly check-ins require an open case")
+    contact = await session.scalar(
+        select(CaseContact).where(
+            CaseContact.tenant_id == tenant_id,
+            CaseContact.case_id == case_id,
+            CaseContact.contact_id == body.client_contact_id,
+        )
+    )
+    if not contact or not {"CLIENT", "PATIENT"}.intersection(contact.roles):
+        raise HTTPException(422, "Client must belong to this case")
+    for model in (MonthlyCheckInSchedule, CheckInSeries):
+        if await session.scalar(
+            select(model.id).where(
+                model.tenant_id == tenant_id,
+                model.case_id == case_id,
+                model.client_contact_id == body.client_contact_id,
+                model.status.in_(["ACTIVE", "PAUSED"]),
             )
-        )
-        fingerprint = digest({"case_id": str(case_id), **body.model_dump(mode="json")})
-        if previous:
-            if previous.creation_hash != fingerprint:
-                raise HTTPException(409, "Idempotency key conflicts with another schedule")
-            return {**await read_schedule(session, previous), "replayed": True}
-        if case.status != "OPEN":
-            raise HTTPException(409, "Monthly check-ins require an open case")
-        contact = await session.scalar(
-            select(CaseContact).where(
-                CaseContact.tenant_id == tenant_id,
-                CaseContact.case_id == case_id,
-                CaseContact.contact_id == body.client_contact_id,
-            )
-        )
-        if not contact or not {"CLIENT", "PATIENT"}.intersection(contact.roles):
-            raise HTTPException(422, "Client must belong to this case")
-        for model in (MonthlyCheckInSchedule, CheckInSeries):
-            if await session.scalar(
-                select(model.id).where(
-                    model.tenant_id == tenant_id,
-                    model.case_id == case_id,
-                    model.client_contact_id == body.client_contact_id,
-                    model.status.in_(["ACTIVE", "PAUSED"]),
-                )
-            ):
-                raise HTTPException(
-                    409, "Client already has a live cadence; stop it before creating another"
-                )
-        if not await session.get(AgentVersion, ("client_check_in", 1)) or not (
-            await session.get(AgentVersion, ("case_supervisor", 2))
-            or await session.get(AgentVersion, ("case_supervisor", 1))
         ):
             raise HTTPException(
-                409, "Publish check-in and supervisor definitions with the seed command"
+                409, "Client already has a live cadence; stop it before creating another"
             )
-        coord = await ensure_monitor(session, tenant_id, case_id)
-        schedule_id, group_id = uuid4(), uuid4()
-        session.add(
-            Task(
-                id=group_id,
-                tenant_id=tenant_id,
-                case_id=case_id,
-                parent_task_id=coord.group_task_id,
-                kind="GROUP",
-                task_type="client.monthly_schedule",
-                objective=body.objective,
-                input_schema="group.v1",
-                input_json={"monthly_schedule_id": str(schedule_id)},
-                progress_json={},
-                completion_json={},
-            )
+    if not await session.get(AgentVersion, ("client_check_in", 1)) or not (
+        await session.get(AgentVersion, ("case_supervisor", 2))
+        or await session.get(AgentVersion, ("case_supervisor", 1))
+    ):
+        raise HTTPException(
+            409, "Publish check-in and supervisor definitions with the seed command"
         )
-        await session.flush()
-        row = MonthlyCheckInSchedule(
-            id=schedule_id,
+    coord = await ensure_monitor(session, tenant_id, case_id)
+    schedule_id, group_id = uuid4(), uuid4()
+    session.add(
+        Task(
+            id=group_id,
             tenant_id=tenant_id,
             case_id=case_id,
-            client_contact_id=body.client_contact_id,
-            group_task_id=group_id,
-            workflow_id=f"firm/{tenant_id}/monthly/{schedule_id}",
-            status="ACTIVE",
-            version=1,
-            timezone=body.timezone,
-            day_of_month=body.day_of_month,
-            local_time=body.local_time,
-            minimum_gap_days=body.minimum_gap_days,
-            dispatch_after=now(),
-            ends_at=body.ends_at,
-            max_occurrences=body.max_occurrences,
-            occurrence_count=0,
+            parent_task_id=coord.group_task_id,
+            kind="GROUP",
+            task_type="client.monthly_schedule",
             objective=body.objective,
-            message=body.message,
-            creation_key=key,
-            creation_hash=fingerprint,
+            input_schema="group.v1",
+            input_json={"monthly_schedule_id": str(schedule_id)},
+            progress_json={},
+            completion_json={},
         )
-        row.next_due_at = first_due(row, now(), body.starts_on)
-        if row.ends_at and row.ends_at <= row.next_due_at:
-            raise HTTPException(422, "End time must follow the first scheduled check-in")
-        session.add(row)
-        await session.flush()
-        event = await schedule_event(
-            session, row, "monthly.created", body.model_dump(mode="json"), actor="local-operator"
-        )
-        await wake_schedule(session, row, event)
-        return {**await read_schedule(session, row), "replayed": False}
+    )
+    await session.flush()
+    row = MonthlyCheckInSchedule(
+        id=schedule_id,
+        tenant_id=tenant_id,
+        case_id=case_id,
+        client_contact_id=body.client_contact_id,
+        group_task_id=group_id,
+        workflow_id=f"firm/{tenant_id}/monthly/{schedule_id}",
+        status="ACTIVE",
+        version=1,
+        timezone=body.timezone,
+        day_of_month=body.day_of_month,
+        local_time=body.local_time,
+        minimum_gap_days=body.minimum_gap_days,
+        dispatch_after=now(),
+        ends_at=body.ends_at,
+        max_occurrences=body.max_occurrences,
+        occurrence_count=0,
+        objective=body.objective,
+        message=body.message,
+        creation_key=key,
+        creation_hash=fingerprint,
+    )
+    row.next_due_at = first_due(row, now(), body.starts_on)
+    if row.ends_at and row.ends_at <= row.next_due_at:
+        raise HTTPException(422, "End time must follow the first scheduled check-in")
+    session.add(row)
+    await session.flush()
+    event = await schedule_event(
+        session, row, "monthly.created", body.model_dump(mode="json"), actor="local-operator"
+    )
+    await wake_schedule(session, row, event)
+    return {**await read_schedule(session, row), "replayed": False}
 
 
 @router.get("")
@@ -758,6 +763,7 @@ class MonthlyActivities:
         self.database = database
 
     @activity.defn
+    @observed_activity
     async def advance_monthly(self, activation):
         from agents_platform.coordination import enqueue_supervisor
 

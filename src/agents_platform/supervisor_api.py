@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from agents_platform.capabilities import discover_capabilities
 from agents_platform.coordination import CaseObjective, submit_objective
 from agents_platform.db import session_dependency
 from agents_platform.models import Case, CaseCoordination
@@ -71,3 +72,12 @@ async def set_objective(
         raise HTTPException(exc.status, str(exc)) from exc
     response.status_code = 201 if created else 200
     return {"group_task_id": str(group_id), "replayed": not created}
+
+
+@router.get("/capabilities")
+async def available_capabilities(tenant_id: UUID, case_id: UUID, session: Session):
+    if not await session.scalar(
+        select(Case.id).where(Case.tenant_id == tenant_id, Case.id == case_id)
+    ):
+        raise HTTPException(404, "Case not found")
+    return {"capabilities": await discover_capabilities().available(session)}

@@ -12,6 +12,7 @@ from agents_platform.models import (
     ClientCheckIn,
     ClientReport,
     ClientReview,
+    ManualContact,
     MonthlyCheckInOccurrence,
     MonthlyCheckInSchedule,
     Task,
@@ -178,6 +179,19 @@ async def assess_contact(session, tenant_id, case_id, client_id, *, at=None, cur
         report_query.order_by(ClientReport.reported_at.desc(), ClientReport.id).limit(1)
     )
     interactions = []
+    manual = await session.scalar(
+        select(ManualContact)
+        .where(
+            ManualContact.tenant_id == tenant_id,
+            ManualContact.case_id == case_id,
+            ManualContact.contact_id == client_id,
+            ManualContact.outcome == "REACHED",
+        )
+        .order_by(ManualContact.occurred_at.desc(), ManualContact.id)
+        .limit(1)
+    )
+    if manual:
+        interactions.append((manual.occurred_at, str(manual.task_id), "recorded manual contact"))
     if sent:
         interactions.append((sent.sent_at, str(sent.task_id), "sent check-in"))
     if report:

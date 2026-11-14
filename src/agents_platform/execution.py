@@ -25,7 +25,15 @@ from agents_platform.context import (
     ModelBudget,
 )
 from agents_platform.db import Database
-from agents_platform.domains import DomainAdapter, adapter_ref, default_registry
+from agents_platform.domains import (
+    ActionNotDue,
+    ActionStateChanged,
+    DecisionValidationError,
+    DomainAdapter,
+    DomainValidation,
+    adapter_ref,
+    default_registry,
+)
 from agents_platform.memory import memory_for_task, policy_lock, stop_contact
 from agents_platform.memory_history import historical_context
 from agents_platform.models import (
@@ -38,6 +46,7 @@ from agents_platform.models import (
     ToolInvocation,
 )
 from agents_platform.task_contracts import NextAction, TaskSnapshot
+from agents_platform.telemetry import bind_context, observed_activity
 
 TERMINAL = {"COMPLETED", "CANCELLED", "FAILED"}
 
@@ -63,6 +72,7 @@ class ActivationContext:
     tools_used: list = field(default_factory=list)
     evidence_source_ids: set[str] = field(default_factory=set)
     retrieved_source_ids: set[str] = field(default_factory=set)
+    tool_rejections: list[dict] = field(default_factory=list)
 
 
 class TaskActivities:
@@ -71,13 +81,29 @@ class TaskActivities:
         self.adapters = adapters or default_registry()
 
     @activity.defn
+    @observed_activity
     async def execute_task(self, activation: dict) -> dict:
         """The complete activation in three steps, with no database lock during model calls."""
         run = await self._prepare(activation)
         if isinstance(run, dict):
             return run  # Previously committed result, closed task, or duplicate signal.
         decision, usage = await self._decide(run, self._tools(run))
-        return await self._commit(run, activation, decision, usage)
+        try:
+            return await self._commit(run, activation, decision, usage)
+        except DecisionValidationError as exc:
+            # Keep successful logical actions. A fresh activation sees saved state and
+            # correction feedback; repeated bad proposals eventually reach human review.
+            feedback = str(exc)
+            usage = {
+                **usage,
+                "rejected_decision": decision.model_dump(mode="json"),
+                "decision_validation_error": feedback,
+            }
+            review = run.adapter.review(feedback)
+            review.next_action = NextAction(
+                type="needs_human", follow_up_seconds=None, reason=feedback
+            )
+            return await self._commit(run, activation, review, usage, feedback)
 
     async def _prepare(self, activation: dict):
         tenant_id, task_id = UUID(activation["tenant_id"]), UUID(activation["task_id"])
@@ -91,8 +117,16 @@ class TaskActivities:
             )
             if task is None:
                 raise ValueError("Task not found")
+            if activation.get("generation", 0) != task.progress_json.get("recovery_generation", 0):
+                return {"status": "CANCELLED", "reason": "Superseded execution generation"}
             if task.status in ("CANCELLED", "FAILED"):
                 return {"status": task.status}
+            bind_context(
+                case_id=task.case_id,
+                task_id=task.id,
+                workflow_id=task.workflow_id,
+                execution_id=execution_id,
+            )
             execution = await session.get(Execution, execution_id)
             if execution is not None and execution.outcome_json is not None:
                 return execution.outcome_json
@@ -126,11 +160,36 @@ class TaskActivities:
                 raise ValueError("Published agent definition missing")
             definition = agent.definition_snapshot
             adapter = self.adapters.for_execution(task, definition)
+            advance_human_work = getattr(adapter, "advance_human_work", None)
+            if execution is None and advance_human_work:
+                human_outcome = await advance_human_work(session, task)
+                if human_outcome:
+                    return human_outcome
             if execution is None:
                 domain = await adapter.load(session, task)
-                if domain.ready_at and domain.ready_at > now():
+                if domain.evidence_source_ids:
+                    scoped_ids = set(
+                        await session.scalars(
+                            select(Source.id).where(
+                                Source.tenant_id == tenant_id,
+                                Source.case_id == task.case_id,
+                                Source.id.in_(domain.evidence_source_ids),
+                            )
+                        )
+                    )
+                    if scoped_ids != set(domain.evidence_source_ids):
+                        raise ValueError("Domain context contains evidence outside this case")
+                if (
+                    domain.ready_at
+                    and domain.ready_at > now()
+                    and not task.progress_json.get("decision_validation_feedback")
+                ):
                     if task.status != "WAITING":
                         task.status, task.version = "WAITING", task.version + 1
+                        task.progress_json = {
+                            **task.progress_json,
+                            "last_reason": f"Waiting until {domain.ready_at.isoformat()}.",
+                        }
                     return {
                         "status": "WAITING",
                         "wake_at": domain.ready_at.isoformat(),
@@ -183,11 +242,18 @@ class TaskActivities:
                     "instructions": memory["instructions"],
                     "memory": memory,
                     "history": history,
-                    "domain": {"adapter": adapter_ref(adapter), "state": domain.state},
+                    "domain": {
+                        "adapter": adapter_ref(adapter),
+                        "state": domain.state,
+                        "evidence_source_ids": [str(i) for i in domain.evidence_source_ids],
+                    },
                     "action_requirements": {
                         **domain.action_requirements,
                         "current_memory_is_authoritative": True,
                         "resolved_items_are_history": True,
+                        "decision_validation_feedback": task.progress_json.get(
+                            "decision_validation_feedback"
+                        ),
                     },
                     "recent_events": [
                         {"type": e.event_type, "payload": e.payload} for e in reversed(recent)
@@ -195,6 +261,10 @@ class TaskActivities:
                     "new_events": [
                         {"type": e.event_type, "payload": e.payload} for e in unread_events
                     ],
+                    "has_new_business_information": any(
+                        event.producer not in {"execution", "domain-tool"}
+                        for event in unread_events
+                    ),
                     "sources": [{"id": str(s.id), "content": s.content} for s in sources],
                     "inbox_ids": [str(i.id) for i in inbox],
                     "expected_version": task.version,
@@ -249,7 +319,10 @@ class TaskActivities:
             arguments_json = arguments.model_dump(mode="json")
             if name not in definition["tools"]:
                 raise ValueError("Tool is not permitted by this agent version")
-            if len(tools_used) >= definition["limits"]["max_tool_calls"]:
+            if (
+                len(tools_used) + len(run_context.tool_rejections)
+                >= definition["limits"]["max_tool_calls"]
+            ):
                 raise ValueError("Tool budget exceeded")
             async with self.database.sessions.begin() as session:
                 await policy_lock(session, tenant_id)
@@ -296,9 +369,24 @@ class TaskActivities:
                     result = cached.result_json
                     evidence_ids = result.get("_evidence_source_ids", [])
                 else:
-                    domain_result = await run_adapter.execute_tool(
-                        session, current, name, arguments
-                    )
+                    try:
+                        domain_result = await run_adapter.execute_tool(
+                            session, current, name, arguments
+                        )
+                    except ActionNotDue as exc:
+                        # Roll back this attempt, not successful tools from earlier
+                        # transactions. Do not consume the contact's logical action key.
+                        await session.rollback()
+                        rejected = {
+                            "tool": name,
+                            "status": "NOT_DUE",
+                            "action_taken": False,
+                            "ready_at": exc.ready_at.isoformat(),
+                            "message": "No action taken. Wait until ready_at; keep verified "
+                            "information in your final summary.",
+                        }
+                        run_context.tool_rejections.append(rejected)
+                        return json.dumps(rejected)
                     result = domain_result.data
                     evidence_ids = [str(i) for i in domain_result.evidence_source_ids]
                     source = Source(
@@ -428,8 +516,16 @@ class TaskActivities:
             cause = exc
             seen = set()
             while cause is not None and id(cause) not in seen:
-                if isinstance(cause, StaleExecution):
+                if isinstance(cause, (StaleExecution, ActionStateChanged)):
                     return None, usage
+                if isinstance(cause, ActionNotDue):
+                    decision = run.adapter.review(str(cause))
+                    decision.next_action = NextAction(
+                        type="wait",
+                        follow_up_seconds=max(1, int((cause.ready_at - now()).total_seconds()) + 1),
+                        reason=str(cause),
+                    )
+                    return decision, {**usage, "action_rejected": "NOT_DUE"}
                 seen.add(id(cause))
                 cause = cause.__cause__
             async with self.database.sessions.begin() as session:
@@ -439,9 +535,11 @@ class TaskActivities:
             raise
         if budget.calls or usage.get("context_budget_exceeded"):
             usage["context_budget"] = budget.report()
+        if run.tool_rejections:
+            usage["tool_rejections"] = run.tool_rejections
         return decision, usage
 
-    async def _commit(self, run, activation, decision, usage):
+    async def _commit(self, run, activation, decision, usage, validation_failure=None):
         tenant_id, task_id, execution_id = run.tenant_id, run.task_id, run.execution_id
         context, attempt = run.context, run.attempt
         tools_used = run.tools_used
@@ -472,6 +570,7 @@ class TaskActivities:
                 | {s["id"] for s in context["sources"]}
                 | set(context["memory"]["manifest"]["source_ids"])
                 | run.retrieved_source_ids
+                | set(context.get("domain", {}).get("evidence_source_ids", []))
                 | {
                     i["source_id"]
                     for i in context.get("history", {}).get("retrieval", {}).get("results", [])
@@ -485,7 +584,10 @@ class TaskActivities:
                 str(o.source_id) not in known | run.evidence_source_ids
                 for o in decision.observations
             ):
-                raise ValueError("Agent cited evidence it was not given")
+                raise DecisionValidationError(
+                    "Agent cited evidence it was not given. Use only actual source IDs in the "
+                    "context or tool results. Task and requirement IDs are not source IDs."
+                )
             step = decision.next_action
             if step.type == "complete" and any(
                 i["kind"] == "OBLIGATION" for i in memory["operational_items"]
@@ -496,9 +598,33 @@ class TaskActivities:
                     reason="Resolve open obligations before completing this task.",
                 )
                 decision.next_action = step
-            validation = await run.adapter.validate(
-                session, task, context, decision, tools_used, step
-            )
+            validation_exhausted = False
+            if validation_failure:
+                failures = task.progress_json.get("decision_validation_replans", 0) + 1
+                validation_exhausted = failures > 2
+                decision.summary = (
+                    "The agent is rechecking its proposal against saved evidence."
+                    if failures <= 2
+                    else "The agent could not verify its proposal after repeated attempts; "
+                    "review the recovery incident to retry or cancel."
+                )
+                step.reason = decision.summary
+                validation = DomainValidation(
+                    action=step,
+                    progress={
+                        "decision_validation_replans": failures,
+                        "decision_validation_feedback": validation_failure,
+                    },
+                    replan_reason=decision.summary if failures <= 2 else None,
+                    rejected=True,
+                )
+            else:
+                validation = await run.adapter.validate(
+                    session, task, context, decision, tools_used, step
+                )
+                validation.progress.update(
+                    decision_validation_replans=0, decision_validation_feedback=None
+                )
             if set(validation.progress) & {
                 "memory_items",
                 "last_summary",
@@ -520,14 +646,20 @@ class TaskActivities:
             status = {"wait": "WAITING", "complete": "COMPLETED", "needs_human": "BLOCKED"}[
                 step.type
             ]
+            if validation_exhausted:
+                status = "FAILED"
             reason = step.reason
-            if (
-                status == "WAITING"
-                and activation["cycle"] >= self.settings.demo_max_activations - 1
-            ):
+            # Bound repeated automatic polling, not the business assignment's lifetime.
+            # New external/human events can keep a useful task alive for months.
+            automatic_activations = (
+                0
+                if context.get("has_new_business_information", bool(context["inbox_ids"]))
+                else task.progress_json.get("automatic_activations", 0) + 1
+            )
+            if status == "WAITING" and automatic_activations >= self.settings.demo_max_activations:
                 status, reason = (
                     "BLOCKED",
-                    "Demo follow-up limit reached; waiting for an operator/provider update.",
+                    "Automatic polling limit reached; waiting for a user/provider update.",
                 )
             outcome = {"status": status, "reason": reason}
             if status == "WAITING":
@@ -547,12 +679,27 @@ class TaskActivities:
             task.progress_json = {
                 **task.progress_json,
                 **validation.progress,
+                "automatic_activations": automatic_activations,
+                **(
+                    {"display_title": decision.task_title}
+                    if decision.task_title and not task.progress_json.get("display_title")
+                    else {}
+                ),
                 "last_summary": decision.summary,
                 "last_reason": reason,
                 "last_execution_id": str(execution_id),
             }
+            from agents_platform.human_requests import retire_requests
+
+            request_human_help = getattr(run.adapter, "request_human_help", None)
+            if status == "BLOCKED" and request_human_help:
+                await request_human_help(session, task, reason)
+            elif status in TERMINAL:
+                await retire_requests(
+                    session, task, "CANCELLED" if status == "CANCELLED" else "SUPERSEDED"
+                )
             execution.status, execution.decision_json = (
-                "SUCCEEDED",
+                "FAILED" if validation_exhausted else "SUCCEEDED",
                 decision.model_dump(mode="json"),
             )
             execution.outcome_json, execution.usage_json, execution.finished_at = (
@@ -560,6 +707,15 @@ class TaskActivities:
                 usage,
                 now(),
             )
+            incident_id = None
+            if validation_exhausted:
+                from agents_platform.recovery import ensure_incident
+
+                execution.error_type = "DecisionValidationError"
+                incident = await ensure_incident(
+                    session, task, activation["cycle"], "DecisionValidationError"
+                )
+                incident_id = str(incident.id)
             for inbox_id in context["inbox_ids"]:
                 entry = await session.get(TaskInbox, UUID(inbox_id))
                 entry.consumed_by_execution_id = execution_id
@@ -567,7 +723,9 @@ class TaskActivities:
                 tenant_id=tenant_id,
                 case_id=task.case_id,
                 task_id=task_id,
-                event_type="task.plan_rejected"
+                event_type="task.failed"
+                if validation_exhausted
+                else "task.plan_rejected"
                 if validation.rejected
                 else f"task.{status.lower()}",
                 producer="execution",
@@ -578,6 +736,7 @@ class TaskActivities:
                     "summary": decision.summary,
                     "mode": execution.mode,
                     "outcome": outcome,
+                    **({"incident_id": incident_id} if incident_id else {}),
                 },
             )
             session.add(event)
@@ -603,8 +762,10 @@ class TaskActivities:
             return outcome
 
     @activity.defn
+    @observed_activity
     async def fail_task(self, activation: dict) -> None:
         async with self.database.sessions.begin() as session:
+            await policy_lock(session, UUID(activation["tenant_id"]))
             task = await session.scalar(
                 select(Task)
                 .where(
@@ -613,13 +774,32 @@ class TaskActivities:
                 )
                 .with_for_update()
             )
-            if task and task.status not in TERMINAL:
+            if (
+                task
+                and task.status not in TERMINAL
+                and activation.get("generation", 0)
+                == task.progress_json.get("recovery_generation", 0)
+            ):
                 task.status, task.version = "FAILED", task.version + 1
                 execution = await session.get(
                     Execution, uuid5(task.id, f"execution/{activation['cycle']}")
                 )
                 if execution:
                     execution.status, execution.finished_at = "FAILED", now()
+                from agents_platform.recovery import ensure_incident
+
+                incident = await ensure_incident(
+                    session,
+                    task,
+                    activation["cycle"],
+                    activation.get("failure_type")
+                    or (execution.error_type if execution else None)
+                    or "ExecutionRetriesExhausted",
+                )
+                task.progress_json = {
+                    **task.progress_json,
+                    "last_reason": "Retries exhausted. Resolve the incident to retry or cancel.",
+                }
                 event = ActivityEvent(
                     tenant_id=task.tenant_id,
                     case_id=task.case_id,
@@ -628,7 +808,10 @@ class TaskActivities:
                     producer="workflow",
                     dedupe_key=f"failed/{activation['cycle']}/{task.id}",
                     actor_ref="platform",
-                    payload={"reason": "Execution retries exhausted"},
+                    payload={
+                        "reason": "Execution retries exhausted",
+                        "incident_id": str(incident.id),
+                    },
                 )
                 session.add(event)
                 from agents_platform.coordination import enqueue_supervisor

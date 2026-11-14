@@ -31,6 +31,7 @@ from agents_platform.models import (
 )
 from agents_platform.task_api import Session, require_operator
 from agents_platform.task_contracts import Contract
+from agents_platform.telemetry import observed_activity
 
 router = APIRouter(
     prefix="/v1/firms/{tenant_id}/cases/{case_id}/check-in-series",
@@ -198,112 +199,116 @@ async def cancel_unsent(session, row, event):
 async def create_series(
     tenant_id: UUID, case_id: UUID, body: CreateSeries, session: Session, key: Key
 ):
+    async with session.begin():
+        return await create_series_in_transaction(session, tenant_id, case_id, body, key)
+
+
+async def create_series_in_transaction(session, tenant_id, case_id, body, key):
     if not key.strip():
         raise HTTPException(422, "Idempotency-Key must not be blank")
-    async with session.begin():
-        await policy_lock(session, tenant_id, publishing=True)
-        case = await session.scalar(
-            select(Case).where(Case.tenant_id == tenant_id, Case.id == case_id).with_for_update()
+    await policy_lock(session, tenant_id, publishing=True)
+    case = await session.scalar(
+        select(Case).where(Case.tenant_id == tenant_id, Case.id == case_id).with_for_update()
+    )
+    if not case:
+        raise HTTPException(404, "Case not found")
+    previous = await session.scalar(
+        select(CheckInSeries).where(
+            CheckInSeries.tenant_id == tenant_id, CheckInSeries.creation_key == key
         )
-        if not case:
-            raise HTTPException(404, "Case not found")
-        previous = await session.scalar(
-            select(CheckInSeries).where(
-                CheckInSeries.tenant_id == tenant_id, CheckInSeries.creation_key == key
-            )
+    )
+    fingerprint = digest({"case_id": str(case_id), **body.model_dump(mode="json")})
+    if previous:
+        if previous.creation_hash != fingerprint:
+            raise HTTPException(409, "Idempotency key conflicts with another series")
+        return {**series_view(previous), "replayed": True}
+    if case.status != "OPEN":
+        raise HTTPException(409, "Case is closed")
+    if body.ends_at and body.ends_at <= now():
+        raise HTTPException(422, "End date is in the past")
+    contact = await session.scalar(
+        select(CaseContact).where(
+            CaseContact.tenant_id == tenant_id,
+            CaseContact.case_id == case_id,
+            CaseContact.contact_id == body.client_contact_id,
         )
-        fingerprint = digest({"case_id": str(case_id), **body.model_dump(mode="json")})
-        if previous:
-            if previous.creation_hash != fingerprint:
-                raise HTTPException(409, "Idempotency key conflicts with another series")
-            return {**series_view(previous), "replayed": True}
-        if case.status != "OPEN":
-            raise HTTPException(409, "Case is closed")
-        if body.ends_at and body.ends_at <= now():
-            raise HTTPException(422, "End date is in the past")
-        contact = await session.scalar(
-            select(CaseContact).where(
-                CaseContact.tenant_id == tenant_id,
-                CaseContact.case_id == case_id,
-                CaseContact.contact_id == body.client_contact_id,
-            )
+    )
+    if not contact or not {"CLIENT", "PATIENT"}.intersection(contact.roles):
+        raise HTTPException(422, "Client must belong to this case")
+    if await session.scalar(
+        select(CheckInSeries.id).where(
+            CheckInSeries.tenant_id == tenant_id,
+            CheckInSeries.case_id == case_id,
+            CheckInSeries.client_contact_id == body.client_contact_id,
+            CheckInSeries.status.in_(["ACTIVE", "PAUSED"]),
         )
-        if not contact or not {"CLIENT", "PATIENT"}.intersection(contact.roles):
-            raise HTTPException(422, "Client must belong to this case")
-        if await session.scalar(
-            select(CheckInSeries.id).where(
-                CheckInSeries.tenant_id == tenant_id,
-                CheckInSeries.case_id == case_id,
-                CheckInSeries.client_contact_id == body.client_contact_id,
-                CheckInSeries.status.in_(["ACTIVE", "PAUSED"]),
-            )
-        ):
-            raise HTTPException(409, "Client already has a live series in this case")
-        from agents_platform.check_in_contact import contact_policy
-        from agents_platform.models import MonthlyCheckInSchedule
+    ):
+        raise HTTPException(409, "Client already has a live series in this case")
+    from agents_platform.check_in_contact import contact_policy
+    from agents_platform.models import MonthlyCheckInSchedule
 
-        if await session.scalar(
-            select(MonthlyCheckInSchedule.id).where(
-                MonthlyCheckInSchedule.tenant_id == tenant_id,
-                MonthlyCheckInSchedule.case_id == case_id,
-                MonthlyCheckInSchedule.client_contact_id == body.client_contact_id,
-                MonthlyCheckInSchedule.status.in_(["ACTIVE", "PAUSED"]),
-            )
-        ):
-            raise HTTPException(
-                409, "Client already has a live monthly schedule; stop it before another cadence"
-            )
-        policy = await contact_policy(session, tenant_id, case_id, body.client_contact_id)
-        if policy and body.interval_seconds < policy.minimum_gap_days * 86400:
-            raise HTTPException(
-                409, "Series interval conflicts with this client's contact-spacing policy"
-            )
-        if not await session.get(AgentVersion, ("client_check_in", 1)):
-            raise HTTPException(409, "Publish check-in definitions with the seed command")
-        coord = await ensure_monitor(session, tenant_id, case_id)
-        series_id, group_id = uuid4(), uuid4()
-        session.add(
-            Task(
-                id=group_id,
-                tenant_id=tenant_id,
-                case_id=case_id,
-                parent_task_id=coord.group_task_id,
-                kind="GROUP",
-                task_type="client.check_in_series",
-                objective=body.objective,
-                input_schema="group.v1",
-                input_json={"series_id": str(series_id)},
-                progress_json={},
-                completion_json={},
-            )
+    if await session.scalar(
+        select(MonthlyCheckInSchedule.id).where(
+            MonthlyCheckInSchedule.tenant_id == tenant_id,
+            MonthlyCheckInSchedule.case_id == case_id,
+            MonthlyCheckInSchedule.client_contact_id == body.client_contact_id,
+            MonthlyCheckInSchedule.status.in_(["ACTIVE", "PAUSED"]),
         )
-        await session.flush()
-        row = CheckInSeries(
-            id=series_id,
+    ):
+        raise HTTPException(
+            409, "Client already has a live monthly schedule; stop it before another cadence"
+        )
+    policy = await contact_policy(session, tenant_id, case_id, body.client_contact_id)
+    if policy and body.interval_seconds < policy.minimum_gap_days * 86400:
+        raise HTTPException(
+            409, "Series interval conflicts with this client's contact-spacing policy"
+        )
+    if not await session.get(AgentVersion, ("client_check_in", 1)):
+        raise HTTPException(409, "Publish check-in definitions with the seed command")
+    coord = await ensure_monitor(session, tenant_id, case_id)
+    series_id, group_id = uuid4(), uuid4()
+    session.add(
+        Task(
+            id=group_id,
             tenant_id=tenant_id,
             case_id=case_id,
-            client_contact_id=body.client_contact_id,
-            group_task_id=group_id,
-            workflow_id=f"firm/{tenant_id}/series/{series_id}",
-            interval_seconds=body.interval_seconds,
-            next_due_at=body.first_due_at,
-            ends_at=body.ends_at,
-            max_occurrences=body.max_occurrences,
+            parent_task_id=coord.group_task_id,
+            kind="GROUP",
+            task_type="client.check_in_series",
             objective=body.objective,
-            message=body.message,
-            creation_key=key,
-            creation_hash=fingerprint,
-            status="ACTIVE",
-            version=1,
-            occurrence_count=0,
+            input_schema="group.v1",
+            input_json={"series_id": str(series_id)},
+            progress_json={},
+            completion_json={},
         )
-        session.add(row)
-        await session.flush()
-        event = await series_event(
-            session, row, "series.created", body.model_dump(mode="json"), actor="local-operator"
-        )
-        await enqueue_series(session, row, event)
-        return {**series_view(row), "replayed": False}
+    )
+    await session.flush()
+    row = CheckInSeries(
+        id=series_id,
+        tenant_id=tenant_id,
+        case_id=case_id,
+        client_contact_id=body.client_contact_id,
+        group_task_id=group_id,
+        workflow_id=f"firm/{tenant_id}/series/{series_id}",
+        interval_seconds=body.interval_seconds,
+        next_due_at=body.first_due_at,
+        ends_at=body.ends_at,
+        max_occurrences=body.max_occurrences,
+        objective=body.objective,
+        message=body.message,
+        creation_key=key,
+        creation_hash=fingerprint,
+        status="ACTIVE",
+        version=1,
+        occurrence_count=0,
+    )
+    session.add(row)
+    await session.flush()
+    event = await series_event(
+        session, row, "series.created", body.model_dump(mode="json"), actor="local-operator"
+    )
+    await enqueue_series(session, row, event)
+    return {**series_view(row), "replayed": False}
 
 
 @router.get("")
@@ -412,6 +417,7 @@ class SeriesActivities:
         self.database = database
 
     @activity.defn
+    @observed_activity
     async def advance_series(self, activation):
         tenant, series_id = UUID(activation["tenant_id"]), UUID(activation["series_id"])
         async with self.database.sessions.begin() as session:
@@ -564,6 +570,7 @@ class SeriesActivities:
             return waiting
 
     @activity.defn
+    @observed_activity
     async def fail_series(self, activation):
         async with self.database.sessions.begin() as session:
             await policy_lock(session, UUID(activation["tenant_id"]), publishing=True)

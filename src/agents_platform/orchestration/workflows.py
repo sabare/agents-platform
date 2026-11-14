@@ -54,10 +54,17 @@ class TaskWorkflow:
                         maximum_attempts=3, initial_interval=timedelta(seconds=1)
                     ),
                 )
-            except ActivityError:
+            except ActivityError as exc:
+                failure = activation
+                if workflow.patched("task-incident-failure-type-v1"):
+                    cause = exc.cause
+                    failure = {
+                        **activation,
+                        "failure_type": getattr(cause, "type", type(cause).__name__),
+                    }
                 await workflow.execute_activity(
                     "fail_task",
-                    activation,
+                    failure,
                     start_to_close_timeout=timedelta(seconds=10),
                     retry_policy=RetryPolicy(maximum_attempts=3),
                 )

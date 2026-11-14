@@ -17,6 +17,22 @@ class EmptyArguments(Contract):
     pass
 
 
+class ActionStateChanged(ValueError):
+    """Current business state invalidates a proposed action; reload before deciding."""
+
+
+class DecisionValidationError(ValueError):
+    """A model proposal needs correction; this is not an infrastructure failure."""
+
+
+class ActionNotDue(ValueError):
+    """A rejected premature action can safely return the task to its durable timer."""
+
+    def __init__(self, ready_at: datetime):
+        self.ready_at = ready_at
+        super().__init__(f"Action is not due until {ready_at.isoformat()}; no action was taken")
+
+
 @dataclass(frozen=True)
 class ToolSpec:
     name: str
@@ -43,6 +59,7 @@ class DomainSnapshot:
     instruction_provider_ids: tuple[UUID, ...] = ()
     task_fields: dict = field(default_factory=dict)  # Compatibility projection for current API/UI.
     action_requirements: dict = field(default_factory=dict)
+    evidence_source_ids: tuple[UUID, ...] = ()
 
 
 @dataclass
@@ -136,8 +153,6 @@ class AdapterRegistry:
 
 
 def default_registry():
-    # Local import keeps the contract independent of domain implementations.
-    from agents_platform.client_check_in import ClientCheckInAdapter
-    from agents_platform.medical_records import MedicalRecordsAdapter
+    from agents_platform.capabilities import discover_capabilities
 
-    return AdapterRegistry((MedicalRecordsAdapter(), ClientCheckInAdapter()))
+    return discover_capabilities().adapters

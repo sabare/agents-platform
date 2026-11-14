@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 from sqlalchemy import select
@@ -23,6 +24,7 @@ from agents_platform.models import (
     Task,
     TaskInbox,
 )
+from agents_platform.provider_callbacks import resolve_callback
 from agents_platform.task_contracts import (
     CreateRecordsTask,
     ProviderUpdate,
@@ -30,6 +32,7 @@ from agents_platform.task_contracts import (
     RequirementView,
     TaskView,
 )
+from agents_platform.telemetry import emit
 
 
 class TaskError(Exception):
@@ -59,6 +62,9 @@ async def read_task(session: AsyncSession, tenant_id: UUID, task_id: UUID) -> Ta
                 .order_by(RecordRequirement.record_type, RecordRequirement.id)
             )
         ).all()
+        from agents_platform.record_receipts import requirement_coverage
+
+        coverage = {r["id"]: r for r in await requirement_coverage(session, tenant_id, request.id)}
         request_view = RecordsRequestView(
             id=request.id,
             patient_contact_id=request.patient_contact_id,
@@ -68,9 +74,13 @@ async def read_task(session: AsyncSession, tenant_id: UUID, task_id: UUID) -> Ta
             reminder_count=request.reminder_count,
             max_reminders=request.max_reminders,
             next_reminder_at=request.next_reminder_at,
+            callback_at=request.callback_at,
+            callback_timezone=request.callback_timezone,
             requirements=[
                 RequirementView(
                     id=item.id,
+                    status=coverage[str(item.id)]["status"],
+                    evidence_source_ids=coverage[str(item.id)]["evidence_source_ids"],
                     record_type=item.record_type,
                     all_dates=item.all_dates,
                     from_date=item.from_date,
@@ -156,7 +166,17 @@ async def create_records_task(
     creation_key: str,
 ) -> tuple[TaskView, bool]:
     async with session.begin():
-        return await create_records_task_in_transaction(session, tenant_id, body, creation_key)
+        task, created = await create_records_task_in_transaction(
+            session, tenant_id, body, creation_key
+        )
+    emit(
+        "task.created" if created else "task.replayed",
+        firm_id=tenant_id,
+        case_id=task.case_id,
+        task_id=task.id,
+        workflow_id=task.workflow_id,
+    )
+    return task, created
 
 
 async def create_records_task_in_transaction(
@@ -339,9 +359,10 @@ async def receive_provider_update(session, tenant_id, task_id, body: ProviderUpd
         existing = await session.scalar(
             select(Source).where(Source.tenant_id == tenant_id, Source.source_key == source_key)
         )
-        content = {**body.model_dump(mode="json"), "simulated": True}
+        content = {**body.model_dump(mode="json", exclude_defaults=True), "simulated": True}
         if existing:
-            if existing.content != content:
+            original = {k: v for k, v in existing.content.items() if k != "callback_schedule"}
+            if original != content:
                 raise TaskError(409, "Idempotency key used for a different provider update")
             return existing.id, False
         if task.status in ("COMPLETED", "CANCELLED", "FAILED"):
@@ -355,6 +376,22 @@ async def receive_provider_update(session, tenant_id, task_id, body: ProviderUpd
             raise TaskError(422, "Task is not a medical-records task")
         if request.status == "RECEIVED" and body.status != "RECEIVED":
             raise TaskError(409, "This demo does not automatically retract received records")
+        received_at = datetime.now(timezone.utc)
+        try:
+            callback = resolve_callback(body, received_at)
+        except ValueError as exc:
+            raise TaskError(422, str(exc)) from exc
+        if callback:
+            if task.agent_version < 3:
+                raise TaskError(409, "Callback follow-ups require a records agent version 3 task")
+            if request.reminder_count >= request.max_reminders:
+                raise TaskError(
+                    409, "Automatic follow-up limit reached; teammate review is required"
+                )
+            content["callback_schedule"] = {
+                "at": callback[0].isoformat(),
+                "timezone": callback[1],
+            }
         source = Source(
             id=uuid4(),
             tenant_id=tenant_id,
@@ -365,46 +402,85 @@ async def receive_provider_update(session, tenant_id, task_id, body: ProviderUpd
         )
         session.add(source)
         await session.flush()
-        if body.status == "RECEIVED":
-            requirements = (
-                await session.scalars(
-                    select(RecordRequirement).where(
-                        RecordRequirement.tenant_id == tenant_id,
-                        RecordRequirement.request_id == request.id,
-                    )
-                )
-            ).all()
-            for requirement in requirements:
-                artifact = Source(
-                    id=uuid4(),
+        from agents_platform.record_receipts import requirement_coverage
+
+        coverage = await requirement_coverage(session, tenant_id, request.id)
+        by_id = {r["id"]: r for r in coverage}
+        # Legacy RECEIVED with no IDs explicitly means the entire requested scope.
+        selected = (
+            {str(i) for i in body.received_requirement_ids}
+            if body.received_requirement_ids is not None
+            else set(by_id)
+            if body.status == "RECEIVED"
+            else set()
+        )
+        if not selected <= set(by_id):
+            raise TaskError(422, "Received requirement does not belong to this task")
+        already = {r["id"] for r in coverage if r["status"] == "RECEIVED"}
+        required = {r["id"] for r in coverage if r["required"]}
+        complete = required <= already | selected
+        if body.status == "RECEIVED" and not complete:
+            raise TaskError(422, "Some required items remain outstanding; use PARTIAL")
+        # A repeated receipt with a new delivery key retains its message but does not
+        # manufacture another artifact for an item already backed by evidence.
+        for requirement_id in sorted(selected - already):
+            requirement = by_id[requirement_id]
+            artifact = Source(
+                id=uuid4(),
+                tenant_id=tenant_id,
+                case_id=task.case_id,
+                source_key=f"{source_key}/record/{requirement_id}",
+                kind="SIMULATED_RECORD",
+                content={
+                    "requirement_id": requirement_id,
+                    "record_type": requirement["record_type"],
+                    "from_date": requirement["from_date"],
+                    "through_date": requirement["through_date"],
+                    "all_dates": requirement["all_dates"],
+                    "provider_message_id": str(source.id),
+                    "simulated": True,
+                },
+            )
+            session.add(artifact)
+            await session.flush()
+            session.add(
+                RecordEvidence(
                     tenant_id=tenant_id,
                     case_id=task.case_id,
-                    source_key=f"{source_key}/record/{requirement.id}",
-                    kind="SIMULATED_RECORD",
-                    content={
-                        "requirement_id": str(requirement.id),
-                        "record_type": requirement.record_type,
-                        "from_date": str(requirement.from_date),
-                        "through_date": str(requirement.through_date),
-                        "all_dates": requirement.all_dates,
-                        "provider_message_id": str(source.id),
-                        "simulated": True,
-                    },
+                    requirement_id=UUID(requirement_id),
+                    source_id=artifact.id,
                 )
-                session.add(artifact)
-                await session.flush()
-                session.add(
-                    RecordEvidence(
-                        tenant_id=tenant_id,
-                        case_id=task.case_id,
-                        requirement_id=requirement.id,
-                        source_id=artifact.id,
-                    )
-                )
-        request.status = body.status
-        if body.status == "RECEIVED":
+            )
+        request.status = (
+            "RECEIVED" if complete else "PARTIAL" if already | selected else body.status
+        )
+        task.progress_json = {
+            **task.progress_json,
+            "outstanding_requirement_ids": sorted(required - already - selected),
+        }
+        if request.status == "RECEIVED":
             request.next_reminder_at = None
+            request.callback_at = request.callback_timezone = None
+        elif callback:
+            request.callback_at, request.callback_timezone = callback
+            request.next_reminder_at = request.callback_at
+            task.status = "WAITING"
+            task.progress_json = {
+                **task.progress_json,
+                "last_reason": "Waiting until the provider's agreed callback time.",
+            }
+        elif body.clear_callback and request.callback_at:
+            request.callback_at = request.callback_timezone = None
+            request.next_reminder_at = received_at + timedelta(
+                seconds=request.reminder_interval_seconds
+            )
         task.version += 1  # An older in-flight execution must re-read this update.
+        provider_name = await session.scalar(
+            select(Contact.display_name).where(
+                Contact.tenant_id == tenant_id,
+                Contact.id == request.provider_contact_id,
+            )
+        )
         event = ActivityEvent(
             id=uuid4(),
             tenant_id=tenant_id,
@@ -414,7 +490,34 @@ async def receive_provider_update(session, tenant_id, task_id, body: ProviderUpd
             producer="demo-provider",
             dedupe_key=source_key,
             actor_ref="local-operator",
-            payload={"source_id": str(source.id), "status": body.status},
+            payload={
+                "source_id": str(source.id),
+                "provider_contact_id": str(request.provider_contact_id),
+                "provider_name": provider_name,
+                "simulated": True,
+                "status": request.status,
+                "received_requirement_ids": sorted(selected),
+                "newly_received_requirement_ids": sorted(selected - already),
+                "message": body.message,
+                "summary": "Received: "
+                + (
+                    ", ".join(by_id[i]["record_type"].lower() for i in sorted(selected - already))
+                    or "no new items"
+                )
+                + ". Outstanding: "
+                + (
+                    ", ".join(
+                        by_id[i]["record_type"].lower()
+                        for i in sorted(required - already - selected)
+                    )
+                    or "none"
+                )
+                + ".",
+                "outstanding_requirement_ids": sorted(required - already - selected),
+                "callback_at": request.callback_at.isoformat() if request.callback_at else None,
+                "callback_timezone": request.callback_timezone,
+                "callback_cleared": body.clear_callback or request.status == "RECEIVED",
+            },
         )
         session.add(event)
         await session.flush()

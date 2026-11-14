@@ -12,7 +12,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agents_platform.config import get_settings
 from agents_platform.db import Database
 from agents_platform.models import (
-    AgentVersion,
     Case,
     CaseContact,
     Contact,
@@ -21,7 +20,7 @@ from agents_platform.models import (
     InstructionRevision,
     Task,
 )
-from agents_platform.registry import definition_hash, load_definition
+from agents_platform.registry import publish_definitions
 
 DEMO_FIRM_ID = UUID("00000000-0000-4000-8000-000000000001")
 
@@ -34,30 +33,7 @@ async def seed_demo(session: AsyncSession, firm_id: UUID = DEMO_FIRM_ID) -> dict
         identity(name) for name in ("case", "patient", "provider", "parent-task")
     )
     async with session.begin():
-        for agent_key, version in (
-            ("medical_records_collector", 1),
-            ("medical_records_collector", 2),
-            ("medical_records_collector", 3),
-            ("case_supervisor", 1),
-            ("case_supervisor", 2),
-            ("client_check_in", 1),
-        ):
-            definition = load_definition(agent_key, version)
-            await session.execute(
-                insert(AgentVersion)
-                .values(
-                    agent_key=definition["agent_key"],
-                    version=version,
-                    definition_hash=definition_hash(definition),
-                    definition_snapshot=definition,
-                )
-                .on_conflict_do_nothing()
-            )
-            published = await session.get(AgentVersion, (definition["agent_key"], version))
-            if published.definition_hash != definition_hash(definition):
-                raise ValueError(
-                    "Published agent version changed; publish a new version explicitly"
-                )
+        await publish_definitions(session)
         await session.execute(
             insert(Firm)
             .values(id=firm_id, name="Fictional Example Firm", timezone="America/New_York")

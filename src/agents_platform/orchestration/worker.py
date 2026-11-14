@@ -1,17 +1,18 @@
 import asyncio
-import logging
 from datetime import timedelta
 
 from dotenv import load_dotenv
 from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.worker import Worker
 
+from agents_platform.capabilities import discover_capabilities
 from agents_platform.check_in_series import SeriesActivities
 from agents_platform.config import get_settings
 from agents_platform.coordination import SupervisorActivities
 from agents_platform.db import Database
 from agents_platform.dispatch import dispatch_loop
 from agents_platform.execution import TaskActivities
+from agents_platform.human_request_handlers import backfill_blocked_requests
 from agents_platform.memory_history import MemoryActivities
 from agents_platform.monthly_check_ins import MonthlyActivities
 from agents_platform.orchestration.activities import InfrastructureActivities
@@ -24,18 +25,26 @@ from agents_platform.orchestration.workflows import (
     MonthlyCheckInWorkflow,
     TaskWorkflow,
 )
+from agents_platform.recovery import backfill_incidents
+from agents_platform.registry import publish_definitions
+from agents_platform.telemetry import configure_logging, emit
 
 
 async def run_worker() -> None:
     settings = get_settings()
-    logging.basicConfig(level=settings.log_level)
+    configure_logging(settings.log_level)
     database = Database(settings.database_url)
     try:
         await database.check()
+        catalog = discover_capabilities()
+        async with database.sessions.begin() as session:
+            await publish_definitions(session, catalog)
+        await backfill_incidents(database)
+        await backfill_blocked_requests(database)
         client = await connect_temporal(settings)
         activities = InfrastructureActivities(database)
-        task_activities = TaskActivities(database, settings)
-        supervisor = SupervisorActivities(database, settings)
+        task_activities = TaskActivities(database, settings, catalog.adapters)
+        supervisor = SupervisorActivities(database, settings, catalog)
         memory = MemoryActivities(database, settings)
         series = SeriesActivities(database)
         monthly = MonthlyActivities(database)
@@ -63,7 +72,7 @@ async def run_worker() -> None:
             ],
             graceful_shutdown_timeout=timedelta(seconds=15),
         )
-        logging.getLogger(__name__).info("Worker listening on %s", settings.temporal_task_queue)
+        emit("worker.started", task_queue=settings.temporal_task_queue)
         try:
             await client.start_workflow(
                 MemoryIndexWorkflow.run,
