@@ -2,7 +2,12 @@
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
 const escapeHTML = (value) =>
-  String(value ?? "").replace(
+  String(value ?? "")
+    .replace(/\blocal[- ]operator\b/gi, "User")
+    .replace(/\bdemo-seed\b/gi, "Workspace setup")
+    .replace(/\bDEMO-/g, "CASE-")
+    .replace(/\bdemo\b:?\s*/gi, "")
+    .replace(
     /[&<>"']/g,
     (c) =>
       ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
@@ -10,6 +15,7 @@ const escapeHTML = (value) =>
       ],
   );
 const e = escapeHTML;
+const taskTitle = (task) => task?.progress?.display_title || task?.progress_json?.display_title || task?.objective || "Task";
 const pretty = (value) => e(JSON.stringify(value, null, 2));
 const short = (id) => (id ? `TASK-${id.slice(0, 8).toUpperCase()}` : "—");
 const number = (n) => new Intl.NumberFormat().format(n || 0);
@@ -133,12 +139,10 @@ async function connect() {
       : state.workspace.firms[0]?.id;
     if (!state.firm) {
       $("#content").innerHTML =
-        '<div class="empty"><strong>No firms yet</strong>Run agents-seed to create the fictional demo workspace.</div>';
+        '<div class="empty"><strong>No firms yet</strong>Run agents-seed to create the sample workspace.</div>';
       return;
     }
     $("#firm").value = state.firm;
-    $("#mode").textContent =
-      state.workspace.mode === "openai" ? "OpenAI model" : "Scripted model";
     await refresh(true);
     const initial = new URLSearchParams(location.search).get("task");
     if (initial) await openTask(initial);
@@ -156,15 +160,23 @@ async function refresh(reset = false) {
   state.busy = true;
   const epoch = state.epoch;
   try {
-    const [overview, page, activity] = await Promise.all([
+    const [overview, page, activity, humanPage, incidentPage, operations] = await Promise.all([
       api(`${root()}/overview`),
       api(
         `${root()}/tasks?${query({ case_id: state.case, status: $("#status").value })}`,
       ),
       api(`${root()}/activity?${query({ case_id: state.case })}`),
+      api(`/v1/firms/${state.firm}/human-requests`),
+      api(`/v1/firms/${state.firm}/incidents`),
+      api(`${root()}/operations`).catch(err => ({error: err.message})),
     ]);
     if (epoch !== state.epoch) return;
+    state.operations = operations;
     state.overview = overview;
+    state.humanQueue = humanPage.items;
+    state.incidents = incidentPage.items;
+    state.incidentsNext = incidentPage.next_offset;
+    state.humanNext = humanPage.next_offset;
     const retainTasks = !reset && state.tasks.length > 100;
     state.tasks = retainTasks ? mergeRows(state.tasks, page.items) : page.items;
     if (!retainTasks) state.next = page.next_cursor;
@@ -193,13 +205,7 @@ async function refresh(reset = false) {
 function selectedCase() {
   return state.overview?.cases.find((c) => c.id === state.case);
 }
-function taskCounts() {
-  return selectedCase()?.counts || state.overview.counts;
-}
 function render() {
-  const counts = taskCounts();
-  const total = Object.values(counts).reduce((a, b) => a + b, 0);
-  const attention = (counts.BLOCKED || 0) + (counts.FAILED || 0);
   $("#nav-count").textContent = number(
     Object.values(state.overview.counts).reduce((a, b) => a + b, 0),
   );
@@ -210,92 +216,43 @@ function render() {
         `<button class="case-nav ${state.case === c.id ? "active" : ""}" data-case="${e(c.id)}"><div>${e(c.number)}<br><small>${e(c.title)}</small></div></button>`,
     )
     .join("");
-  $("#metrics").innerHTML = [
-    ["Total tasks", total, "In selected scope", ""],
-    [
-      "In progress",
-      (counts.RUNNING || 0) + (counts.PENDING || 0),
-      `${number(counts.WAITING)} waiting for a response`,
-      "",
-    ],
-    [
-      "Needs review",
-      attention,
-      attention ? "Blocked or failed" : "No blockers",
-      attention ? "attention" : "",
-    ],
-    [
-      "Completed",
-      counts.COMPLETED || 0,
-      `${number(state.overview.executions)} executions / ${number(state.overview.tokens)} tokens across firm`,
-      "",
-    ],
-  ]
-    .map(
-      ([label, value, note, cls]) =>
-        `<article class="metric"><div class="metric-top">${label}</div><div class="metric-number ${cls}">${number(value)}</div><div class="metric-note">${note}</div></article>`,
-    )
-    .join("");
-  const viewTitles = {
-    tasks: [
-      "Tasks",
-      "Assign work, review blockers, and follow agent progress.",
-      "All tasks",
-    ],
-    supervisor: [
-      "Supervisor",
-      "Review case progress and tasks that need a person.",
-      "Supervisor",
-    ],
-    activity: [
-      "Activity & audit",
-      "Comments, agent decisions, and provider updates.",
-      "Activity & audit",
-    ],
-    agents: [
-      "Agents",
-      "Published agents and their available workflows.",
-      "Agents",
-    ],
-  };
-  const [title, desc, crumb] = viewTitles[state.view];
-  $("#page-title").textContent =
-    state.case && state.view === "tasks"
-      ? selectedCase()?.number || title
-      : title;
-  $("#page-description").textContent =
-    state.case && state.view === "tasks" ? selectedCase()?.title || desc : desc;
-  $("#crumb-title").textContent = crumb;
+  const title = {tasks: "All tasks", supervisor: "Supervisor", activity: "Activity", agents: "Agents", human: "Needs your input", incidents: "Execution incidents", operations: "Operations"}[state.view];
+  $("#page-title").textContent = state.case && state.view === "tasks" ? selectedCase()?.number || title : title;
   $$(".nav").forEach((b) =>
     b.classList.toggle("active", b.dataset.view === state.view && !state.case),
   );
   $("#view-tabs").hidden = state.view !== "tasks";
   $("#section-label").hidden = state.view === "tasks";
-  $("#section-label").textContent = crumb;
+  $("#section-label").textContent = title;
   $(".filters").hidden = !["tasks"].includes(state.view);
   const term = $("#search").value.trim().toLowerCase();
   const tasks = state.tasks.filter((t) =>
-    `${t.objective} ${t.id} ${short(t.id)}`.toLowerCase().includes(term),
+    `${taskTitle(t)} ${t.objective} ${t.id} ${short(t.id)}`.toLowerCase().includes(term),
   );
   if (state.view === "tasks") renderTasks(tasks);
   if (state.view === "supervisor") renderSupervisor();
+  if (state.view === "human") renderHumanQueue();
+  if (state.view === "incidents") renderIncidentQueue();
+  if (state.view === "operations") renderOperations();
+  $("#ops-count").textContent = state.operations?.alert_count || "";
+  $("#ops-count").hidden = !state.operations?.alert_count;
   if (state.view === "activity")
     $("#content").innerHTML =
       `<div class="audit-feed">${state.activity.length ? state.activity.map(eventHTML).join("") : '<div class="empty">No activity yet. Create a task to get started.</div>'}</div>`;
   if (state.view === "agents")
     $("#content").innerHTML =
-      `<div class="agent-grid">${state.workspace.agents.map((a) => `<article class="agent-card"><span class="agent-initial">${a.key === "supervisor" ? "S" : a.key === "client_check_in" ? "CI" : "MR"}</span><h3>${e(a.name)}</h3><p>${e(a.capability)}</p><small>${e(a.key)}</small><p>${a.key === "medical_records_collector" ? "Published v3 / task-scoped tools / bounded simulated reminders / durable follow-ups" : a.key === "supervisor" ? "Coordinates approved case objectives through independent durable specialist tasks." : "Published v1 / scheduled simulated outreach / attributed replies / meaningful-update comparison."}</p></article>`).join("")}</div>`;
+      `<div class="agent-grid">${state.workspace.agents.map((a) => `<article class="agent-card"><span class="agent-initial">${e(a.name.split(/\s+/).slice(0, 2).map(word => word[0]).join("").toUpperCase())}</span><h3>${e(a.name)}</h3><p>${e(a.description || a.capability)}</p></article>`).join("")}</div>`;
   $("#load-more").hidden = !(state.view === "tasks"
     ? state.next
     : state.view === "activity"
       ? state.activityNext
-      : false);
+      : state.view === "human" ? state.humanNext !== null : state.view === "incidents" ? state.incidentsNext !== null : false);
   $("#result-count").textContent =
     state.view === "tasks"
-      ? `${number(tasks.length)} loaded tasks${term ? " matching search" : ""} / ${number(total)} in scope`
+      ? `${number(tasks.length)} tasks${term ? " found" : ""}`
       : state.view === "activity"
         ? `${number(state.activity.length)} loaded events`
-        : "Computed from persisted platform data";
+        : state.view === "human" ? `${state.humanQueue?.length || 0} open requests loaded` : "";
 }
 function caseName(t) {
   return state.overview.cases.find((c) => c.id === t.case_id)?.number || "Case";
@@ -319,13 +276,21 @@ function renderTasks(tasks) {
     $("#content").innerHTML = `<div class="board">${cols
       .map(([title, statuses]) => {
         const items = tasks.filter((t) => statuses.includes(t.status));
-        return `<section class="column"><div class="column-title">${title}<b>${items.length}</b></div>${items.map((t) => `<button class="task-card" data-task="${e(t.id)}">${badge(t.status)}<span class="task-title">${e(t.objective)}</span><div class="task-card-bottom">${taskSub(t)}<span class="agent-initial" aria-hidden="true">MR</span></div></button>`).join("")}</section>`;
+        return `<section class="column"><div class="column-title">${title}<b>${items.length}</b></div>${items.map((t) => `<button class="task-card" data-task="${e(t.id)}">${badge(t.status)}<span class="task-title">${e(taskTitle(t))}</span><div class="task-card-bottom">${taskSub(t)}${agent(t)}</div></button>`).join("")}</section>`;
       })
       .join("")}</div>`;
     return;
   }
-  $("#content").innerHTML =
-    `<table class="task-table"><thead><tr><th>Task</th><th>Status</th><th>Assigned agent</th><th>Created</th><th>Version</th></tr></thead><tbody>${tasks.map((t) => `<tr><td><button class="task-name" data-task="${e(t.id)}"><span class="task-check ${t.status === "COMPLETED" ? "done" : ""}">${t.status === "COMPLETED" ? "✓" : ""}</span><span><span class="task-title">${e(t.objective)}</span>${taskSub(t)}</span></button></td><td>${badge(t.status)}</td><td>${agent(t)}</td><td>${e(date(t.created_at))}</td><td>v${e(t.agent_version)}</td></tr>`).join("")}</tbody></table>`;
+  const statuses = ["RUNNING", "WAITING", "BLOCKED", "PENDING", "FAILED", "COMPLETED", "CANCELLED"];
+  $("#content").innerHTML = `<div class="task-groups">${statuses.map((status) => {
+    const items = tasks.filter((t) => t.status === status);
+    if (!items.length) return "";
+    return `<section class="task-group" aria-label="${e(statusName(status))} tasks">
+      <div class="group-heading">${badge(status)}<span class="group-count">${items.length}</span></div>
+      <table class="task-table"><thead><tr><th scope="col">Name</th><th scope="col">Assignee</th><th scope="col">Case</th><th scope="col">Created</th></tr></thead>
+      <tbody>${items.map((t) => `<tr><td><button class="task-name" data-task="${e(t.id)}"><span class="task-check ${t.status === "COMPLETED" ? "done" : ""}" aria-hidden="true">${t.status === "COMPLETED" ? "✓" : ""}</span><span class="task-title">${e(taskTitle(t))}</span>${t.parent_task_id ? '<span class="subtask-mark" title="Subtask" aria-label="Subtask">↳</span>' : ""}</button></td><td>${agent(t)}</td><td><span class="case-tag">${e(caseName(t))}</span></td><td>${e(date(t.created_at))}</td></tr>`).join("")}</tbody></table>
+    </section>`;
+  }).join("")}<button class="add-task-row" data-create><span aria-hidden="true">＋</span> Add task</button></div>`;
 }
 function renderSupervisor() {
   const cases = state.overview.cases.filter(
@@ -338,7 +303,7 @@ function renderSupervisor() {
     .filter((ev) => ev.payload.mentions?.includes("supervisor"))
     .slice(0, 8);
   $("#content").innerHTML =
-    `<div class="supervisor-grid"><div class="notice"><strong>Operator overview</strong> / The supervisor delegates approved records scope and reviews material outcomes. Client-report reviews can be decided on their task. Other review questions still need explicit operator guidance or objective revision; comments are not approval.</div><section><div class="section-heading">Case progress <span>${cases.length} cases</span></div>${cases
+    `<div class="supervisor-grid"><section><div class="section-heading">Case progress <span>${cases.length} cases</span></div>${cases
       .map((c) => {
         const total = Object.values(c.counts).reduce((a, b) => a + b, 0),
           done = c.counts.COMPLETED || 0,
@@ -346,13 +311,13 @@ function renderSupervisor() {
         return `<article class="case-card"><div class="case-card-top">${e(c.number)} / ${e(c.status)}</div><h3>${e(c.title)}</h3><p>${
           state.overview.groups
             .filter((g) => g.case_id === c.id)
-            .map((g) => `<button class="task-link" data-task="${e(g.id)}">${e(g.objective)}</button>`)
+            .map((g) => `<button class="task-link" data-task="${e(g.id)}">${e(taskTitle(g))}</button>`)
             .join("<br>") || "No parent task"
         }</p>${supervisorPanel(c)}${monthlyPanel(c.id)}<div class="progress-track"><i style="width:${total ? Math.round((done / total) * 100) : 0}%"></i></div><div class="case-stats"><span>${done} of ${total} tasks complete</span><span>${blocked} need attention</span></div><button class="text-button" data-case="${e(c.id)}" style="margin-top:14px">View case tasks</button></article>`;
       })
       .join(
         "",
-      )}</section><section><div class="section-heading">Needs review <span>Loaded tasks</span></div>${needs.length ? needs.map((t) => `<button class="attention-row" data-task="${e(t.id)}">${badge(t.status)}<span class="task-title">${e(t.objective)}</span><p>${e(t.progress.last_reason || t.progress.last_summary || "Review the latest execution and add guidance.")}</p>${taskSub(t)}</button>`).join("") : '<div class="attention-empty">No blockers in the loaded tasks.<br>Case totals above include all persisted tasks.</div>'}<div class="section-heading" style="margin-top:28px">Supervisor mentions <span>Recent activity</span></div>${mentions.length ? mentions.map(eventHTML).join("") : '<div class="attention-empty">Tag @supervisor in a comment to wake the configured case coordinator.</div>'}</section></div>`;
+      )}</section><section><div class="section-heading">Needs review <span>Loaded tasks</span></div>${needs.length ? needs.map((t) => `<button class="attention-row" data-task="${e(t.id)}">${badge(t.status)}<span class="task-title">${e(taskTitle(t))}</span><p>${e(t.progress.last_reason || t.progress.last_summary || "Review the latest execution and add guidance.")}</p>${taskSub(t)}</button>`).join("") : '<div class="attention-empty">No blockers in the loaded tasks.<br>Case totals above include all persisted tasks.</div>'}<div class="section-heading" style="margin-top:28px">Supervisor mentions <span>Recent activity</span></div>${mentions.length ? mentions.map(eventHTML).join("") : '<div class="attention-empty">Tag @supervisor in a comment to wake the configured case coordinator.</div>'}</section></div>`;
 }
 const eventTitles = {
   "client.review_decided": "Teammate recorded a client-report decision",
@@ -364,6 +329,7 @@ const eventTitles = {
   "supervisor.review_completed": "Supervisor reviewed case",
   "supervisor.failed": "Supervisor needs recovery",
   "task.created": "Task assigned",
+  "task.plan_rejected": "Agent plan needs correction",
   "task.comment_added": "Comment added",
   "provider.response_received": "Provider update received",
   "agent.execution_completed": "Execution completed",
@@ -387,7 +353,10 @@ function eventHTML(ev) {
     payload.reason ||
     payload.assignment?.objective ||
     "";
-  return `<article class="feed-item"><div class="feed-body"><div class="feed-meta"><span class="feed-title">${e(title)}</span><time>${e(date(ev.created_at, true))}</time></div><div class="task-sub">${e(ev.actor || ev.actor_ref || "platform")}${ev.task_id ? `<span class="meta-separator" aria-hidden="true">/</span><button class="task-link" data-task="${e(ev.task_id)}">${short(ev.task_id)}</button>` : ""}</div>${text ? `<p class="feed-text">${e(text)}</p>` : ""}${payload.mentions?.length ? `<div class="feed-tags">${payload.mentions.map((m) => `<span class="mention">@${e(m)}</span>`).join("")}${payload.woke_agent ? '<span class="mention">Wake requested</span>' : ""}</div>` : ""}<details><summary>Event payload / ${e(ev.id?.slice(0, 8))}</summary><pre>${pretty(payload)}</pre></details></div></article>`;
+  const attribution = ev.source_actor
+    ? `${e(ev.source_actor.name)}${ev.simulated ? " · Simulated update" : ""}${ev.recorded_by ? ` · Recorded by ${e(ev.recorded_by)}` : ""}`
+    : e(ev.actor || ev.actor_ref || "platform");
+  return `<article class="feed-item"><div class="feed-body"><div class="feed-meta"><span class="feed-title">${e(title)}</span><time>${e(date(ev.created_at, true))}</time></div><div class="task-sub">${attribution}${ev.task_id ? `<span class="meta-separator" aria-hidden="true">/</span><button class="task-link" data-task="${e(ev.task_id)}">${short(ev.task_id)}</button>` : ""}</div>${text ? `<p class="feed-text">${e(text)}</p>` : ""}${payload.message ? `<p class="feed-text">${e(payload.message)}</p>` : ""}${payload.mentions?.length ? `<div class="feed-tags">${payload.mentions.map((m) => `<span class="mention">@${e(m)}</span>`).join("")}${payload.woke_agent ? '<span class="mention">Wake requested</span>' : ""}</div>` : ""}<details><summary>Event payload / ${e(ev.id?.slice(0, 8))}</summary><pre>${pretty(payload)}</pre></details></div></article>`;
 }
 async function openTask(id) {
   if (state.selected !== id) {
@@ -424,11 +393,14 @@ async function refreshDetail(force = false) {
     epoch = state.detailEpoch,
     firm = state.firm;
   if (!id) return;
-  const [task, events, runs, memory] = await Promise.all([
+  const [task, events, runs, memory, humanPage, incidentPage, contactPage] = await Promise.all([
     api(taskRoot(id)),
     api(`${root()}/activity?${query({ task_id: id })}`),
     api(`${taskRoot(id)}/executions`),
     api(`${taskRoot(id)}/memory`),
+    api(`/v1/firms/${state.firm}/human-requests?${query({task_id:id,status:"ALL",limit:100})}`),
+    api(`/v1/firms/${state.firm}/incidents?${query({task_id:id,status:"ALL",limit:100})}`),
+    api(`${taskRoot(id)}/manual-contacts`),
   ]);
   if (
     state.selected !== id ||
@@ -436,12 +408,15 @@ async function refreshDetail(force = false) {
     firm !== state.firm
   )
     return;
-  const hash = JSON.stringify([task, events, runs, memory]);
+  const hash = JSON.stringify([task, events, runs, memory, humanPage, incidentPage, contactPage]);
   if (!force && hash === state.detailHash) return;
   state.detailHash = hash;
   state.detail = task;
   state.runs = runs;
   state.memory = memory;
+  state.humanRequests = humanPage.items;
+  state.taskIncidents = incidentPage.items;
+  state.manualContacts = contactPage.items;
   const retaining = state.events.length > 100;
   state.events = retaining
     ? mergeRows(state.events, events.items)
@@ -455,6 +430,8 @@ function renderDetail() {
     outcome = latest?.outcome;
   const group = state.overview.groups.find((g) => g.id === t.parent_task_id);
   const reason =
+    (t.records_request?.callback_at ? "Waiting until the provider’s agreed callback time." : "") ||
+    t.progress_json.last_reason ||
     outcome?.reason ||
     latest?.decision?.next_action?.reason ||
     latest?.decision?.summary ||
@@ -462,11 +439,16 @@ function renderDetail() {
     "";
   $("#detail-id").textContent = short(t.id);
   $("#detail-heading").innerHTML =
-    `${badge(t.task_type === "case.coordination" ? state.overview.supervisors?.find((s) => s.group_task_id === t.id)?.status || t.status : t.status)}<h2>${e(t.objective)}</h2><dl class="detail-props"><dt>Task ID</dt><dd><code>${e(t.id)}</code></dd><dt>Assigned to</dt><dd>${agent(t)}</dd><dt>Case</dt><dd>${e(caseName(t))}</dd><dt>Part of</dt><dd>${e(group?.objective || "Standalone task")}</dd><dt>Next step</dt><dd>${e(reason || "Agent will assess the task.")}</dd>${outcome?.wake_at ? `<dt>Scheduled wake</dt><dd>${e(date(outcome.wake_at, true))}</dd>` : ""}<dt>Workflow</dt><dd><code>${e(t.workflow_id || t.check_in_series?.workflow_id || state.overview.supervisors?.find((s) => s.group_task_id === t.id)?.workflow_id)}</code></dd></dl>${t.records_request ? `<div class="requirements">${t.records_request.requirements.map((r) => `<span>${e(statusName(r.record_type))} / ${r.all_dates ? "all dates" : `${e(r.from_date)} ${e(r.through_date)}`}</span>`).join("")}<span>${e(statusName(t.records_request.status))}</span></div>${!closed(t) ? '<button class="text-button" data-provider>Simulate provider response</button>' : ""}` : ""}`;
-  $("#detail-heading").insertAdjacentHTML("beforeend", clientReviewHTML(t) + seriesHTML(t) + monthlyHTML(t));
+    `${badge(t.task_type === "case.coordination" ? state.overview.supervisors?.find((s) => s.group_task_id === t.id)?.status || t.status : t.status)}<h2>${e(taskTitle(t))}</h2><dl class="detail-props"><dt>Assigned to</dt><dd>${agent(t)}</dd><dt>Case</dt><dd>${e(caseName(t))}</dd><dt>Part of</dt><dd>${e(group ? taskTitle(group) : "Standalone task")}</dd><dt>Next step</dt><dd>${e(reason || "Agent will assess the task.")}</dd>${outcome?.wake_at && !t.records_request?.callback_at ? `<dt>Scheduled wake</dt><dd>${e(date(outcome.wake_at, true))}</dd>` : ""}</dl>${t.records_request ? `<div class="requirements">${t.records_request.requirements.map((r) => `<span>${e(statusName(r.record_type))} / ${e(statusName(r.status))} / ${r.all_dates ? "all dates" : `${e(r.from_date)} ${e(r.through_date)}`}</span>`).join("")}<span>${e(statusName(t.records_request.status))}</span></div>${!closed(t) ? '<button class="text-button" data-provider>Simulate provider response</button>' : ""}` : ""}`;
+  $("#detail-heading").insertAdjacentHTML("beforeend", recoveryHTML(t) + manualContactsHTML(t) + humanRequestsHTML(t) + seriesHTML(t) + monthlyHTML(t));
+  if (t.records_request?.callback_at) {
+    const r = t.records_request;
+    const when = new Date(r.callback_at).toLocaleString(undefined, {dateStyle: "medium", timeStyle: "short", timeZone: r.callback_timezone});
+    $("#detail-heading").insertAdjacentHTML("beforeend", `<p class="inline-note"><strong>Provider callback:</strong> ${e(when)} (${e(r.callback_timezone)}). Follow-ups pause until then.</p>`);
+  }
   if (t.records_request?.reminders_enabled) {
     const r = t.records_request;
-    $("#detail-heading").insertAdjacentHTML("beforeend", `<p class="inline-note">Simulated reminders: ${r.reminder_count} / ${r.max_reminders}${r.next_reminder_at ? ` / Next due ${e(date(r.next_reminder_at,true))}` : ""}. Existing contact restrictions remain enforced.</p>`);
+    $("#detail-heading").insertAdjacentHTML("beforeend", `<p class="inline-note">Simulated reminders: ${r.reminder_count} / ${r.max_reminders}${r.next_reminder_at && !r.callback_at ? ` / Next due ${e(date(r.next_reminder_at,true))}` : ""}. Existing contact restrictions remain enforced.</p>`);
   }
   $$(".detail-tabs button").forEach((b) =>
     b.classList.toggle("selected", b.dataset.tab === state.tab),
@@ -499,10 +481,10 @@ function renderDetailTab() {
   const target = $("#detail-content");
   if (state.tab === "activity")
     target.innerHTML = state.events.length
-      ? `${[...state.events].reverse().map(eventHTML).join("")}${state.eventsNext ? '<button class="text-button" data-older-events>Load older events</button>' : ""}`
+      ? `${state.events.map(eventHTML).join("")}${state.eventsNext ? '<button class="text-button" data-older-events>Load older events</button>' : ""}`
       : '<div class="empty">No activity yet.</div>';
   if (state.tab === "executions")
-    target.innerHTML = `<p class="inline-note">Latest 20 activations. Context, decisions, tool results, and actual token usage are saved per execution. Provider tools are simulated.</p>${state.runs.map((run, i) => `<details class="run" ${i === state.runs.length - 1 ? "open" : ""}><summary><span>Activation ${run.cycle + 1} / ${e(run.mode)}</span>${badge(run.status)}</summary><div class="run-meta">${e(date(run.created_at, true))} / ${e(run.id)} / attempt ${run.attempt} / ${number(run.usage?.total_tokens)} tokens / ${number(run.usage?.requests)} model calls</div><p>${e(run.decision?.summary || run.error_type || "Execution is in progress.")}</p>${run.decision?.next_action ? `<p><strong>${e(run.decision.next_action.type)}</strong> / ${e(run.decision.next_action.reason)}</p>` : ""}${run.outcome?.reason && run.outcome.reason !== run.decision?.next_action?.reason ? `<p class="inline-note">Backend: ${e(run.outcome.reason)}</p>` : ""}<h4>Tool calls (${run.tools.length})</h4>${run.tools.map((tool) => `<details class="run-tools"><summary>${e(tool.name)}<span class="mode">Simulated</span></summary><p>Idempotency key: <code>${e(tool.logical_key)}</code></p><pre>${pretty(tool.result)}</pre></details>`).join("")}<details><summary>Saved decision & committed outcome</summary><pre>${pretty({ decision: run.decision, outcome: run.outcome, usage: run.usage })}</pre></details></details>`).join("") || '<div class="empty">No executions yet. The worker will pick up the task.</div>'}`;
+    target.innerHTML = `<p class="inline-note">Latest 20 activations. Context, decisions, tool results, and actual token usage are saved per execution. Provider tools are simulated.</p>${state.runs.map((run, i) => `<details class="run" ${i === state.runs.length - 1 ? "open" : ""}><summary><span>Activation ${run.cycle + 1} / ${e(run.mode)}</span>${badge(run.status)}</summary><div class="run-meta">${e(date(run.created_at, true))} / ${e(run.id)} / attempt ${run.attempt} / ${number(run.usage?.total_tokens)} tokens / ${number(run.usage?.requests)} model calls</div><p>${e(run.decision?.summary || run.error_type || "Execution is in progress.")}</p>${run.decision?.next_action ? `<p><strong>${e(run.decision.next_action.type)}</strong> / ${e(run.decision.next_action.reason)}</p>` : ""}${run.outcome?.reason && run.outcome.reason !== run.decision?.next_action?.reason ? `<p class="inline-note">Backend: ${e(run.outcome.reason)}</p>` : ""}${(run.usage?.tool_rejections || []).map(r => `<p class="inline-note">Action postponed: ${e(statusName(r.tool))}. Due ${e(date(r.ready_at, true))}. No action was taken.</p>`).join("")}<h4>Tool calls (${run.tools.length})</h4>${run.tools.map((tool) => `<details class="run-tools"><summary>${e(tool.name)}<span class="mode">Simulated</span></summary><p>Idempotency key: <code>${e(tool.logical_key)}</code></p><pre>${pretty(tool.result)}</pre></details>`).join("")}<details><summary>Saved decision & committed outcome</summary><pre>${pretty({ decision: run.decision, outcome: run.outcome, usage: run.usage })}</pre></details></details>`).join("") || '<div class="empty">No executions yet. The worker will pick up the task.</div>'}`;
   if (state.tab === "context") {
     const run = state.runs.at(-1),
       ctx = run?.context;
@@ -714,6 +696,17 @@ async function loadMore() {
   const button = $("#load-more");
   button.disabled = true;
   try {
+    if (state.view === "incidents") {
+      const page = await api(`/v1/firms/${state.firm}/incidents?offset=${state.incidentsNext}`);
+      state.incidents = [...state.incidents, ...page.items];
+      state.incidentsNext = page.next_offset; render(); return;
+    }
+    if (state.view === "human") {
+      const page = await api(`/v1/firms/${state.firm}/human-requests?offset=${state.humanNext}`);
+      state.humanQueue = [...state.humanQueue, ...page.items];
+      state.humanNext = page.next_offset;
+      render(); return;
+    }
     const isTask = state.view === "tasks";
     const page = await api(
       `${root()}/${isTask ? "tasks" : "activity"}?${query({ case_id: state.case, status: isTask ? $("#status").value : null, before: isTask ? state.next : state.activityNext })}`,
@@ -737,10 +730,81 @@ document.querySelector("#create-series").addEventListener("change", updateCreate
 function isMonthlyCreate() {
   return $("#create-agent").value === "supervisor" && $("#create-supervisor-mode").value === "monthly";
 }
+function automaticCreate() {
+  return !state.humanObjective && !$("#create-manual-settings").open;
+}
+function invalidateAssignmentPlan() {
+  state.assignmentPlan = null;
+  $("#create-plan").hidden = true;
+  $("#create-plan").innerHTML = "";
+}
+$("#create-manual-settings").addEventListener("toggle", () => {
+  invalidateAssignmentPlan();
+  updateCreateKind();
+  if (!automaticCreate() && $("#create-agent").value === "supervisor") loadCreateSupervisor();
+});
+
+function assignmentPlanHTML(draft) {
+  const plan = draft.plan;
+  const names = new Map(draft.contacts.map(c => [c.id, c.name]));
+  const name = id => e(names.get(id) || "Unknown contact");
+  const steps = plan.steps.map(step => {
+    if (step.kind === "records") return `<section class="instructions"><strong>Collect hospital records</strong>${step.targets.map(t => `<p>${name(t.patient_contact_id)} → ${name(t.provider_contact_id)}</p><ul>${t.requirements.map(r => `<li>${e(statusName(r.record_type))}: ${r.all_dates ? "all dates" : `${e(r.from_date)} through ${e(r.through_date)}`}</li>`).join("")}</ul>`).join("")}</section>`;
+    if (step.kind === "agent") {
+      const capability = (draft.capabilities || []).find(c => c.agent_key === step.agent_key);
+      let assignment = {};
+      try { assignment = JSON.parse(step.assignment_json); } catch (_) { /* Backend validates before approval. */ }
+      return `<section class="instructions"><strong>${e(capability?.name || step.objective)}</strong><p>${e(step.objective)}</p><dl>${Object.entries(assignment).map(([key, value]) => `<dt>${e(statusName(key))}</dt><dd>${e(typeof value === "object" ? JSON.stringify(value) : String(value))}</dd>`).join("")}</dl></section>`;
+    }
+    const a = step.assignment;
+    const timing = step.kind === "monthly" ? `Monthly on day ${a.day_of_month} at ${a.local_time} (${a.timezone}), ${a.max_occurrences} check-ins. Minimum gap: ${a.minimum_gap_days} days.${a.starts_on ? ` Start: ${a.starts_on}.` : ""}${a.ends_at ? ` End: ${date(a.ends_at,true)}.` : ""}`
+      : step.kind === "series" ? `Every ${a.interval_seconds / 86400} days after completion; ${a.max_occurrences || "end-date bounded"} check-ins. First: ${date(a.first_due_at,true)}.${a.ends_at ? ` End: ${date(a.ends_at,true)}.` : ""}`
+      : `Send: ${date(a.scheduled_at,true)}`;
+    return `<section class="instructions"><strong>${e(step.kind === "monthly" ? "Monthly client check-ins" : step.kind === "series" ? "Recurring client check-ins" : "Client check-in")}</strong><p>${name(a.client_contact_id)} · ${e(timing)}</p><p>${e(a.message)}</p></section>`;
+  }).join("");
+  return `<h3>${plan.status === "ready" ? "Supervisor's proposed plan" : "The supervisor needs more information"}</h3><p>${e(plan.summary)}</p>${steps}${plan.assumptions.length ? `<strong>Please review these assumptions</strong><ul>${plan.assumptions.map(a => `<li>${e(a)}</li>`).join("")}</ul>` : ""}${plan.questions.length ? `<ul>${plan.questions.map(q => `<li>${e(q)}</li>`).join("")}</ul><p>Update your description above, then review the plan again.</p>` : ""}${draft.preserves_existing_records_scope && plan.steps.some(s => s.kind === "records") ? '<p>Existing approved hospital scopes will also be preserved.</p>' : ""}${plan.status === "ready" ? '<button type="button" class="primary" id="approve-assignment-plan">Approve & start</button>' : ""}`;
+}
+$("#create-plan").addEventListener("click", async event => {
+  if (!event.target.closest("#approve-assignment-plan") || !state.assignmentPlan) return;
+  const draft = state.assignmentPlan;
+  const caseId = $("#create-case").value;
+  const firm = state.firm;
+  // Freeze the reviewed description while its atomic approval is in flight.
+  $("#create-form").inert = true;
+  $("#create-error").hidden = true;
+  try {
+    const result = await api(`/v1/firms/${firm}/cases/${caseId}/assignments/${draft.plan_id}/approve`, {method:"POST"});
+    $("#create-modal").close();
+    invalidateAssignmentPlan();
+    toast("Plan approved. Assignments queued.");
+    await refresh(true);
+    await openTask(result.tasks[0].task_id);
+  } catch (err) {
+    $("#create-error").textContent = err.message;
+    $("#create-error").hidden = false;
+  } finally { $("#create-form").inert = false; }
+});
+$("#create-workflow").addEventListener("change", () => {
+  if (state.humanObjective) { updateCreateKind(); return; }
+  const choice = $("#create-workflow").value;
+  $("#create-agent").value = ["records", "monthly"].includes(choice) ? "supervisor" : choice;
+  $("#create-supervisor-mode").value = choice === "monthly" ? "monthly" : "records";
+  $("#create-objective").value = "";
+  $("#create-agent").dispatchEvent(new Event("change"));
+});
 function updateCreateKind() {
+  $$("#create-manual-settings input, #create-manual-settings select, #create-manual-settings textarea").forEach(el => {
+    if (el.dataset.assignmentDisabled !== undefined) {
+      el.disabled = el.dataset.assignmentDisabled === "true";
+      delete el.dataset.assignmentDisabled;
+    }
+  });
   const supervisor = $("#create-agent").value === "supervisor";
+  $("#create-agent").disabled = Boolean(state.humanObjective);
   const monthly = isMonthlyCreate();
   const checkIn = $("#create-agent").value === "check_in";
+  $("#create-workflow").value = monthly ? "monthly" : supervisor ? "records" : $("#create-agent").value;
+  $("#create-workflow").disabled = Boolean(state.humanObjective);
   const preserved = supervisor && !monthly && Boolean(state.createSavedTargets);
   const scope = !monthly && (!supervisor || $("#create-scope").checked);
   $("#create-supervisor-fields").hidden = !supervisor;
@@ -763,10 +827,27 @@ function updateCreateKind() {
   $("#create-replace").required = supervisor && !monthly && Boolean(state.createSupervisor?.revision);
   $("#create-submit").disabled = supervisor && !monthly && (state.createSupervisorLoading || !state.createSupervisor);
   $("#create-submit").textContent = monthly ? "Create monthly schedule" : supervisor && state.createSupervisor?.revision ? "Update supervisor task" : "Create & start task";
-  $("#create-help").textContent = monthly ? "The calendar wakes the supervisor each month to review and delegate a check-in."
-    : supervisor ? "The supervisor plans the work, assigns specialists, and reviews their progress."
-    : "The selected specialist starts automatically and reports back to this task.";
+  $("#create-help").textContent = monthly ? "Schedule monthly client updates for the firm."
+    : supervisor ? "The supervisor assigns a records specialist and monitors progress."
+    : checkIn ? "Send a check-in and report the client's reply to the firm."
+    : "Start one records specialist without supervisor planning.";
   $("#create-objective").placeholder = monthly ? "Check in with the client monthly and report meaningful changes…" : checkIn ? "Check in with the client and report meaningful changes…" : "Collect records and imaging from the provider…";
+  // Manual-only fields must not validate or block a description-first proposal.
+  const automatic = automaticCreate();
+  $$("#create-manual-settings input, #create-manual-settings select, #create-manual-settings textarea").forEach(el => {
+    if (automatic) {
+      el.dataset.assignmentDisabled = String(el.disabled);
+      el.disabled = true;
+    }
+  });
+  $("#create-case").required = true;
+  if (automatic) {
+    $("#create-workflow").disabled = true;
+    $("#create-help").textContent = "Describe the work. The supervisor will propose assignments for you to review.";
+    $("#create-objective").placeholder = "Collect bills and records from City Hospital, and check in with the client monthly…";
+    $("#create-submit").textContent = "Review supervisor plan";
+    $("#create-submit").disabled = false;
+  }
 }
 $("#create-supervisor-mode").addEventListener("change", () => {
   state.createKey = null;
@@ -809,7 +890,7 @@ async function loadCreateSupervisor() {
       ? "This case already has a supervisor task. Saving updates it; existing specialist tasks continue."
       : "A supervisor task will be created for this case, with specialist subtasks as needed.";
     if (current.objective) {
-      $("#create-objective").value = current.objective.objective;
+      if (!$("#create-objective").value) $("#create-objective").value = current.objective.objective;
       $("#create-scope").checked = Boolean(targets.length);
       const target = targets[0];
       if (target) {
@@ -870,8 +951,12 @@ $("#client-reply-form").addEventListener("submit", async (event) => {
 function openCreate(caseId = null) {
   if (!state.overview) return;
   state.createKey = null;
+  state.humanObjective = null;
+  invalidateAssignmentPlan();
+  $("#create-agent").disabled = $("#create-case").disabled = false;
   state.createAt = null;
   $("#create-form").reset();
+  $$("#create-form details").forEach((el) => el.open = false);
   $("#monthly-zone").value = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
   $("#date-range").hidden = true;
   updateCreateKind();
@@ -888,6 +973,8 @@ function openCreate(caseId = null) {
   $("#create-modal").showModal();
 }
 function updateCreateContacts() {
+  invalidateAssignmentPlan();
+  state.createSupervisor = null;
   state.createKey = null;
   $("#create-objective").value = "";
   $("#create-scope").checked = true;
@@ -896,6 +983,7 @@ function updateCreateContacts() {
   $$('input[name="record"]').forEach((el) => el.checked = el.defaultChecked);
   const caseId = $("#create-case").value,
     contacts = state.overview.contacts.filter((c) => c.case_id === caseId);
+  $("#create-contacts").textContent = `People and providers in this case: ${contacts.map(c => c.name).join(", ") || "None linked yet"}.`;
   $("#create-patient").innerHTML = contacts
     .filter((c) => c.roles.some((r) => ["CLIENT", "PATIENT"].includes(r)))
     .map((c) => `<option value="${e(c.id)}">${e(c.name)}</option>`)
@@ -908,11 +996,11 @@ function updateCreateContacts() {
     '<option value="">No parent task</option>' +
     state.overview.groups
       .filter((g) => g.case_id === caseId)
-      .map((g) => `<option value="${e(g.id)}">${e(g.objective)}</option>`)
+      .map((g) => `<option value="${e(g.id)}">${e(taskTitle(g))}</option>`)
       .join("");
   if ($("#create-parent").options.length > 1)
     $("#create-parent").selectedIndex = 1;
-  if ($("#create-agent").value === "supervisor") loadCreateSupervisor();
+  if (!automaticCreate() && $("#create-agent").value === "supervisor") loadCreateSupervisor();
   else updateCreateKind();
 }
 $("#create-form").addEventListener("submit", async (ev) => {
@@ -921,6 +1009,19 @@ $("#create-form").addEventListener("submit", async (ev) => {
   button.disabled = true;
   $("#create-error").hidden = true;
   try {
+    if (automaticCreate()) {
+      const description = $("#create-objective").value;
+      const caseId = $("#create-case").value;
+      const firm = state.firm;
+      const draft = await api(`/v1/firms/${firm}/cases/${caseId}/assignments/plan`, {
+        method:"POST", body:JSON.stringify({description, timezone:Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"}),
+      });
+      if (firm !== state.firm || caseId !== $("#create-case").value || description !== $("#create-objective").value || !automaticCreate()) return;
+      state.assignmentPlan = draft;
+      $("#create-plan").innerHTML = assignmentPlanHTML(draft);
+      $("#create-plan").hidden = false;
+      return;
+    }
     if (isMonthlyCreate()) {
       const payload = {
         client_contact_id: $("#create-patient").value,
@@ -976,24 +1077,33 @@ $("#create-form").addEventListener("submit", async (ev) => {
     if (supervisor) {
       if (state.createSupervisorLoading || !state.createSupervisor) throw new Error("Wait for the case objective to load.");
       if (state.createSupervisor.revision && !$("#create-replace").checked) throw new Error("Confirm the update to the existing supervisor task.");
-      const result = await api(`/v1/firms/${state.firm}/cases/${$("#create-case").value}/supervisor`, {
-        method: "POST",
-        headers: {"Idempotency-Key": (state.createKey ||= crypto.randomUUID())},
-        body: JSON.stringify({
-          objective: $("#create-objective").value,
-          expected_revision: state.createSupervisor.revision,
-          targets: state.createSavedTargets || (scoped ? [{
-            patient_contact_id: $("#create-patient").value,
-            provider_contact_id: $("#create-provider").value,
-            requirements,
-          }] : []),
-        }),
-      });
+      const objective = {
+        objective: $("#create-objective").value,
+        expected_revision: state.createSupervisor.revision,
+        targets: state.createSavedTargets || (scoped ? [{
+          patient_contact_id: $("#create-patient").value,
+          provider_contact_id: $("#create-provider").value, requirements,
+        }] : []),
+      };
+      const intervention = state.humanObjective;
+      if (intervention && $("#create-case").value !== intervention.request.case_id)
+        throw new Error("Keep the clarification in its original case.");
+      const result = intervention
+        ? await api(`/v1/firms/${state.firm}/human-requests/${intervention.request.id}/decisions`, {
+          method:"POST", headers:{"Idempotency-Key":(state.createKey ||= crypto.randomUUID())},
+          body:JSON.stringify({expected_task_version:intervention.request.task_version,
+            expected_request_version:intervention.request.version, action:"REVISE_OBJECTIVE",
+            payload:objective, reason:intervention.reason}),
+        })
+        : await api(`/v1/firms/${state.firm}/cases/${$("#create-case").value}/supervisor`, {
+          method:"POST", headers:{"Idempotency-Key":(state.createKey ||= crypto.randomUUID())},
+          body:JSON.stringify(objective),
+        });
       state.createKey = null;
       $("#create-modal").close();
       toast("Task assigned to supervisor. Delegation queued.");
       await refresh(true);
-      await openTask(result.group_task_id);
+      await openTask(intervention ? intervention.request.task_id : result.group_task_id);
       return;
     }
     const task = await api(`/v1/firms/${state.firm}/tasks/medical-records`, {
@@ -1022,7 +1132,10 @@ $("#create-form").addEventListener("submit", async (ev) => {
   }
 });
 $("#create-form").addEventListener("input", () => {
+  invalidateAssignmentPlan();
   state.createKey = null;
+  // Editing the answer must preserve the review identity and its case binding.
+  // openCreate resets these when starting a different assignment.
   state.createAt = null;
 });
 $("#comment-form").addEventListener("submit", async (ev) => {
@@ -1070,8 +1183,21 @@ $("#comment-form").addEventListener("submit", async (ev) => {
 // A deliberately explicit demo intake; it never sends a message to a real provider.
 const providerDialog = document.createElement("dialog");
 providerDialog.id = "provider-modal";
-providerDialog.innerHTML =
-  '<form id="provider-form"><div class="modal-heading"><h2>Simulate provider response</h2><button type="button" data-close="provider-modal" class="icon-button" aria-label="Close">✕</button></div><p>This stores a fictional response, creates synthetic evidence when received, and wakes the assigned agent.</p><label>Response status<select id="provider-status"><option value="PENDING">Still processing</option><option value="RECEIVED">All requested records received</option></select></label><label>Message<textarea id="provider-message" rows="4" required maxlength="2000" placeholder="The requested records are ready…"></textarea></label><div id="provider-error" class="error" role="alert" hidden></div><div class="modal-footer"><span>Simulation only / saved in audit history</span><button class="primary" type="submit">Save response & wake</button></div></form>';
+providerDialog.innerHTML = `
+  <form id="provider-form">
+    <div class="modal-heading"><h2>Simulate provider response</h2><button type="button" data-close="provider-modal" class="icon-button" aria-label="Close">✕</button></div>
+    <label>Response status<select id="provider-status"><option value="PENDING">Still processing</option><option value="PARTIAL">Receive selected items</option><option value="RECEIVED">Receive all outstanding items</option></select></label>
+    <fieldset id="provider-receipt-fields" hidden><legend>Items included in this delivery</legend><div id="provider-receipt-items"></div><p class="muted">Select only items actually received. Other requirements remain outstanding.</p></fieldset>
+    <label>Message<textarea id="provider-message" rows="3" required maxlength="2000" placeholder="Please call back Friday at 2pm."></textarea></label>
+    <details id="provider-callback-fields"><summary>Callback schedule (optional)</summary>
+      <label>Hospital timezone<input id="provider-callback-zone" placeholder="America/New_York" maxlength="100" /></label>
+      <div class="form-row"><label>Exact date (optional)<input id="provider-callback-date" type="date" /></label><label>Time if not in message<input id="provider-callback-time" type="time" value="09:00" /></label></div>
+      <p class="muted">Use a date, or write “call back Friday” in the message. Confirm the hospital timezone; an omitted time uses the time above.</p>
+      <label id="provider-clear-field" class="wake-label" hidden><input id="provider-clear-callback" type="checkbox" /> Cancel the current callback and resume normal follow-ups</label>
+    </details>
+    <div id="provider-error" class="error" role="alert" hidden></div>
+    <div class="modal-footer"><span>Simulated response</span><button class="primary" type="submit">Save response</button></div>
+  </form>`;
 document.body.append(providerDialog);
 $("#provider-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
@@ -1079,6 +1205,11 @@ $("#provider-form").addEventListener("submit", async (ev) => {
   button.disabled = true;
   $("#provider-error").hidden = true;
   try {
+    const pending = $("#provider-status").value !== "RECEIVED";
+    const receipt = $("#provider-status").value !== "PENDING";
+    const received = $$('#provider-receipt-items input:checked').map((el) => el.value);
+    if (receipt && !received.length) throw new Error("Select at least one received item.");
+    const schedule = pending && !$("#provider-clear-callback").checked && ($("#provider-callback-date").value || /\b(call\s+back|callback|follow[ -]?up)\b/i.test($("#provider-message").value));
     await api(`${taskRoot(state.selected)}/provider-updates`, {
       method: "POST",
       headers: {
@@ -1087,6 +1218,13 @@ $("#provider-form").addEventListener("submit", async (ev) => {
       body: JSON.stringify({
         status: $("#provider-status").value,
         message: $("#provider-message").value,
+        ...(receipt ? {received_requirement_ids:received} : {}),
+        ...(schedule ? {
+          callback_date: $("#provider-callback-date").value || null,
+          callback_local_time: $("#provider-callback-time").value || "09:00",
+          callback_timezone: $("#provider-callback-zone").value.trim() || null,
+        } : {}),
+        ...(pending && $("#provider-clear-callback").checked ? {clear_callback: true} : {}),
       }),
     });
     state.providerKey = null;
@@ -1102,6 +1240,20 @@ $("#provider-form").addEventListener("submit", async (ev) => {
   }
 });
 $("#provider-form").addEventListener("input", () => (state.providerKey = null));
+function updateProviderReceipt() {
+  const status = $("#provider-status").value;
+  $("#provider-callback-fields").hidden = status === "RECEIVED";
+  $("#provider-receipt-fields").hidden = status === "PENDING";
+  $$('#provider-receipt-items input').forEach((el) => {
+    el.disabled = status !== "PARTIAL";
+    el.checked = status === "RECEIVED";
+  });
+}
+$("#provider-status").onchange = updateProviderReceipt;
+$("#provider-message").oninput = () => {
+  if (/\b(call\s+back|callback|follow[ -]?up)\b/i.test($("#provider-message").value))
+    $("#provider-callback-fields").open = true;
+};
 document.addEventListener("click", async (ev) => {
   const b = ev.target.closest("button");
   if (!b) return;
@@ -1131,6 +1283,14 @@ document.addEventListener("click", async (ev) => {
   if (b.hasAttribute("data-create")) openCreate();
   if (b.hasAttribute("data-provider")) {
     $("#provider-form").reset();
+    $("#provider-callback-fields").hidden = false;
+    $("#provider-receipt-items").innerHTML = state.detail.records_request.requirements
+      .filter((r) => r.status !== "RECEIVED")
+      .map((r) => `<label class="wake-label"><input type="checkbox" value="${e(r.id)}" /> ${e(statusName(r.record_type))} / ${r.all_dates ? "all dates" : `${e(r.from_date)} through ${e(r.through_date)}`}</label>`).join("");
+    updateProviderReceipt();
+    $("#provider-callback-fields").open = !!state.detail.records_request?.callback_at;
+    $("#provider-callback-zone").value = state.detail.records_request?.callback_timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+    $("#provider-clear-field").hidden = !state.detail.records_request?.callback_at;
     $("#provider-error").hidden = true;
     state.providerKey = null;
     providerDialog.showModal();
@@ -1242,54 +1402,116 @@ document.addEventListener("click", (event) => {
 });
 
 
-function clientReviewHTML(task) {
-  const report = task.client_check_in?.report;
-  const review = report?.human_review;
-  if (!review) return "";
-  const draft = state.reviewDraft?.id === review.id ? state.reviewDraft : {reason:"", decision:"ALLOW_COMPLETION"};
-  const actionable = review.status === "OPEN" && task.status === "BLOCKED";
-  return `<section class="task-memory" aria-label="Client report review"><h3>Teammate review / ${e(statusName(review.status))}</h3>
-    <p><strong>${e(review.question)}</strong></p><blockquote>${e(report.report.message)}</blockquote>
-    <p class="inline-note">This decision concerns this client report only. Contact holds and open obligations remain enforced. No message will be sent by this form.</p>
-    ${report.review_stale ? `<p role="alert">The report changed after acknowledgement. This decision no longer permits completion; the report needs a new correction/review process.</p>` : ""}
-    ${review.reason ? `<p>Last decision: <strong>${e(statusName(review.decision))}</strong> / ${e(review.reason)}</p><small>${e(review.decided_by)} / ${e(date(review.decided_at,true))}</small>` : ""}
-    ${actionable ? `<form data-client-review="${e(review.id)}" data-task="${e(task.id)}" data-version="${task.version}" data-review-version="${review.version}">
-      <label>Decision<select name="decision"><option value="ALLOW_COMPLETION" ${draft.decision === "ALLOW_COMPLETION" ? "selected" : ""}>Allow completion / I have handled this report</option><option value="REQUEST_CHANGES" ${draft.decision === "REQUEST_CHANGES" ? "selected" : ""}>Request changes / give guidance and keep review open</option></select></label>
-      <label>Reason or instructions<textarea name="reason" required maxlength="2000" rows="3" placeholder="Record what you reviewed, handled, or need the agent to change">${e(draft.reason)}</textarea></label>
-      <p class="inline-note">Recorded under the authenticated local operator credential. Requesting changes wakes the agent once; completion still needs an explicit acknowledgement.</p>
-      <button type="submit" class="primary">Record decision & wake same task</button></form>` : `<p>${review.status === "RESOLVED" ? "Acknowledgement saved. The agent resumes on this same task; other blockers still apply." : "Wait for the agent to block for review, then decide here."}</p>`}
-  </section>`;
+function renderHumanQueue() {
+  const rows = state.humanQueue || [];
+  $("#content").innerHTML = rows.length ? `<div class="audit-feed">${rows.map((r) => `
+    <article class="task-memory">${badge(r.kind)} ${r.overdue ? '<strong>Overdue</strong>' : ""}
+    <h3>${e(r.question)}</h3><p>${e(r.context_summary)}</p>
+    <p>Owner: ${e(r.assignee || "Unassigned")}${r.due_at ? ` / Due ${e(date(r.due_at,true))}` : ""}</p>
+    <button class="primary" data-task="${e(r.task_id)}">Review and choose next step</button></article>`).join("")}</div>`
+    : '<div class="empty">No open human requests. New requests appear here when work needs your input.</div>';
+  $("#result-count").textContent = `${rows.length} open requests loaded`;
 }
-
+function humanRequestsHTML(task) {
+  return (state.humanRequests || []).map((r) => {
+    const draft = state.humanDrafts?.[r.id] || {};
+    const selected = draft.action || r.allowed_actions[0]?.action;
+    const choice = r.allowed_actions.find((a) => a.action === selected);
+    const scheduled = selected === "SCHEDULE_FOLLOW_UP";
+    return `<section class="task-memory" aria-label="Human request">
+      <h3>${e(statusName(r.kind))} / ${e(statusName(r.status))}</h3>
+      <p><strong>${e(r.question)}</strong></p><p>${e(r.context_summary)}</p>
+      <p>Owner: ${e(r.assignee || "Unassigned")}${r.due_at ? ` / Due ${e(date(r.due_at,true))}` : ""}${r.overdue ? " / Overdue" : ""}</p>
+      ${(r.evidence_source_ids || []).slice(-20).map((id) => `<details><summary>Supporting evidence</summary><button class="text-button" data-memory-source="${e(id)}">Read evidence ${e(id.slice(0,8))}</button><div></div></details>`).join("")}
+      ${r.decisions.map((d) => `<div class="instructions"><strong>${e(statusName(d.action))}</strong><p>${e(d.reason)}</p><small>${e(d.actor)} / ${e(date(d.created_at,true))}</small></div>`).join("")}
+      ${r.continuations.map((c) => `<p class="inline-note">Authorized follow-up: ${e(statusName(c.status))} / Scheduled ${e(date(c.ready_at,true))} / Response deadline ${e(date(c.response_due_at,true))}. Contact remains simulated.</p>`).join("")}
+      ${r.actionable && !closed(task) ? `<form data-human-response="${e(r.id)}" data-request-version="${r.version}" data-task-version="${task.version}">
+        <label>Next step<select name="action">${r.allowed_actions.map((a) => `<option value="${e(a.action)}" ${selected === a.action ? "selected" : ""}>${e(a.label)}</option>`).join("")}</select></label>
+        <p data-human-consequence class="inline-note">${e(choice?.consequence)}</p>
+        <div data-human-schedule ${scheduled ? "" : "hidden"}>
+          <label>Follow-up time (${e(Intl.DateTimeFormat().resolvedOptions().timeZone)})<input type="datetime-local" name="follow_up_at" value="${e(draft.follow_up_at || "")}" ${scheduled ? "required" : ""}></label>
+          <label>Wait for provider response until<input type="datetime-local" name="response_due_at" value="${e(draft.response_due_at || "")}" ${scheduled ? "required" : ""}></label>
+        </div>
+        <label>Reason / guidance<textarea name="reason" rows="3" required maxlength="2000">${e(draft.reason || "")}</textarea></label>
+        <p class="inline-note">Decisions are attributed to the User. Existing restrictions remain enforced.</p>
+        <button type="submit" class="primary">${selected === "REVISE_OBJECTIVE" ? "Continue to objective form" : "Record decision"}</button>
+      </form>` : r.status === "OPEN" ? '<p class="inline-note">Wait for the agent to stop for review, then refresh.</p>' : '<p class="inline-note">Decision recorded. Check the task timeline for the continuation outcome.</p>'}
+      ${r.status === "OPEN" && !closed(task) ? `<details><summary>Assign owner or deadline</summary><form data-human-assignment="${e(r.id)}" data-request-version="${r.version}">
+        <label>Responsible person<input name="assignee" maxlength="100" value="${e(draft.assignee ?? r.assignee ?? "")}"></label>
+        <label>Due time<input type="datetime-local" name="due_at" value="${e(draft.due_at ?? localInput(r.due_at))}"></label>
+        <p class="inline-note">Owner labels organize work in this local prototype; they do not grant account permissions.</p>
+        <button type="submit" class="text-button">Save assignment</button></form></details>` : ""}
+    </section>`;
+  }).join("");
+}
+function localInput(value) {
+  if (!value) return "";
+  const d = new Date(value);
+  return new Date(d.getTime() - d.getTimezoneOffset()*60000).toISOString().slice(0,16);
+}
 document.addEventListener("input", (event) => {
-  const form = event.target.closest("[data-client-review]");
+  const form = event.target.closest("[data-human-response], [data-human-assignment]");
   if (!form) return;
-  state.reviewDraft = {id:form.dataset.clientReview, reason:form.elements.reason.value, decision:form.elements.decision.value};
+  const id = form.dataset.humanResponse || form.dataset.humanAssignment;
+  state.humanDrafts ||= {};
+  state.humanDrafts[id] = {...state.humanDrafts[id], ...Object.fromEntries(new FormData(form))};
 });
-
+document.addEventListener("change", (event) => {
+  const form = event.target.closest("[data-human-response]");
+  if (!form || event.target.name !== "action") return;
+  const request = state.humanRequests.find((r) => r.id === form.dataset.humanResponse);
+  const selected = form.elements.action.value;
+  form.querySelector("[data-human-consequence]").textContent = request.allowed_actions.find((a) => a.action === selected).consequence;
+  form.querySelector("[data-human-schedule]").hidden = selected !== "SCHEDULE_FOLLOW_UP";
+  form.elements.follow_up_at.required = form.elements.response_due_at.required = selected === "SCHEDULE_FOLLOW_UP";
+  form.querySelector("button[type=submit]").textContent = selected === "REVISE_OBJECTIVE" ? "Continue to objective form" : "Record decision";
+});
 document.addEventListener("submit", async (event) => {
-  const form = event.target.closest("[data-client-review]");
+  const form = event.target.closest("[data-human-response], [data-human-assignment]");
   if (!form) return;
   event.preventDefault();
+  const id = form.dataset.humanResponse || form.dataset.humanAssignment;
+  const request = state.humanRequests.find((r) => r.id === id);
+  const data = Object.fromEntries(new FormData(form));
+  if (form.dataset.humanResponse && data.action === "REVISE_OBJECTIVE") {
+    const reason = data.reason.trim();
+    if (!reason) { toast("Record a reason before continuing."); return; }
+    $("#create-agent").value = "supervisor";
+    openCreate(request.case_id);
+    state.humanObjective = {request, reason};
+    $("#create-manual-settings").open = true;
+    $("#create-agent").disabled = $("#create-case").disabled = true;
+    updateCreateKind();
+    return;
+  }
   const button = form.querySelector("button[type=submit]");
-  const target = `${taskRoot(form.dataset.task)}/client-reviews/${form.dataset.clientReview}/decisions`;
-  const payload = {expected_task_version:Number(form.dataset.version), expected_review_version:Number(form.dataset.reviewVersion), decision:form.elements.decision.value, reason:form.elements.reason.value.trim()};
-  if (!payload.reason) { toast("A review reason is required."); return; }
-  const intent = JSON.stringify({decision:payload.decision,reason:payload.reason});
-  if (state.reviewWrite?.target !== target || state.reviewWrite?.intent !== intent)
-    state.reviewWrite = {target,intent,key:crypto.randomUUID(),body:JSON.stringify(payload)};
   button.disabled = true;
   try {
-    await api(target, {method:"POST",headers:{"Idempotency-Key":state.reviewWrite.key},body:state.reviewWrite.body});
-    state.reviewWrite = null; state.reviewDraft = null;
-    toast("Decision recorded. Same task and supervisor wake queued.");
+    let body, operation;
+    if (form.dataset.humanAssignment) {
+      operation = "assignment";
+      body = {expected_request_version:Number(form.dataset.requestVersion),
+        assignee:data.assignee.trim() || null, due_at:data.due_at ? new Date(data.due_at).toISOString() : null};
+    } else {
+      operation = "decisions";
+      body = {expected_task_version:Number(form.dataset.taskVersion), expected_request_version:Number(form.dataset.requestVersion),
+        action:data.action, reason:data.reason.trim(), payload:data.action === "SCHEDULE_FOLLOW_UP"
+          ? {follow_up_at:new Date(data.follow_up_at).toISOString(),response_due_at:new Date(data.response_due_at).toISOString()} : {}};
+    }
+    const target = `/v1/firms/${state.firm}/human-requests/${id}/${operation}`;
+    const intent = JSON.stringify(body);
+    state.humanWrites ||= {};
+    if (state.humanWrites[target]?.intent !== intent) state.humanWrites[target] = {intent,key:crypto.randomUUID()};
+    await api(target, {method:"POST",headers:{"Idempotency-Key":state.humanWrites[target].key},body:intent});
+    delete state.humanWrites[target];
+    if (state.humanDrafts) delete state.humanDrafts[id];
+    toast(operation === "assignment" ? "Assignment saved." : "Decision saved. Continuation queued; other blockers still apply.");
     await refreshDetail(true); await refresh();
   } catch (err) {
-    if (err.status === 409) { state.reviewWrite = null; await refreshDetail(true); }
+    if (err.status === 409) { state.humanWrites = {}; await refreshDetail(true); }
     toast(err.message);
   } finally { button.disabled = false; }
 });
-
 
 function seriesHTML(task) {
   const s=task.check_in_series;
@@ -1362,3 +1584,108 @@ document.addEventListener("submit", async (event) => {
   } catch (err) { if (err.status === 409) state.monthlyWrite = null; toast(err.message); }
   finally { button.disabled = false; }
 });
+
+
+function renderIncidentQueue() {
+  $("#content").innerHTML = (state.incidents || []).length ? `<div class="audit-feed">${state.incidents.map((i) => `<article class="task-memory"><h3>${e(i.objective)}</h3><p>${e(statusName(i.category))} / ${e(i.error_type)}</p><p>Execution ${i.failed_cycle}; recovery attempts used ${i.generation} / 3</p><button class="primary" data-task="${e(i.task_id)}">Inspect and recover</button></article>`).join("")}</div>` : '<div class="empty">No open execution incidents.</div>';
+}
+function contactFields(task, draft = {}) {
+  const contacts = state.overview.contacts.filter((c) => c.case_id === task.case_id);
+  return `<label>Contact<select name="contact_id">${contacts.map((c) => `<option value="${e(c.id)}" ${draft.contact_id === c.id ? "selected" : ""}>${e(c.name)}</option>`).join("")}</select></label>
+    <label>Actual contact time<input name="occurred_at" type="datetime-local" required value="${e(draft.occurred_at || localInput(new Date().toISOString()))}"></label>
+    <label>Channel<select name="channel">${["PHONE","EMAIL","IN_PERSON","OTHER"].map((v) => `<option ${draft.channel === v ? "selected" : ""}>${v}</option>`).join("")}</select></label>
+    <label>Outcome<select name="outcome">${["REACHED","VOICEMAIL","NO_ANSWER","WRONG_CONTACT"].map((v) => `<option ${draft.outcome === v ? "selected" : ""}>${v}</option>`).join("")}</select></label>
+    <label>What happened<textarea name="notes" required maxlength="4000" rows="3">${e(draft.notes || "")}</textarea></label>
+    <label>Supporting source IDs (optional, comma-separated)<input name="evidence" value="${e(draft.evidence || "")}"></label>
+    ${task.records_request ? `<details><summary>Explicitly authorize one provider follow-up (optional)</summary><p>Choose the task's provider and REACHED outcome. This authorizes one simulated attempt for missing items; holds remain enforced.</p><label>Follow-up time<input type="datetime-local" name="follow_up_at" value="${e(draft.follow_up_at || "")}"></label><label>Response deadline<input type="datetime-local" name="response_due_at" value="${e(draft.response_due_at || "")}"></label></details>` : ""}
+    <p class="inline-note">Attributed to User. Notes remain unverified statements, not document receipt or a completed client check-in.</p>`;
+}
+function recoveryHTML(task) {
+  return (state.taskIncidents || []).map((i) => {
+    const draft = state.recoveryDrafts?.[i.id] || {};
+    return `<section class="task-memory"><h3>Execution incident / ${e(statusName(i.status))}</h3><p>${e(i.error_type)} / ${e(statusName(i.category))}</p><p>Failed cycle ${i.failed_cycle}. Recovery attempts used: ${i.generation} / 3.</p><p>${e(i.delivery_note)}</p><details><summary>Saved actions (${i.saved_actions.length}${i.saved_actions_truncated ? "+" : ""})</summary><pre>${pretty(i.saved_actions)}</pre></details>
+    ${i.resolution ? `<p>${e(i.resolution.action)}: ${e(i.resolution.reason)}</p><small>${e(i.resolution.actor)}</small>` : ""}
+    ${i.status === "OPEN" && task.status === "FAILED" ? `<form data-recover="${e(i.id)}" data-task-version="${task.version}" data-incident-version="${i.version}">
+      <label>Recovery action<select name="action">${i.allowed_actions.map((a) => `<option ${draft.action === a ? "selected" : ""}>${a}</option>`).join("")}</select></label>
+      <label>What was fixed / reason<textarea name="reason" rows="3" required maxlength="2000">${e(draft.reason || "")}</textarea></label>
+      <label class="wake-label"><input type="checkbox" name="include_contact" ${draft.include_contact ? "checked" : ""}> Record manual contact with this decision</label>
+      <fieldset data-recovery-contact ${draft.include_contact ? "" : "hidden disabled"}><legend>Manual contact</legend>${contactFields(task,draft)}</fieldset>
+      <p class="inline-note">Retry starts a new execution on the same assignment with current facts and policy. Saved actions remain deduplicated. Cancel stops future work.</p><button type="submit" class="primary">Save recovery decision</button></form>` : ""}</section>`;
+  }).join("");
+}
+function manualContactsHTML(task) {
+  if (task.kind !== "AGENT") return "";
+  const draft = state.contactDrafts?.[task.id] || {};
+  return `<section class="task-memory"><h3>Manual contact</h3>${(state.manualContacts || []).map((c) => `<div class="instructions"><strong>${e(statusName(c.outcome))} / ${e(statusName(c.channel))}</strong><p>${e(c.notes)}</p><small>Contact ${e(date(c.occurred_at,true))}; recorded ${e(date(c.recorded_at,true))} by ${e(c.actor)}</small></div>`).join("")}
+    ${!["COMPLETED","CANCELLED"].includes(task.status) ? `<details><summary>Record a call or other contact</summary><form data-record-contact="${e(task.id)}" data-task-version="${task.version}">${contactFields(task,draft)}<button type="submit" class="text-button">Save contact</button></form></details>` : ""}</section>`;
+}
+function contactPayload(form) {
+  const f = form.elements;
+  return {contact_id:f.contact_id.value,occurred_at:new Date(f.occurred_at.value).toISOString(),
+    channel:f.channel.value,outcome:f.outcome.value,notes:f.notes.value.trim(),
+    evidence_source_ids:f.evidence.value.split(",").map((v) => v.trim()).filter(Boolean),
+    ...(f.follow_up_at?.value ? {follow_up_at:new Date(f.follow_up_at.value).toISOString()} : {}),
+    ...(f.response_due_at?.value ? {response_due_at:new Date(f.response_due_at.value).toISOString()} : {})};
+}
+document.addEventListener("input", (event) => {
+  const form = event.target.closest("[data-recover], [data-record-contact]");
+  if (!form) return;
+  const recovering = !!form.dataset.recover;
+  const store = recovering ? (state.recoveryDrafts ||= {}) : (state.contactDrafts ||= {});
+  const id = form.dataset.recover || form.dataset.recordContact;
+  store[id] = Object.fromEntries(new FormData(form));
+});
+document.addEventListener("change", (event) => {
+  const form = event.target.closest("[data-recover]");
+  if (form && event.target.name === "include_contact") {
+    const fields = form.querySelector("[data-recovery-contact]");
+    fields.hidden = fields.disabled = !event.target.checked;
+  }
+});
+document.addEventListener("submit", async (event) => {
+  const form = event.target.closest("[data-recover], [data-record-contact]");
+  if (!form) return;
+  event.preventDefault(); const button = form.querySelector("button[type=submit]"); button.disabled = true;
+  try {
+    const recovering = !!form.dataset.recover;
+    const id = form.dataset.recover || form.dataset.recordContact;
+    const target = recovering ? `/v1/firms/${state.firm}/incidents/${id}/resolve` : `${taskRoot(id)}/manual-contacts`;
+    const body = {expected_task_version:Number(form.dataset.taskVersion)};
+    if (recovering) {
+      Object.assign(body,{expected_incident_version:Number(form.dataset.incidentVersion),action:form.elements.action.value,reason:form.elements.reason.value.trim()});
+      if (form.elements.include_contact.checked) body.contact = contactPayload(form);
+    } else body.contact = contactPayload(form);
+    const intent = JSON.stringify(body); state.recoveryWrites ||= {};
+    if (state.recoveryWrites[target]?.intent !== intent) state.recoveryWrites[target] = {intent,key:crypto.randomUUID()};
+    await api(target,{method:"POST",headers:{"Idempotency-Key":state.recoveryWrites[target].key},body:intent});
+    delete state.recoveryWrites[target];
+    if (recovering && state.recoveryDrafts) delete state.recoveryDrafts[id];
+    else if (state.contactDrafts) delete state.contactDrafts[id];
+    toast(recovering ? "Recovery saved. Inspect the task for the continuation outcome." : "Manual contact recorded.");
+    await refreshDetail(true); await refresh(true);
+  } catch (err) { toast(err.message); if (err.status === 409) {state.recoveryWrites={};await refreshDetail(true);} }
+  finally {button.disabled=false;}
+});
+
+function duration(seconds) {
+  if (seconds < 60) return `${Math.floor(seconds)}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`;
+  return `${Math.floor(seconds / 86400)}d ${Math.floor(seconds % 86400 / 3600)}h`;
+}
+function renderOperations() {
+  const data = state.operations;
+  if (!data || data.error) {
+    $("#content").innerHTML = `<div class="empty"><strong>Operations unavailable</strong>${e(data?.error || "Refresh to try again.")}</div>`;
+    return;
+  }
+  const expanded = new Set($$("details[data-ops-key][open]").map(el => el.dataset.opsKey));
+  const descriptions = {
+    outbox: "Oldest undelivered message, including retries.",
+    worker: "Oldest runnable unread event or pending task. Scheduled and human-blocked waits excluded.",
+    failed: "Tasks currently failed; inspect their execution incident.",
+    callbacks: "Callback deadline passed beyond the grace period. Holds still apply.",
+    human: "Open human requests. Alerts when overdue or older than the review threshold.",
+  };
+  $("#content").innerHTML = `<div class="operations"><div class="ops-summary"><span>${data.alert_count ? `${data.alert_count} active alert conditions` : "No active alerts"}</span><small>Checked ${e(date(data.as_of, true))} · Firm-wide</small></div>${data.signals.map(s => `<section class="ops-signal ${s.alert ? "ops-alert" : ""}"><div class="ops-heading"><h3>${e(s.label)}</h3><span class="ops-state">${s.alert ? "Needs attention" : "Within threshold"}</span></div><div class="ops-value">${number(s.count)}${s.age_seconds !== undefined ? `<small>Oldest ${duration(s.age_seconds)}</small>` : ""}${s.overdue_count ? `<small>${s.overdue_count} past due</small>` : ""}</div><p>${e(descriptions[s.key])}${s.threshold_seconds !== undefined ? ` Threshold: ${duration(s.threshold_seconds)}.` : ""}</p>${s.items.length ? `<details data-ops-key="${e(s.key)}" ${expanded.has(s.key) ? "open" : ""}><summary>Inspect oldest ${s.items.length} items</summary><div class="ops-items">${s.items.map(i => `<div><button class="task-link" data-task="${e(i.task_id)}">${e(short(i.task_id))}</button><span>${i.age_seconds !== undefined ? duration(i.age_seconds) : e(statusName(i.status || "OPEN"))}${i.attempts !== undefined ? ` · ${i.attempts} delivery retries` : ""}</span><code>${e(i.workflow_id || i.request_id || "")}</code></div>`).join("")}</div></details>` : ""}</section>`).join("")}</div>`;
+}

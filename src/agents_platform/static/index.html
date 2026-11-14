@@ -3,18 +3,14 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <meta name="theme-color" content="#f8f7f5" />
+    <meta name="theme-color" content="#ffffff" />
     <meta
       name="description"
       content="Assign agent tasks, review progress, and inspect saved execution history."
     />
-    <link
-      href="https://api.fontshare.com/v2/css?f[]=general-sans@400,500,600&display=swap"
-      rel="stylesheet"
-    />
     <title>HelloCounsel · Agent workspace</title>
-    <link rel="stylesheet" href="/assets/style.css" />
-    <script src="/assets/app.js" defer></script>
+    <link rel="stylesheet" href="/assets/style.css?v=operations-1" />
+    <script src="/assets/app.js?v=recovery-contact-1" defer></script>
   </head>
   <body>
     <noscript
@@ -25,7 +21,7 @@
     >
     <aside class="sidebar">
       <a class="brand" href="/" aria-label="HelloCounsel home">
-        <div>HelloCounsel<small>Agent workspace</small></div></a
+        <span class="brand-mark" aria-hidden="true">H</span><div>HelloCounsel</div></a
       >
       <div class="workspace-label">Workspace</div>
       <label class="sr-only" for="firm">Firm</label
@@ -38,6 +34,8 @@
           </svg>
           All tasks <b id="nav-count">0</b>
         </button>
+        <button class="nav" data-view="incidents">Execution incidents</button>
+        <button class="nav" data-view="human">Needs your input</button>
         <button class="nav" data-view="supervisor">
           <svg viewBox="0 0 20 20" aria-hidden="true">
             <path d="M10 3v4M4 12V7h12v5M10 7v5" />
@@ -52,7 +50,7 @@
             <circle cx="10" cy="10" r="7" />
             <path d="M10 6v4l3 2" />
           </svg>
-          Activity & audit
+          Activity
         </button>
         <button class="nav" data-view="agents">
           <svg viewBox="0 0 20 20" aria-hidden="true">
@@ -61,6 +59,7 @@
           </svg>
           Agents
         </button>
+        <button class="nav" data-view="operations"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2 10h4l2-6 4 12 2-6h4" /></svg>Operations <b id="ops-count" hidden></b></button>
       </nav>
       <div class="sidebar-caption">Cases <span id="case-count"></span></div>
       <div id="case-nav"></div>
@@ -70,46 +69,26 @@
         </div>
 
         <button id="connection" class="operator">
-          <span class="avatar">OP</span
-          ><span>Local operator<small>Internal demo workspace</small></span
+          <span class="avatar">U</span
+          ><span>User</span
           ><span aria-hidden="true">Settings</span>
         </button>
       </div>
     </aside>
     <main>
-      <header class="topbar">
-        <div class="crumb">
-          Workspace <span>/</span> <strong id="crumb-title">All tasks</strong>
-        </div>
-        <div class="top-actions">
-          <span id="mode" class="mode">DEMO</span
-          ><a href="/docs" target="_blank" rel="noreferrer">API</a
-          ><a href="http://localhost:8233" target="_blank" rel="noreferrer"
-            >Temporal</a
-          >
-        </div>
-      </header>
       <div class="page">
         <div class="page-heading">
           <div>
             <h1 id="page-title">Tasks</h1>
-            <p id="page-description">
-              Assign work, review blockers, and follow agent progress.
-            </p>
           </div>
-          <button class="primary" id="new-task">New task</button>
+          <button class="primary" id="new-task"><span aria-hidden="true">＋</span> Add task</button>
         </div>
         <div id="error" class="error" role="alert" hidden></div>
-        <section
-          id="metrics"
-          class="metrics"
-          aria-label="Workspace metrics"
-        ></section>
         <section class="workspace-panel">
           <div class="toolbar">
             <div class="view-tabs" id="view-tabs">
-              <button class="selected" data-layout="list">List</button
-              ><button data-layout="board">Board</button>
+              <button class="selected" data-layout="list"><span aria-hidden="true">☷</span> List</button
+              ><button data-layout="board"><span aria-hidden="true">▥</span> Board</button>
             </div>
             <div class="section-label" id="section-label" hidden>
               Workspace overview
@@ -118,7 +97,7 @@
               <label class="search"
                 ><input
                   id="search"
-                  placeholder="Search tasks or ID…"
+                  placeholder="Search tasks…"
                   aria-label="Search tasks" /></label
               ><select id="status" aria-label="Filter status">
                 <option value="">All statuses</option>
@@ -144,13 +123,9 @@
           <footer class="panel-footer">
             <span id="result-count">Loading tasks</span
             ><button id="load-more" class="text-button" hidden>Load more</button
-            ><span id="last-sync">Live updates every 5s</span>
+            ><span id="last-sync" hidden></span>
           </footer>
         </section>
-        <p class="demo-note">
-          Provider messages and records are simulated. Times use your local
-          timezone.
-        </p>
       </div>
     </main>
     <div id="drawer-backdrop" class="backdrop" hidden></div>
@@ -218,32 +193,32 @@
             ×
           </button>
         </div>
-        <p id="create-help">The supervisor plans the work, assigns specialists, and reviews their progress.</p>
+        <p id="create-help">Describe the work. The supervisor will propose assignments for you to review.</p>
         <label>Case<select id="create-case" required></select></label
-        ><label id="create-parent-field"
+        ><p id="create-contacts" class="muted"></p><label>What needs to get done?<textarea id="create-objective" rows="3" required maxlength="2000" placeholder="Collect bills and records from City Hospital, and check in with the client monthly…"></textarea></label>
+        <div id="create-plan" aria-live="polite" hidden></div>
+        <details id="create-manual-settings" class="create-options"><summary>Manual assignment (advanced)</summary>
+        <label>Workflow<select id="create-workflow">
+          <option value="records" selected>Collect hospital records</option>
+          <option value="check_in">Check in with a client once</option>
+          <option value="monthly">Check in with a client monthly</option>
+          <optgroup label="Advanced"><option value="medical_records">Assign records specialist directly</option></optgroup>
+        </select></label>
+        <details id="create-parent-field" class="create-options"><summary>Task grouping (optional)</summary><label
           >Part of<select id="create-parent">
             <option value="">No parent task</option>
-          </select></label
-        ><label
+          </select></label></details
+        ><label hidden
           >Agent<select id="create-agent">
             <option value="supervisor" selected>Supervisor (default)</option><option value="medical_records">Medical records (v3)</option><option value="check_in">Client check-in (v1)</option>
           </select></label
-        ><label
-          >Task objective<textarea
-            id="create-objective"
-            rows="3"
-            required
-            maxlength="2000"
-            placeholder="Collect records and imaging from the provider…"
-          ></textarea>
-        </label>
+        >
         <div id="create-supervisor-fields">
-          <label>Work type<select id="create-supervisor-mode"><option value="records">Records objective</option><option value="monthly">Monthly client check-ins</option></select></label>
+          <label hidden>Work type<select id="create-supervisor-mode"><option value="records">Records objective</option><option value="monthly">Monthly client check-ins</option></select></label>
           <div id="create-records-supervision">
           <p id="create-supervisor-note" class="muted"></p>
           <label id="create-replace-field" class="wake-label" hidden><input type="checkbox" id="create-replace" /> Update this case's existing supervisor task</label>
-          <label class="wake-label"><input type="checkbox" id="create-scope" checked /> Approve the records scope below for automatic delegation</label>
-          <p class="muted">The supervisor delegates records collection. Choose Monthly client check-ins for a calendar schedule.</p>
+          <label class="wake-label"><input type="checkbox" id="create-scope" checked /> Allow the supervisor to assign the records request below</label>
           </div>
         </div>
         <div class="form-row">
@@ -257,14 +232,17 @@
           ></label>
         </div>
         <div id="create-monthly-fields" hidden>
-          <p class="muted">Each month the supervisor checks current restrictions and recent contact before assigning a check-in. This adds a schedule without replacing the case's records objective.</p>
+          <p class="muted">One check-in each month, subject to contact restrictions and pending replies.</p>
           <div class="form-row"><label>Day of month<input id="monthly-day" type="number" min="1" max="31" value="5" required disabled></label><label>Time in schedule timezone<input id="monthly-time" type="time" value="09:00" required disabled></label></div>
+          <label>Months in schedule<input id="monthly-count" type="number" min="1" max="120" value="12" required disabled></label>
+          <details class="create-options"><summary>Message and advanced scheduling</summary>
           <label>Timezone<input id="monthly-zone" value="UTC" required maxlength="100" disabled></label>
-          <div class="form-row"><label>Start on or after (optional)<input id="monthly-start" type="date" disabled></label><label>Months in schedule<input id="monthly-count" type="number" min="1" max="120" value="12" required disabled></label></div>
+          <label>Start on or after (optional)<input id="monthly-start" type="date" disabled></label>
           <label>Minimum days between check-ins<input id="monthly-gap" type="number" min="1" max="365" value="28" required disabled></label>
           <label>End time (optional, your local timezone)<input id="monthly-end" type="datetime-local" disabled></label>
           <label>Check-in message<textarea id="monthly-message" rows="3" maxlength="2000" required disabled>How have you been? Please share changes in how you feel, treatment, daily activities, or anything the firm should know.</textarea></label>
-          <p class="muted">Recent manual check-ins and client replies count toward the minimum gap. Pending replies/reviews prevent another message. Missing dates use the month's last day; missed windows do not produce catch-up messages. Contact spacing also applies to manual tasks.</p>
+          <p class="muted">Recent client contact counts toward the minimum gap. Missed months do not trigger catch-up messages.</p>
+          </details>
         </div>
         <div id="create-records-fields"><label>Required documents</label>
         <div class="checks">
@@ -285,11 +263,12 @@
           <label>From<input id="from-date" type="date" /></label
           ><label>Through<input id="through-date" type="date" /></label>
         </div>
-        </div><div id="create-checkin-fields" hidden><label>Send at (local time)<input id="checkin-at" type="datetime-local" /></label><label>Check-in message<textarea id="checkin-message" rows="3" maxlength="2000">How have you been since our last check-in? Please share changes in how you feel, daily activities, treatment, or anything you would like the firm to know.</textarea></label><label><input id="create-series" type="checkbox" /> Repeat as a bounded check-in series</label><div id="series-fields" hidden><label>Interval after completion (minutes)<input id="series-interval" type="number" min="1" max="525600" value="10080" /></label><label>Maximum check-ins (up to 100)<input id="series-max" type="number" min="1" max="100" value="4" /></label><label>End date (optional, local time)<input id="series-end" type="datetime-local" /></label><p class="muted">One child task at a time. The next starts after the previous one completes and the interval passes. Review blocks the series. Missed dates do not create a burst.</p></div><p class="muted">Each occurrence sends one simulated message and accepts one reply. Pause and stop controls appear on the series task.</p></div>
+        </div><div id="create-checkin-fields" hidden><label>Check-in message<textarea id="checkin-message" rows="3" maxlength="2000">How have you been since our last check-in? Please share changes in how you feel, daily activities, treatment, or anything you would like the firm to know.</textarea></label><details class="create-options"><summary>Schedule or repeat (optional)</summary><label>Send at (local time; blank means now)<input id="checkin-at" type="datetime-local" /></label><label><input id="create-series" type="checkbox" /> Repeat after each completed check-in</label><div id="series-fields" hidden><label>Interval after completion (minutes)<input id="series-interval" type="number" min="1" max="525600" value="10080" /></label><label>Maximum check-ins (up to 100)<input id="series-max" type="number" min="1" max="100" value="4" /></label><label>End date (optional, local time)<input id="series-end" type="datetime-local" /></label><p class="muted">One check-in at a time. The next starts after completion and the interval passes.</p></div></details></div>
+        </details>
         <div id="create-error" class="error" role="alert" hidden></div>
         <div class="modal-footer">
           <span>All external communication is simulated.</span
-          ><button id="create-submit" type="submit" class="primary">Create & start task</button>
+          ><button id="create-submit" type="submit" class="primary">Review supervisor plan</button>
         </div>
       </form>
     </dialog>
@@ -307,7 +286,7 @@
           </button>
         </div>
         <p>
-          Enter the local operator API credential. This is separate from the
+          Enter the user API credential. This is separate from the
           OpenAI API key.
         </p>
         <label
@@ -318,7 +297,7 @@
             required
         /></label>
         <p class="muted">
-          Kept in this browser tab’s session only. The default demo credential
+          Kept in this browser tab’s session only. The default credential
           is <code>local-development-only</code>.
         </p>
         <div class="modal-footer">
