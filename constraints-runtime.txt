@@ -52,6 +52,7 @@ truststore==0.10.5
 types-protobuf==7.35.1.20260906
 typing-inspection==0.4.5
 typing_extensions==4.16.0
+tzdata==2026.6
 urllib3==2.8.0
 uvicorn==0.54.0
 websockets==16.1.1

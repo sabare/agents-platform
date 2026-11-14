@@ -19,6 +19,7 @@ dependencies = [
     "temporalio>=1.9,<2",
     "pgvector>=0.3,<1",
     "tiktoken>=0.8,<1",
+    "tzdata>=2025.2",
 ]
 
 [project.optional-dependencies]

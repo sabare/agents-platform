@@ -149,6 +149,8 @@ class RecordsRequest(TenantRow, Base):
     max_reminders: Mapped[int] = mapped_column(default=3, server_default="3")
     reminder_interval_seconds: Mapped[int] = mapped_column(default=30, server_default="30")
     next_reminder_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    callback_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    callback_timezone: Mapped[str | None]
     __table_args__ = (
         CheckConstraint(
             "reminder_count BETWEEN 0 AND max_reminders AND max_reminders BETWEEN 1 AND 3 "
@@ -669,6 +671,103 @@ class ClientReview(TenantRow, Base):
     )
 
 
+class HumanRequest(TenantRow, Base):
+    """Durable human work; domain-specific records remain the authority for outcomes."""
+
+    __tablename__ = "human_requests"
+    case_id: Mapped[UUID]
+    task_id: Mapped[UUID]
+    kind: Mapped[str]
+    handler: Mapped[str]
+    subject_id: Mapped[UUID]
+    subject_fingerprint: Mapped[str]
+    question: Mapped[str]
+    context_summary: Mapped[str]
+    evidence_source_ids: Mapped[list] = mapped_column(JSONB, default=list)
+    allowed_actions: Mapped[list] = mapped_column(JSONB)
+    status: Mapped[str] = mapped_column(default="OPEN")
+    assignee: Mapped[str | None]
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(default=1)
+    dedupe_key: Mapped[str]
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "case_id", "id"),
+        UniqueConstraint("tenant_id", "dedupe_key"),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "task_id"], ["tasks.tenant_id", "tasks.case_id", "tasks.id"]
+        ),
+        CheckConstraint("version > 0", name="human_request_version"),
+        CheckConstraint(
+            "status IN ('OPEN','RESOLVED','SUPERSEDED','CANCELLED')", name="human_request_status"
+        ),
+        CheckConstraint(
+            "kind IN ('CLARIFICATION','APPROVAL','REVIEW','MANUAL_ACTION')",
+            name="human_request_kind",
+        ),
+        Index("ix_human_requests_queue", "tenant_id", "status", "due_at"),
+    )
+
+
+class HumanDecision(TenantRow, Base):
+    """Append-only response. Delivery state belongs to the separate continuation row."""
+
+    __tablename__ = "human_decisions"
+    case_id: Mapped[UUID]
+    request_id: Mapped[UUID]
+    action: Mapped[str]
+    payload: Mapped[dict] = mapped_column(JSONB)
+    reason: Mapped[str]
+    actor: Mapped[str]
+    reviewed_fingerprint: Mapped[str]
+    source_id: Mapped[UUID]
+    idempotency_key: Mapped[str]
+    request_hash: Mapped[str]
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "case_id", "id"),
+        UniqueConstraint("tenant_id", "request_id", "idempotency_key"),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "request_id"],
+            ["human_requests.tenant_id", "human_requests.case_id", "human_requests.id"],
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "source_id"],
+            ["sources.tenant_id", "sources.case_id", "sources.id"],
+        ),
+    )
+
+
+class HumanContinuation(TenantRow, Base):
+    """One domain-authorized action and its response deadline, independent of model retries."""
+
+    __tablename__ = "human_continuations"
+    case_id: Mapped[UUID]
+    task_id: Mapped[UUID]
+    decision_id: Mapped[UUID]
+    status: Mapped[str] = mapped_column(default="PENDING")
+    ready_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    response_due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    source_id: Mapped[UUID | None]
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "decision_id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "task_id"], ["tasks.tenant_id", "tasks.case_id", "tasks.id"]
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "decision_id"],
+            ["human_decisions.tenant_id", "human_decisions.case_id", "human_decisions.id"],
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "source_id"],
+            ["sources.tenant_id", "sources.case_id", "sources.id"],
+        ),
+        CheckConstraint(
+            "status IN ('PENDING','APPLIED','FINISHED','CANCELLED')",
+            name="human_continuation_status",
+        ),
+    )
+
+
 class CheckInSeries(TenantRow, Base):
     __tablename__ = "check_in_series"
     case_id: Mapped[UUID]
@@ -817,4 +916,62 @@ class MonthlyCheckInOccurrence(TenantRow, Base):
             name="monthly_occurrence_status",
         ),
         Index("ix_monthly_occurrence_scope", "tenant_id", "case_id", "status"),
+    )
+
+
+class ExecutionIncident(TenantRow, Base):
+    __tablename__ = "execution_incidents"
+    case_id: Mapped[UUID]
+    task_id: Mapped[UUID]
+    failed_cycle: Mapped[int]
+    workflow_id: Mapped[str]
+    generation: Mapped[int]
+    error_type: Mapped[str]
+    category: Mapped[str]
+    status: Mapped[str] = mapped_column(default="OPEN")
+    version: Mapped[int] = mapped_column(default=1)
+    resolution: Mapped[dict | None] = mapped_column(JSONB)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "task_id", "generation"),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "task_id"], ["tasks.tenant_id", "tasks.case_id", "tasks.id"]
+        ),
+        CheckConstraint("status IN ('OPEN','RESOLVED')", name="execution_incident_status"),
+        CheckConstraint("version > 0 AND generation >= 0", name="execution_incident_versions"),
+        Index("ix_incidents_queue", "tenant_id", "status", "created_at"),
+    )
+
+
+class ManualContact(TenantRow, Base):
+    __tablename__ = "manual_contacts"
+    case_id: Mapped[UUID]
+    task_id: Mapped[UUID]
+    contact_id: Mapped[UUID]
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    channel: Mapped[str]
+    outcome: Mapped[str]
+    notes: Mapped[str]
+    actor: Mapped[str]
+    source_id: Mapped[UUID]
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "task_id"], ["tasks.tenant_id", "tasks.case_id", "tasks.id"]
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "contact_id"],
+            ["case_contacts.tenant_id", "case_contacts.case_id", "case_contacts.contact_id"],
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "source_id"],
+            ["sources.tenant_id", "sources.case_id", "sources.id"],
+        ),
+        CheckConstraint(
+            "outcome IN ('REACHED','VOICEMAIL','NO_ANSWER','WRONG_CONTACT')",
+            name="manual_contact_outcome",
+        ),
+        CheckConstraint(
+            "channel IN ('PHONE','EMAIL','IN_PERSON','OTHER')", name="manual_contact_channel"
+        ),
+        Index("ix_manual_contact_history", "tenant_id", "case_id", "contact_id", "occurred_at"),
     )

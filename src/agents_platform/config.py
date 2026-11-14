@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     context_output_tokens: int = Field(default=1500, ge=256, le=8000)
     context_retrieval_calls: int = Field(default=4, ge=1, le=10)
     demo_follow_up_seconds: int = Field(default=30, ge=1, le=86400)
+    ops_poll_seconds: int = Field(default=15, ge=1, le=300)
+    ops_outbox_age_seconds: int = Field(default=60, ge=1)
+    ops_worker_delay_seconds: int = Field(default=120, ge=1)
+    ops_callback_grace_seconds: int = Field(default=60, ge=0)
+    ops_review_age_seconds: int = Field(default=86400, ge=1)
     demo_max_activations: int = Field(default=6, ge=1, le=100)
 
 
