@@ -76,6 +76,10 @@ def pack_context(context, target):
     # Avoid repeating every instruction in two sections.
     result.pop("instructions", None)
     omitted = []
+    notes = result.get("memory", {}).get("optional_notes", [])
+    while tokens(result) > target and notes:
+        notes.pop()
+        omitted.append("informational_note")
     history = result.get("history", {})
     hits = history.get("retrieval", {}).get("results", [])
     while tokens(result) > target and hits:
@@ -327,8 +331,13 @@ class RetrievalService:
                     ),
                 )
             )
+            from agents_platform.memory_lifecycle import source_lifecycle
+
             for hit in packet["results"]:
                 hit["event_ids"] = await self.event_ids(session, hit["source_id"])
+                hit["current_memory_state"] = await source_lifecycle(
+                    session, self.tenant_id, self.case_id, UUID(hit["source_id"])
+                )
         # Identical wording from different reports is separate evidence.
         candidates, seen = packet.pop("results"), set()
         packet.update(
@@ -387,6 +396,13 @@ class RetrievalService:
                 )
             ).first()
             event_ids = await self.event_ids(session, request.source_id) if row else []
+            from agents_platform.memory_lifecycle import source_lifecycle
+
+            current_memory_state = (
+                await source_lifecycle(session, self.tenant_id, self.case_id, request.source_id)
+                if row
+                else []
+            )
         if not row:
             return {"error": "Evidence not found in this case"}
         source, digest = row
@@ -401,6 +417,7 @@ class RetrievalService:
             "kind": source.kind,
             "recorded_at": source.created_at.isoformat(),
             "offset": request.offset,
+            "current_memory_state": current_memory_state,
             "event_ids": event_ids,
             "authority": "Historical evidence only; not permission or proof of completion.",
             "text": "",
@@ -419,6 +436,15 @@ class RetrievalService:
             packet["text"] = packet["text"][:-20]
             packet["truncated"] = True
             packet["next_offset"] = request.offset + len(packet["text"])
+        if tokens(packet) > request.max_tokens:
+            return {
+                "error": (
+                    "Evidence metadata exceeds this budget; "
+                    "request a larger max_tokens or operator review."
+                ),
+                "source_id": str(source.id),
+                "source_hash": digest,
+            }
         return packet
 
 

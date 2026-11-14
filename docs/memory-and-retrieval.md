@@ -12,7 +12,7 @@ Reviewed against the code on 14 November 2026. This is the current implementatio
 
 Mandatory memory always loads, regardless of age or similarity. A months-old open restriction does not need to win a vector search. Each activation records selected instruction/item revisions, source IDs and a fingerprint. The specialist checks task version and memory again before a simulated action and final commit; the supervisor also checks its saved plan/task/memory state.
 
-Approved instructions have immutable revision history. An operator publishes a revision with a reason. Task obligations and stop-contact items require explicit resolution; holds do not expire automatically. Whole-case or provider-specific case holds apply to existing and future tasks. A free-text “stop” comment does not automatically create a typed restriction. Resolving an item records the operator's reason; it does not establish that consent is legally sufficient.
+Approved instructions have immutable revision history. An operator publishes a revision with a reason. Task obligations and stop-contact items require explicit resolution or an authorized replacement; holds do not expire automatically. Task memory now uses normalized `task_memory_items` rows, with active, archived and scheduled items kept separate in the briefing. Review dates never lift a hold. Only optional informational notes can expire automatically. Whole-case or provider-specific case holds apply to existing and future tasks. A free-text “stop” comment does not automatically create a typed restriction. Resolving an item records the operator's reason; it does not establish that consent is legally sufficient.
 
 ## Indexing and search
 
@@ -78,7 +78,7 @@ The authenticated operator routes use the same service as agent tools. Prefix al
 | `POST /cases/{case}/context/retrieve` | Question-specific, filtered, budgeted evidence |
 | `POST /cases/{case}/context/read` | Bounded source expansion |
 
-Memory/restriction writes require `Idempotency-Key` and the current `expected_version`. Instruction publication uses `expected_revision`. Resolution requires an item ID and reason text. Task memory holds at most 100 items, including resolved ones. Policy/hold changes currently fan out to affected tasks in one transaction.
+Memory/restriction writes require `Idempotency-Key` and the current `expected_version`. Instruction publication uses `expected_revision`. Resolution requires an item ID and reason text. Task memory permits at most 100 open, unexpired items; archived history does not consume this limit. History is paginated independently of the complete current-control load. Policy/hold changes currently fan out to affected tasks in one transaction.
 
 Example retrieval body:
 
@@ -111,3 +111,15 @@ The two former context modules are combined in **`context.py`**. No additional s
 Follow one request: agent asks a question → execution supplies firm/case identity → service searches indexed history → cited results are saved and returned → budget checks the next model call. The original snapshot and full tool results remain saved even if the model-facing copy is shortened.
 
 The other memory files have separate jobs: `memory.py` loads current controls; `memory_history.py` indexes/searches historical evidence; `memory_api.py` exposes operator routes. They remain separate to keep current controls, background indexing and HTTP handling easy to locate.
+
+
+## Maintaining current memory
+
+See [Memory lifecycle](memory-lifecycle.md) for exact-duplicate reuse, explicit
+supersession, effective/review dates, instruction retirement and bounded history.
+The existing indexing worker also performs bounded lifecycle sweeps. Action-time
+checks independently honor effective and expiry dates, even if the sweep is late.
+Both agent retrieval tools label historical memory sources with their current
+status, active flag and replacement reference. Retrieved text cannot revive a
+resolved or superseded restriction. This is an explicit operator-managed lifecycle;
+automatic natural-language contradiction resolution remains unimplemented.

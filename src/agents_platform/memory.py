@@ -1,6 +1,6 @@
 """Mandatory memory, loaded with SQL on every activation; no embedding dependency.
 
-Task memory is a small current projection in progress_json. Immutable Sources and
+Task memory uses normalized rows with a bounded active projection. Immutable Sources and
 ActivityEvents preserve how it changed. Instructions have a separate revision ledger.
 """
 
@@ -10,7 +10,8 @@ from uuid import UUID
 
 from sqlalchemy import select, text
 
-from agents_platform.models import CaseRestriction, Instruction, Task
+from agents_platform.memory_lifecycle import is_current, lifecycle_view, task_memory_view
+from agents_platform.models import CaseRestriction, Instruction, Task, TaskMemoryItem
 
 
 async def policy_lock(session, tenant_id, *, publishing=False):
@@ -25,17 +26,19 @@ async def policy_lock(session, tenant_id, *, publishing=False):
 
 
 async def instructions_for(session, tenant_id, provider_ids):
-    return (
+    rows = (
         await session.scalars(
             select(Instruction)
             .where(
                 Instruction.tenant_id == tenant_id,
+                Instruction.status == "ACTIVE",
                 Instruction.provider_contact_id.is_(None)
                 | Instruction.provider_contact_id.in_(provider_ids),
             )
             .order_by(Instruction.id)
         )
     ).all()
+    return [row for row in rows if is_current(row)]
 
 
 def instruction_view(row):
@@ -45,6 +48,8 @@ def instruction_view(row):
         "scope": row.scope,
         "provider_contact_id": str(row.provider_contact_id) if row.provider_contact_id else None,
         "text": row.text,
+        "status": row.status,
+        **lifecycle_view(row),
     }
 
 
@@ -53,12 +58,17 @@ async def assemble_memory(session, tenant_id, provider_ids, tasks, case_id):
     instructions = [
         instruction_view(i) for i in await instructions_for(session, tenant_id, provider_ids)
     ]
-    items = [
-        {**item, "task_id": str(task.id)}
-        for task in tasks
-        for item in task.progress_json.get("memory_items", [])
-        if item["status"] == "OPEN"
-    ]
+    rows = (
+        await session.scalars(
+            select(TaskMemoryItem).where(
+                TaskMemoryItem.tenant_id == tenant_id,
+                TaskMemoryItem.case_id == case_id,
+                TaskMemoryItem.task_id.in_([task.id for task in tasks]),
+                TaskMemoryItem.status == "OPEN",
+            )
+        )
+    ).all()
+    items = [task_memory_view(row) for row in rows if is_current(row)]
     restrictions = (
         await session.scalars(
             select(CaseRestriction).where(
@@ -70,9 +80,13 @@ async def assemble_memory(session, tenant_id, provider_ids, tasks, case_id):
             )
         )
     ).all()
-    items.extend(restriction_view(r) for r in restrictions)
+    items.extend(restriction_view(r) for r in restrictions if is_current(r))
     items.sort(key=lambda i: i["id"])
-    selected = {"instructions": instructions, "operational_items": items}
+    selected = {
+        "instructions": instructions,
+        "operational_items": [i for i in items if i["kind"] != "NOTE"],
+        "optional_notes": [i for i in items if i["kind"] == "NOTE"],
+    }
     fingerprint = hashlib.sha256(json.dumps(selected, sort_keys=True).encode()).hexdigest()
     return {
         **selected,
@@ -128,6 +142,9 @@ def restriction_view(row):
         "text": row.text,
         "status": row.status,
         "revision": row.revision,
+        **lifecycle_view(row),
+        "supersedes_id": str(row.supersedes_id) if row.supersedes_id else None,
+        "superseded_by_id": str(row.superseded_by_id) if row.superseded_by_id else None,
         "source_id": str(row.source_id),
         "resolution_source_id": str(row.resolution_source_id) if row.resolution_source_id else None,
         "resolution_reason": row.resolution_reason,

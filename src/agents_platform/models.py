@@ -31,6 +31,13 @@ class TenantRow:
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class MemoryLifecycle:
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    effective_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    review_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_transition_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
 class Firm(Base):
     __tablename__ = "firms"
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -250,8 +257,9 @@ class Source(TenantRow, Base):
     )
 
 
-class Instruction(TenantRow, Base):
+class Instruction(MemoryLifecycle, TenantRow, Base):
     __tablename__ = "instructions"
+    status: Mapped[str] = mapped_column(default="ACTIVE", server_default="ACTIVE")
     scope: Mapped[str]
     provider_contact_id: Mapped[UUID | None]
     text: Mapped[str]
@@ -273,6 +281,10 @@ class InstructionRevision(TenantRow, Base):
     """Published policy history; Instruction remains the current approved projection."""
 
     __tablename__ = "instruction_revisions"
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(default="ACTIVE", server_default="ACTIVE")
+    effective_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    review_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     instruction_id: Mapped[UUID]
     revision: Mapped[int]
     scope: Mapped[str]
@@ -405,10 +417,12 @@ class CaseCoordination(TenantRow, Base):
     )
 
 
-class CaseRestriction(TenantRow, Base):
+class CaseRestriction(MemoryLifecycle, TenantRow, Base):
     """Current case/provider contact hold; original and resolution evidence stay in Sources."""
 
     __tablename__ = "case_restrictions"
+    supersedes_id: Mapped[UUID | None]
+    superseded_by_id: Mapped[UUID | None]
     case_id: Mapped[UUID]
     provider_contact_id: Mapped[UUID | None]
     text: Mapped[str]
@@ -431,9 +445,49 @@ class CaseRestriction(TenantRow, Base):
             ["sources.tenant_id", "sources.case_id", "sources.id"],
         ),
         CheckConstraint(
-            "status IN ('OPEN','RESOLVED') AND revision > 0", name="case_restriction_state"
+            "status IN ('OPEN','RESOLVED','SUPERSEDED') AND revision > 0",
+            name="case_restriction_state",
         ),
         Index("ix_case_restrictions_scope", "tenant_id", "case_id", "status"),
+    )
+
+
+class TaskMemoryItem(MemoryLifecycle, TenantRow, Base):
+    """Current and historical task memory, independent of task progress/context size."""
+
+    __tablename__ = "task_memory_items"
+    case_id: Mapped[UUID]
+    task_id: Mapped[UUID]
+    kind: Mapped[str]
+    text: Mapped[str]
+    status: Mapped[str] = mapped_column(default="OPEN")
+    revision: Mapped[int] = mapped_column(default=1)
+    source_id: Mapped[UUID]
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    supersedes_id: Mapped[UUID | None]
+    superseded_by_id: Mapped[UUID | None]
+    resolution_source_id: Mapped[UUID | None]
+    resolution_reason: Mapped[str | None]
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "task_id"], ["tasks.tenant_id", "tasks.case_id", "tasks.id"]
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "source_id"],
+            ["sources.tenant_id", "sources.case_id", "sources.id"],
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "resolution_source_id"],
+            ["sources.tenant_id", "sources.case_id", "sources.id"],
+        ),
+        CheckConstraint("kind IN ('STOP_CONTACT','OBLIGATION','NOTE')", name="task_memory_kind"),
+        CheckConstraint(
+            "status IN ('OPEN','RESOLVED','SUPERSEDED','EXPIRED') AND revision > 0",
+            name="task_memory_state",
+        ),
+        CheckConstraint("expires_at IS NULL OR kind = 'NOTE'", name="only_notes_expire"),
+        Index("ix_task_memory_scope", "tenant_id", "case_id", "task_id", "status"),
     )
 
 

@@ -516,20 +516,45 @@ function memoryHTML() {
   const memory = state.memory;
   if (!memory || state.detail.kind !== "AGENT") return "";
   const editable = !closed(state.detail);
-  return `<section class="task-memory"><h4>Operational memory</h4>
-    <p class="inline-note">Open items always load, regardless of age. Case holds also cover future tasks. Task resolutions do not clear case holds.</p>
-    ${[...(memory.case_restrictions || []), ...(memory.history || [])].map((item) => `<div class="instructions">
-      <strong>${e(item.scope === "CASE" ? (item.provider_contact_id ? "Case / provider hold" : "Case-wide hold") : statusName(item.kind))} / ${e(statusName(item.status))}</strong>
+  const items = [...new Map([
+    ...(memory.operational_items || []), ...(memory.optional_notes || []),
+    ...(memory.case_restrictions || []), ...(memory.history || []),
+  ].map((item) => [item.id, item])).values()];
+  const itemHTML = (item) => {
+    const expired = item.expires_at && new Date(item.expires_at) <= new Date();
+    const open = item.status === "OPEN" && !expired;
+    const label = expired && item.status === "OPEN" ? "Expired" : item.status === "OPEN" && item.active === false ? "Scheduled" : statusName(item.status);
+    return `<div class="instructions">
+      <strong>${e(item.scope === "CASE" ? (item.provider_contact_id ? "Case / provider hold" : "Case-wide hold") : statusName(item.kind))} / ${e(label)}</strong>
       <p>${e(item.text)}</p><code>Source ${e(item.source_id.slice(0, 8))} / revision ${item.revision}</code>
+      ${item.effective_from ? `<p>Effective ${e(date(item.effective_from, true))}</p>` : ""}
       ${item.due_at ? `<p>Due ${e(date(item.due_at, true))}</p>` : ""}
-      ${item.status === "OPEN" && editable ? `<form data-memory-form data-scope="${item.scope === "CASE" ? "CASE" : "TASK"}" data-item="${e(item.id)}">
-        <label>Resolution reason<input name="text" required maxlength="2000" placeholder="What changed or was verified?"></label>
-        <button type="submit" class="text-button">Resolve & wake agent</button></form>` : ""}
-      ${item.resolution_reason ? `<p>Resolved: ${e(item.resolution_reason)}</p>` : ""}
-    </div>`).join("") || '<p class="inline-note">No operational memory recorded.</p>'}
-    ${editable ? `<details><summary>Add an obligation or contact restriction</summary>
-      <form data-memory-form><label>Applies to<select name="scope"><option value="TASK">This task</option><option value="CASE">Entire case / contact hold</option>${state.detail.records_request ? '<option value="PROVIDER">This provider across the case / contact hold</option>' : ""}</select></label><label>Type<select name="kind"><option value="OBLIGATION">Obligation / requires resolution before completion</option><option value="STOP_CONTACT">Stop contact / blocks outreach immediately</option></select></label>
-      <label>Details<textarea name="text" required maxlength="2000" rows="2" placeholder="Record a specific instruction and its reason"></textarea></label>
+      ${item.review_at ? `<p>${item.review_due ? "Review overdue" : "Review scheduled"}: ${e(date(item.review_at, true))}. A review date does not lift this item.</p>` : ""}
+      ${item.expires_at ? `<p>Note expires ${e(date(item.expires_at, true))}</p>` : ""}
+      ${open && editable ? `<details><summary>Review, replace or resolve</summary><form data-memory-form data-scope="${item.scope === "CASE" ? "CASE" : "TASK"}" data-item="${e(item.id)}" data-kind="${e(item.kind)}">
+        <label>Action<select name="operation"><option value="${item.review_due ? "REVIEW" : "RESOLVE"}">${item.review_due ? "Reviewed / keep active" : "Resolve"}</option><option value="${item.review_due ? "RESOLVE" : "REVIEW"}">${item.review_due ? "Resolve" : "Reviewed / keep active"}</option><option value="SUPERSEDE">Replace with a revised item</option></select></label>
+        <label data-replacement hidden>Replacement details<textarea name="replacement" maxlength="2000" rows="2"></textarea></label>
+        ${item.kind === "NOTE" ? '<label data-note-expiry hidden>Replacement note expires (optional, local time)<input name="expires_at" type="datetime-local" disabled></label>' : ""}
+        <label>Reason<input name="text" required maxlength="2000" placeholder="What changed or was verified?"></label>
+        <label data-review-date ${item.review_due ? "" : "hidden"}>Next review (optional, local time)<input name="review_at" type="datetime-local"></label>
+        <button type="submit" class="text-button">Save decision & wake agent</button></form></details>` : ""}
+      ${item.resolution_reason ? `<p>Decision: ${e(item.resolution_reason)}</p>` : ""}
+      ${item.superseded_by_id ? `<p>Replaced by ${e(item.superseded_by_id.slice(0, 8))}</p>` : ""}
+    </div>`;
+  };
+  const current = items.filter((i) => i.status === "OPEN" && !(i.expires_at && new Date(i.expires_at) <= new Date()));
+  const archived = items.filter((i) => !current.includes(i));
+  return `<section class="task-memory"><h4>Operational memory</h4>
+    <p class="inline-note">Effective holds and obligations always load. Resolved and replaced items stay in history. Review dates never lift contact holds.</p>
+    ${current.map(itemHTML).join("") || '<p class="inline-note">No open memory items.</p>'}
+    ${archived.length ? `<details><summary>Archived memory / ${archived.length} loaded</summary>${archived.map(itemHTML).join("")}</details>` : ""}
+    ${memory.history_next_offset != null ? `<button class="text-button" data-memory-older="${memory.history_next_offset}">Load older task memory</button>` : ""}
+    ${editable ? `<details><summary>Add an obligation, restriction or note</summary>
+      <form data-memory-form><label>Applies to<select name="scope"><option value="TASK">This task</option><option value="CASE">Entire case / contact hold</option>${state.detail.records_request ? '<option value="PROVIDER">This provider across the case / contact hold</option>' : ""}</select></label><label>Type<select name="kind"><option value="OBLIGATION">Obligation / requires explicit resolution</option><option value="STOP_CONTACT">Stop contact / blocks outreach</option><option value="NOTE">Supporting note / optional context</option></select></label>
+      <label>Details<textarea name="text" required maxlength="2000" rows="2" placeholder="Record a specific item and its reason"></textarea></label>
+      <label>Effective from (optional, local time)<input name="effective_from" type="datetime-local"></label>
+      <label>Review on (optional, local time)<input name="review_at" type="datetime-local"></label>
+      <label data-note-expiry hidden>Note expires (optional, local time)<input name="expires_at" type="datetime-local" disabled></label>
       <button type="submit" class="text-button">Save & wake agent</button></form></details>` : ""}
     <details><summary>Current memory manifest</summary><pre>${pretty(memory.manifest)}</pre></details>
   </section>`;
@@ -544,9 +569,19 @@ document.addEventListener("submit", async (event) => {
   const scope = form.dataset.scope || data.get("scope") || "TASK";
   const isCase = scope !== "TASK";
   const target = isCase ? `/v1/firms/${state.firm}/cases/${state.detail.case_id}/restrictions` : taskRoot(state.selected) + "/memory";
-  const payload = {expected_version: isCase ? state.memory.case_memory_version : state.memory.task_version, text: data.get("text"),
-    ...(form.dataset.item ? {operation: "RESOLVE", item_id: form.dataset.item} :
-      isCase ? (scope === "PROVIDER" ? {provider_contact_id: state.detail.records_request.provider_contact_id} : {}) : {kind: data.get("kind")})};
+  const operation = form.dataset.item ? data.get("operation") : "ADD";
+  const payload = {
+    expected_version: isCase ? state.memory.case_memory_version : state.memory.task_version,
+    operation,
+    text: operation === "SUPERSEDE" ? data.get("replacement") : data.get("text"),
+  };
+  if (form.dataset.item) payload.item_id = form.dataset.item;
+  if (operation === "SUPERSEDE") payload.reason = data.get("text");
+  if (!isCase && ["ADD", "SUPERSEDE"].includes(operation)) payload.kind = form.dataset.kind || data.get("kind");
+  if (isCase && operation === "ADD" && scope === "PROVIDER") payload.provider_contact_id = state.detail.records_request.provider_contact_id;
+  for (const field of operation === "ADD" ? ["effective_from", "review_at", "expires_at"] : operation === "SUPERSEDE" ? ["review_at", "expires_at"] : operation === "REVIEW" ? ["review_at"] : []) {
+    if (data.get(field)) payload[field] = new Date(data.get(field)).toISOString();
+  }
   const intent = JSON.stringify({...payload, expected_version: undefined});
   // Preserve the original body/version on uncertain retries, even after a refresh.
   if (state.memoryWrite?.intent !== intent || state.memoryWrite?.target !== target)
@@ -567,12 +602,45 @@ document.addEventListener("submit", async (event) => {
 });
 
 
-// Case scopes represent contact restrictions; obligations remain task-scoped.
+// Lifecycle controls keep hold resolution separate from review acknowledgement.
+function updateMemoryForm(form) {
+  const scope = form.dataset.scope || form.querySelector('[name="scope"]')?.value || "TASK";
+  const kind = form.querySelector('[name="kind"]');
+  if (kind) {
+    kind.disabled = scope !== "TASK";
+    if (kind.disabled) kind.value = "STOP_CONTACT";
+  }
+  const operation = form.querySelector('[name="operation"]')?.value || "ADD";
+  const replacement = form.querySelector('[data-replacement]');
+  if (replacement) {
+    replacement.hidden = operation !== "SUPERSEDE";
+    replacement.querySelector('textarea').required = operation === "SUPERSEDE";
+  }
+  const review = form.querySelector('[data-review-date]');
+  if (review) review.hidden = operation === "RESOLVE";
+  const expiry = form.querySelector('[data-note-expiry]');
+  if (expiry) {
+    expiry.hidden = scope !== "TASK" || (form.dataset.kind || kind?.value) !== "NOTE" || !["ADD", "SUPERSEDE"].includes(operation);
+    expiry.querySelector('input').disabled = expiry.hidden;
+  }
+}
 document.addEventListener("change", (event) => {
-  if (!event.target.matches("[data-memory-form] select[name=scope]")) return;
-  const kind = event.target.form.querySelector("select[name=kind]");
-  kind.disabled = event.target.value !== "TASK";
-  if (kind.disabled) kind.value = "STOP_CONTACT";
+  const form = event.target.closest('[data-memory-form]');
+  if (form) updateMemoryForm(form);
+});
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest('[data-memory-older]');
+  if (!button) return;
+  const taskId = state.selected;
+  button.disabled = true;
+  try {
+    const page = await api(`${taskRoot(taskId)}/memory?history_offset=${button.dataset.memoryOlder}`);
+    if (state.selected !== taskId) return;
+    state.memory.history = [...new Map([...state.memory.history, ...page.history].map((i) => [i.id, i])).values()];
+    state.memory.history_next_offset = page.history_next_offset;
+    renderDetailTab();
+  } catch (err) { toast(err.message); }
+  finally { button.disabled = false; }
 });
 
 function historyHTML() {

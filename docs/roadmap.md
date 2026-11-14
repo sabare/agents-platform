@@ -12,7 +12,7 @@ Reviewed 14 November 2026. Everything under “Remaining work” is unfinished; 
 | 4 | Real integrations | Messaging/provider portals, document intake, durable outbound action intents and reconciliation when delivery outcome is uncertain. Database-only simulated sends do not solve real delivery duplicates. |
 | 5 | Production access and operations | Firm-user authentication/permissions, stronger tenant protection/RLS, retention and deletion propagation, monitoring, workload isolation and load/reliability testing. |
 
-Other scale limits: task memory retains 100 total items; policy/hold publication wakes affected tasks in one transaction; indexing uses a shared backlog; very large essential context requests review. Larger firms will need batched fan-out, backlog partitioning and safe task/context partitioning. Exact vector ranking is intentional until case-size and recall measurements justify approximate indexes.
+Other scale limits: task memory permits 100 open, unexpired items independently of archived history; policy/hold publication wakes affected tasks in one transaction; indexing uses a shared backlog; very large essential context requests review. Larger firms will need batched fan-out, backlog partitioning and safe task/context partitioning. Exact vector ranking is intentional until case-size and recall measurements justify approximate indexes.
 
 The next retrieval evaluation should contain corrections, delayed information, ambiguous dates, similarly named providers, multi-source questions and unknown answers. Measure evidence recall, outdated-answer errors, citation accuracy, downstream decisions, latency, indexing lag and tokens separately. A seven-month test fixture does not prove seven months of live operation.
 

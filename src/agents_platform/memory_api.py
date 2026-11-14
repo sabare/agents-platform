@@ -11,6 +11,13 @@ from sqlalchemy.dialects.postgresql import insert
 from agents_platform.context import EvidenceRequest, RetrievalRequest, RetrievalService
 from agents_platform.memory import instruction_view, memory_for_task, policy_lock, restriction_view
 from agents_platform.memory_history import latest_summary, prepare_query, search_history
+from agents_platform.memory_lifecycle import (
+    is_current,
+    next_transition,
+    normalized,
+    now,
+    task_memory_view,
+)
 from agents_platform.models import (
     ActivityEvent,
     Case,
@@ -23,6 +30,7 @@ from agents_platform.models import (
     Source,
     Task,
     TaskInbox,
+    TaskMemoryItem,
 )
 from agents_platform.task_api import Session, require_operator
 from agents_platform.task_contracts import Contract
@@ -35,18 +43,44 @@ Key = Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=12
 
 class MemoryChange(Contract):
     expected_version: int = Field(ge=1)
-    operation: Literal["ADD", "RESOLVE"] = "ADD"
+    operation: Literal["ADD", "RESOLVE", "SUPERSEDE", "REVIEW"] = "ADD"
     item_id: UUID | None = None
-    kind: Literal["STOP_CONTACT", "OBLIGATION"] | None = None
+    kind: Literal["STOP_CONTACT", "OBLIGATION", "NOTE"] | None = None
     text: str = Field(min_length=1, max_length=2000)
+    reason: str | None = Field(default=None, min_length=1, max_length=2000)
     due_at: AwareDatetime | None = None
+    effective_from: AwareDatetime | None = None
+    review_at: AwareDatetime | None = None
+    expires_at: AwareDatetime | None = None
 
     @model_validator(mode="after")
     def valid_operation(self):
+        if not self.text.strip() or (self.reason is not None and not self.reason.strip()):
+            raise ValueError("Text and reasons must not be blank")
         if self.operation == "ADD" and (self.kind is None or self.item_id is not None):
             raise ValueError("ADD requires kind and no item_id")
-        if self.operation == "RESOLVE" and (self.item_id is None or self.kind or self.due_at):
-            raise ValueError("RESOLVE requires item_id, reason text, and no kind/due_at")
+        if self.operation != "ADD" and self.item_id is None:
+            raise ValueError("This operation requires item_id")
+        if self.operation in ("RESOLVE", "REVIEW"):
+            if self.kind or self.due_at or self.effective_from or self.expires_at:
+                raise ValueError("Resolution/review cannot replace item fields")
+            if self.operation == "RESOLVE" and self.review_at:
+                raise ValueError("Resolution cannot schedule a review")
+        if self.operation == "SUPERSEDE":
+            if not self.kind or not self.reason:
+                raise ValueError("SUPERSEDE requires kind and an explicit reason")
+            if self.effective_from and self.effective_from > now():
+                raise ValueError(
+                    "Future replacements require review; the old item must remain active"
+                )
+        if self.expires_at and self.kind != "NOTE":
+            raise ValueError(
+                "Only informational notes can expire; holds/obligations require resolution"
+            )
+        if self.expires_at and self.effective_from and self.expires_at <= self.effective_from:
+            raise ValueError("Expiry must follow the effective time")
+        if self.review_at and self.effective_from and self.review_at < self.effective_from:
+            raise ValueError("Review cannot precede the effective time")
         if self.kind == "STOP_CONTACT" and self.due_at:
             raise ValueError("Contact holds require explicit resolution; they do not expire")
         return self
@@ -56,6 +90,17 @@ class PublishInstruction(Contract):
     expected_revision: int = Field(ge=1)
     text: str = Field(min_length=1, max_length=8000)
     reason: str = Field(min_length=1, max_length=2000)
+    status: Literal["ACTIVE", "RETIRED"] | None = None
+    effective_from: AwareDatetime | None = None
+    review_at: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def valid_dates(self):
+        if not self.text.strip() or not self.reason.strip():
+            raise ValueError("Instruction and reason must not be blank")
+        if self.effective_from and self.effective_from > now():
+            raise ValueError("Publish effective instructions now; future replacement needs review")
+        return self
 
 
 async def wake_task(session, task, event):
@@ -80,7 +125,13 @@ async def wake_task(session, task, event):
 
 
 @router.get("/tasks/{task_id}/memory")
-async def read_memory(tenant_id: UUID, task_id: UUID, session: Session):
+async def read_memory(
+    tenant_id: UUID,
+    task_id: UUID,
+    session: Session,
+    history_offset: int = Query(default=0, ge=0),
+    history_limit: int = Query(default=100, ge=1, le=100),
+):
     task = await session.scalar(select(Task).where(Task.tenant_id == tenant_id, Task.id == task_id))
     if not task:
         raise HTTPException(404, "Task not found")
@@ -92,13 +143,25 @@ async def read_memory(tenant_id: UUID, task_id: UUID, session: Session):
             .order_by(CaseRestriction.created_at)
         )
     ).all()
+    history = (
+        await session.scalars(
+            select(TaskMemoryItem)
+            .where(TaskMemoryItem.tenant_id == tenant_id, TaskMemoryItem.task_id == task_id)
+            .order_by(TaskMemoryItem.created_at.desc(), TaskMemoryItem.id.desc())
+            .offset(history_offset)
+            .limit(history_limit + 1)
+        )
+    ).all()
     return {
         "summary": await latest_summary(session, tenant_id, task.case_id),
         "case_memory_version": case.memory_version,
         "case_restrictions": [restriction_view(r) for r in restrictions],
         "task_version": task.version,
         **await memory_for_task(session, task),
-        "history": task.progress_json.get("memory_items", []),
+        "history": [task_memory_view(i) for i in history[:history_limit]],
+        "history_next_offset": history_offset + history_limit
+        if len(history) > history_limit
+        else None,
     }
 
 
@@ -106,8 +169,10 @@ async def read_memory(tenant_id: UUID, task_id: UUID, session: Session):
 async def change_memory(
     tenant_id: UUID, task_id: UUID, body: MemoryChange, session: Session, key: Key
 ):
+    if not key.strip():
+        raise HTTPException(422, "Idempotency-Key must not be blank")
     async with session.begin():
-        await policy_lock(session, tenant_id)
+        await policy_lock(session, tenant_id, publishing=True)
         task = await session.scalar(
             select(Task).where(Task.tenant_id == tenant_id, Task.id == task_id).with_for_update()
         )
@@ -115,18 +180,38 @@ async def change_memory(
             raise HTTPException(404, "Task not found")
         payload = body.model_dump(mode="json")
         source_key = f"memory/{task_id}/{key}"
-        existing = await session.scalar(
+        previous = await session.scalar(
             select(Source).where(Source.tenant_id == tenant_id, Source.source_key == source_key)
         )
-        if existing:
-            if existing.content != payload:
+        if previous:
+            if (
+                MemoryChange.model_validate(
+                    {k: v for k, v in previous.content.items() if k != "_result"}
+                ).model_dump(mode="json")
+                != payload
+            ):
                 raise HTTPException(409, "Idempotency-Key was used for a different change")
-            return {"source_id": str(existing.id), "replayed": True}
+            if previous.content.get("_result"):
+                return {**previous.content["_result"], "replayed": True}
+            event = await session.scalar(
+                select(ActivityEvent).where(
+                    ActivityEvent.tenant_id == tenant_id,
+                    ActivityEvent.dedupe_key == source_key,
+                    ActivityEvent.producer == "operator",
+                )
+            )
+            return {
+                "source_id": str(previous.id),
+                "item_id": event.payload["item_id"],
+                "deduplicated": event.payload.get("deduplicated", False),
+                "replayed": True,
+            }
+        if body.expires_at and body.expires_at <= now():
+            raise HTTPException(422, "New notes must expire in the future")
         if task.kind != "AGENT" or task.status in ("COMPLETED", "CANCELLED", "FAILED"):
             raise HTTPException(409, "Memory changes require an active agent task")
         if task.version != body.expected_version:
             raise HTTPException(409, "Task changed; reload before changing memory")
-        items = [dict(i) for i in task.progress_json.get("memory_items", [])]
         source = Source(
             id=uuid4(),
             tenant_id=tenant_id,
@@ -137,33 +222,99 @@ async def change_memory(
         )
         session.add(source)
         await session.flush()
-        if body.operation == "ADD":
-            # A bounded demo projection; reject additions rather than truncate mandatory memory.
-            if len(items) >= 100:
-                raise HTTPException(409, "Task memory limit reached; needs review")
-            item = {
-                "id": str(uuid4()),
-                "kind": body.kind,
-                "text": body.text,
-                "due_at": body.due_at.isoformat() if body.due_at else None,
-                "status": "OPEN",
-                "revision": 1,
-                "source_id": str(source.id),
-            }
-            items.append(item)
-        else:
-            item = next((i for i in items if i["id"] == str(body.item_id)), None)
-            if not item:
-                raise HTTPException(404, "Memory item not found on this task")
-            if item["status"] != "OPEN":
-                raise HTTPException(409, "Memory item is already resolved")
-            item.update(
-                status="RESOLVED",
-                revision=item["revision"] + 1,
-                resolution_source_id=str(source.id),
-                resolution_reason=body.text,
+        previous_item = None
+        if body.item_id:
+            previous_item = await session.scalar(
+                select(TaskMemoryItem)
+                .where(
+                    TaskMemoryItem.tenant_id == tenant_id,
+                    TaskMemoryItem.task_id == task_id,
+                    TaskMemoryItem.id == body.item_id,
+                )
+                .with_for_update()
             )
-        task.progress_json = {**task.progress_json, "memory_items": items}
+            if not previous_item:
+                raise HTTPException(404, "Memory item not found on this task")
+            if previous_item.status != "OPEN" or (
+                previous_item.expires_at and previous_item.expires_at <= now()
+            ):
+                raise HTTPException(409, "Memory item is no longer open")
+        deduplicated = False
+        if body.operation in ("RESOLVE", "REVIEW"):
+            item = previous_item
+            if body.operation == "RESOLVE":
+                item.closed_at = now()
+                item.status, item.resolution_source_id, item.resolution_reason = (
+                    "RESOLVED",
+                    source.id,
+                    body.text,
+                )
+            else:
+                item.review_at = body.review_at
+            item.revision += 1
+        else:
+            if previous_item and previous_item.kind != body.kind:
+                raise HTTPException(422, "Replacement must retain the memory kind")
+            rows = (
+                await session.scalars(
+                    select(TaskMemoryItem).where(
+                        TaskMemoryItem.tenant_id == tenant_id,
+                        TaskMemoryItem.task_id == task_id,
+                        TaskMemoryItem.status == "OPEN",
+                    )
+                )
+            ).all()
+            item = next(
+                (
+                    r
+                    for r in rows
+                    if r.id != body.item_id
+                    and r.kind == body.kind
+                    and normalized(r.text) == normalized(body.text)
+                    and r.due_at == body.due_at
+                    and r.effective_from == body.effective_from
+                    and r.expires_at == body.expires_at
+                    and r.review_at == body.review_at
+                ),
+                None,
+            )
+            deduplicated = item is not None
+            if not item:
+                if (
+                    sum(r.expires_at is None or r.expires_at > now() for r in rows)
+                    - bool(previous_item)
+                    >= 100
+                ):
+                    raise HTTPException(409, "Active task memory limit reached; needs review")
+                item = TaskMemoryItem(
+                    id=uuid4(),
+                    tenant_id=tenant_id,
+                    case_id=task.case_id,
+                    task_id=task.id,
+                    kind=body.kind,
+                    text=body.text,
+                    status="OPEN",
+                    revision=1,
+                    source_id=source.id,
+                    due_at=body.due_at,
+                    effective_from=body.effective_from,
+                    review_at=body.review_at,
+                    expires_at=body.expires_at,
+                    supersedes_id=previous_item.id if previous_item else None,
+                )
+                session.add(item)
+            if previous_item:
+                previous_item.status = "SUPERSEDED"
+                previous_item.closed_at = now()
+                previous_item.superseded_by_id = item.id
+                previous_item.resolution_source_id, previous_item.resolution_reason = (
+                    source.id,
+                    body.reason,
+                )
+                previous_item.revision += 1
+                previous_item.next_transition_at = None
+        item.next_transition_at = next_transition(item)
+        await session.flush()
         event = ActivityEvent(
             id=uuid4(),
             tenant_id=tenant_id,
@@ -171,18 +322,26 @@ async def change_memory(
             task_id=task_id,
             event_type="memory.changed",
             producer="operator",
-            dedupe_key=source_key,
             actor_ref="local-operator",
+            dedupe_key=source_key,
             payload={
                 "source_id": str(source.id),
-                "item_id": item["id"],
+                "item_id": str(item.id),
                 "operation": body.operation,
+                "deduplicated": deduplicated,
             },
         )
         session.add(event)
         await session.flush()
         await wake_task(session, task, event)
-        return {"source_id": str(source.id), "item_id": item["id"], "replayed": False}
+        result = {
+            "source_id": str(source.id),
+            "item_id": str(item.id),
+            "deduplicated": deduplicated,
+            "replayed": False,
+        }
+        source.content = {**payload, "_result": result}
+        return result
 
 
 def revision_values(row, *, approved_by, reason):
@@ -196,6 +355,10 @@ def revision_values(row, *, approved_by, reason):
         "text": row.text,
         "approved_by": approved_by,
         "reason": reason,
+        "status": row.status,
+        "closed_at": row.closed_at,
+        "effective_from": row.effective_from,
+        "review_at": row.review_at,
     }
 
 
@@ -227,6 +390,9 @@ async def instruction_history(tenant_id: UUID, instruction_id: UUID, session: Se
                 "approved_by": i.approved_by,
                 "reason": i.reason,
                 "published_at": i.created_at.isoformat(),
+                "active": i.revision == row.revision and is_current(row),
+                "historical_revision": i.revision != row.revision,
+                "superseded_by_revision": i.revision + 1 if i.revision < row.revision else None,
             }
             for i in history
         ],
@@ -259,6 +425,17 @@ async def publish_instruction(
             .on_conflict_do_nothing()
         )
         row.text, row.revision = body.text, row.revision + 1
+        previous_status = row.status
+        row.status = body.status or row.status
+        if row.status == "RETIRED" and previous_status != "RETIRED":
+            row.closed_at = now()
+        elif row.status == "ACTIVE":
+            row.closed_at = None
+        if "effective_from" in body.model_fields_set:
+            row.effective_from = body.effective_from
+        if "review_at" in body.model_fields_set:
+            row.review_at = body.review_at
+        row.next_transition_at = next_transition(row)
         await session.flush()
         session.add(
             InstructionRevision(
@@ -333,17 +510,37 @@ async def publish_instruction(
 
 class CaseRestrictionChange(Contract):
     expected_version: int = Field(ge=0)
-    operation: Literal["ADD", "RESOLVE"] = "ADD"
+    operation: Literal["ADD", "RESOLVE", "SUPERSEDE", "REVIEW"] = "ADD"
     item_id: UUID | None = None
     provider_contact_id: UUID | None = None
     text: str = Field(min_length=1, max_length=2000)
+    reason: str | None = Field(default=None, min_length=1, max_length=2000)
+    effective_from: AwareDatetime | None = None
+    review_at: AwareDatetime | None = None
 
     @model_validator(mode="after")
     def valid_operation(self):
+        if not self.text.strip() or (self.reason is not None and not self.reason.strip()):
+            raise ValueError("Text and reasons must not be blank")
         if self.operation == "ADD" and self.item_id:
             raise ValueError("ADD must not supply item_id")
-        if self.operation == "RESOLVE" and (not self.item_id or self.provider_contact_id):
-            raise ValueError("RESOLVE requires item_id and no provider_contact_id")
+        if self.operation != "ADD" and not self.item_id:
+            raise ValueError("This operation requires item_id")
+        if self.operation in ("RESOLVE", "REVIEW") and (
+            self.provider_contact_id or self.effective_from
+        ):
+            raise ValueError("Resolution/review cannot change scope or effective date")
+        if self.operation == "RESOLVE" and self.review_at:
+            raise ValueError("Resolution cannot schedule review")
+        if self.operation == "SUPERSEDE":
+            if not self.reason:
+                raise ValueError("SUPERSEDE requires an explicit reason")
+            if self.effective_from and self.effective_from > now():
+                raise ValueError(
+                    "Future replacements require review; the old hold must remain active"
+                )
+        if self.review_at and self.effective_from and self.review_at < self.effective_from:
+            raise ValueError("Review cannot precede the effective time")
         return self
 
 
@@ -351,6 +548,8 @@ class CaseRestrictionChange(Contract):
 async def change_case_restriction(
     tenant_id: UUID, case_id: UUID, body: CaseRestrictionChange, session: Session, key: Key
 ):
+    if not key.strip():
+        raise HTTPException(422, "Idempotency-Key must not be blank")
     async with session.begin():
         # Exclusive publication lock also protects future tasks and action-time checks.
         await policy_lock(session, tenant_id, publishing=True)
@@ -366,9 +565,15 @@ async def change_case_restriction(
             select(Source).where(Source.tenant_id == tenant_id, Source.source_key == source_key)
         )
         if previous:
-            if previous.content != payload:
+            previous_payload = CaseRestrictionChange.model_validate(
+                {k: v for k, v in previous.content.items() if k != "_result"}
+            ).model_dump(mode="json")
+            if previous_payload != payload:
                 raise HTTPException(409, "Idempotency-Key was used for a different change")
-            return {"source_id": str(previous.id), "replayed": True}
+            return {
+                **previous.content.get("_result", {"source_id": str(previous.id)}),
+                "replayed": True,
+            }
         if case.memory_version != body.expected_version:
             raise HTTPException(409, "Case memory changed; reload before changing restrictions")
         if body.provider_contact_id:
@@ -391,20 +596,9 @@ async def change_case_restriction(
         )
         session.add(source)
         await session.flush()
-        if body.operation == "ADD":
-            restriction = CaseRestriction(
-                id=uuid4(),
-                tenant_id=tenant_id,
-                case_id=case_id,
-                provider_contact_id=body.provider_contact_id,
-                text=body.text,
-                source_id=source.id,
-                revision=1,
-                status="OPEN",
-            )
-            session.add(restriction)
-        else:
-            restriction = await session.scalar(
+        previous_item = None
+        if body.item_id:
+            previous_item = await session.scalar(
                 select(CaseRestriction)
                 .where(
                     CaseRestriction.tenant_id == tenant_id,
@@ -413,12 +607,81 @@ async def change_case_restriction(
                 )
                 .with_for_update()
             )
-            if not restriction:
+            if not previous_item:
                 raise HTTPException(404, "Case restriction not found")
-            if restriction.status != "OPEN":
-                raise HTTPException(409, "Case restriction is already resolved")
-            restriction.status, restriction.revision = "RESOLVED", restriction.revision + 1
-            restriction.resolution_source_id, restriction.resolution_reason = source.id, body.text
+            if previous_item.status != "OPEN":
+                raise HTTPException(409, "Case restriction is no longer open")
+        deduplicated = False
+        if body.operation in ("RESOLVE", "REVIEW"):
+            restriction = previous_item
+            if body.operation == "RESOLVE":
+                restriction.status = "RESOLVED"
+                restriction.closed_at = now()
+                restriction.resolution_source_id, restriction.resolution_reason = (
+                    source.id,
+                    body.text,
+                )
+            else:
+                restriction.review_at = body.review_at
+            restriction.revision += 1
+        else:
+            provider_id = (
+                previous_item.provider_contact_id if previous_item else body.provider_contact_id
+            )
+            if (
+                previous_item
+                and body.provider_contact_id
+                and body.provider_contact_id != provider_id
+            ):
+                raise HTTPException(422, "Replacement must retain the restriction scope")
+            rows = (
+                await session.scalars(
+                    select(CaseRestriction).where(
+                        CaseRestriction.tenant_id == tenant_id,
+                        CaseRestriction.case_id == case_id,
+                        CaseRestriction.status == "OPEN",
+                        CaseRestriction.provider_contact_id == provider_id,
+                    )
+                )
+            ).all()
+            restriction = next(
+                (
+                    r
+                    for r in rows
+                    if r.id != body.item_id
+                    and normalized(r.text) == normalized(body.text)
+                    and r.effective_from == body.effective_from
+                    and r.review_at == body.review_at
+                ),
+                None,
+            )
+            deduplicated = restriction is not None
+            if not restriction:
+                restriction = CaseRestriction(
+                    id=uuid4(),
+                    tenant_id=tenant_id,
+                    case_id=case_id,
+                    provider_contact_id=provider_id,
+                    text=body.text,
+                    source_id=source.id,
+                    revision=1,
+                    status="OPEN",
+                    effective_from=body.effective_from,
+                    review_at=body.review_at,
+                    supersedes_id=previous_item.id if previous_item else None,
+                )
+                session.add(restriction)
+            if previous_item:
+                previous_item.closed_at = now()
+                previous_item.status, previous_item.superseded_by_id = "SUPERSEDED", restriction.id
+                previous_item.resolution_source_id, previous_item.resolution_reason = (
+                    source.id,
+                    body.reason,
+                )
+                previous_item.revision += 1
+                previous_item.next_transition_at = None
+        restriction.next_transition_at = next_transition(restriction)
+        await session.flush()
         case.memory_version += 1
         tasks = (
             await session.scalars(
@@ -447,6 +710,7 @@ async def change_case_restriction(
                     "source_id": str(source.id),
                     "item_id": str(restriction.id),
                     "operation": body.operation,
+                    "deduplicated": deduplicated,
                 },
             )
             session.add(event)
@@ -475,12 +739,15 @@ async def change_case_restriction(
                 from agents_platform.coordination import enqueue_supervisor
 
                 await enqueue_supervisor(session, event, force=True)
-        return {
+        result = {
             "item_id": str(restriction.id),
             "source_id": str(source.id),
             "case_memory_version": case.memory_version,
+            "deduplicated": deduplicated,
             "replayed": False,
         }
+        source.content = {**payload, "_result": result}
+        return result
 
 
 @router.get("/cases/{case_id}/memory")
@@ -499,6 +766,56 @@ async def case_memory(tenant_id: UUID, case_id: UUID, session: Session):
         "case_memory_version": case.memory_version,
         "restrictions": [restriction_view(r) for r in items],
         "summary": await latest_summary(session, tenant_id, case_id),
+    }
+
+
+@router.get("/cases/{case_id}/memory/reviews")
+async def due_memory_reviews(
+    tenant_id: UUID,
+    case_id: UUID,
+    session: Session,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=100),
+):
+    case = await session.scalar(select(Case).where(Case.tenant_id == tenant_id, Case.id == case_id))
+    if not case:
+        raise HTTPException(404, "Case not found")
+    # This is an operator queue, not a model-context cap. Pagination never omits active rules.
+    entries = []
+    for model, view in ((TaskMemoryItem, task_memory_view), (CaseRestriction, restriction_view)):
+        rows = (
+            await session.scalars(
+                select(model).where(
+                    model.tenant_id == tenant_id,
+                    model.case_id == case_id,
+                    model.status == "OPEN",
+                    model.review_at <= now(),
+                )
+            )
+        ).all()
+        entries.extend(view(r) for r in rows if is_current(r))
+    provider_ids = (
+        await session.scalars(
+            select(CaseContact.contact_id).where(
+                CaseContact.tenant_id == tenant_id,
+                CaseContact.case_id == case_id,
+                CaseContact.roles.contains(["MEDICAL_PROVIDER"]),
+            )
+        )
+    ).all()
+    from agents_platform.memory import instructions_for
+
+    entries.extend(
+        instruction_view(r)
+        for r in await instructions_for(session, tenant_id, provider_ids)
+        if r.review_at and r.review_at <= now()
+    )
+    entries.sort(key=lambda i: (i["review_at"], i["id"]))
+    return {
+        "items": entries[offset : offset + limit],
+        "next_offset": offset + limit if offset + limit < len(entries) else None,
+        "total": len(entries),
+        "notice": "Review dates do not lift restrictions.",
     }
 
 

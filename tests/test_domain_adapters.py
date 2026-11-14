@@ -24,7 +24,14 @@ from agents_platform.domains import (
 )
 from agents_platform.execution import StaleExecution, TaskActivities
 from agents_platform.medical_records import MedicalRecordsAdapter
-from agents_platform.models import AgentVersion, Execution, Task, ToolInvocation
+from agents_platform.models import (
+    AgentVersion,
+    Execution,
+    Source,
+    Task,
+    TaskMemoryItem,
+    ToolInvocation,
+)
 from agents_platform.task_contracts import AgentDecision, Contract, NextAction, Observation
 
 
@@ -368,18 +375,29 @@ async def test_platform_obligation_gate_applies_after_domain_validation(
     try:
         async with database.sessions.begin() as session:
             current = await session.get(Task, task.id)
-            current.progress_json = {
-                "memory_items": [
-                    {
-                        "id": str(uuid4()),
-                        "revision": 1,
-                        "status": "OPEN",
-                        "kind": "OBLIGATION",
-                        "source_id": str(uuid4()),
-                        "text": "Operator must verify receipt",
-                    }
-                ]
-            }
+            source = Source(
+                id=uuid4(),
+                tenant_id=task.tenant_id,
+                case_id=task.case_id,
+                source_key=f"test/obligation/{task.id}",
+                kind="OPERATOR_MEMORY_CHANGE",
+                content={"text": "Operator must verify receipt"},
+            )
+            session.add(source)
+            await session.flush()
+            session.add(
+                TaskMemoryItem(
+                    id=uuid4(),
+                    tenant_id=task.tenant_id,
+                    case_id=task.case_id,
+                    task_id=current.id,
+                    kind="OBLIGATION",
+                    text="Operator must verify receipt",
+                    status="OPEN",
+                    revision=1,
+                    source_id=source.id,
+                )
+            )
         run = await worker._prepare(activation(task))
         result = await worker._commit(run, activation(task), adapter.review("Review"), {})
         assert result["status"] == "BLOCKED"

@@ -146,7 +146,7 @@ class CaseWorkflow:
 
 @workflow.defn
 class MemoryIndexWorkflow:
-    """Derived work only. A durable timer catches new/backfilled sources after restarts."""
+    """Durable maintenance of search indexes and pre-authorized memory date transitions."""
 
     @workflow.run
     async def run(self):
@@ -158,7 +158,12 @@ class MemoryIndexWorkflow:
                     start_to_close_timeout=timedelta(minutes=2),
                     retry_policy=RetryPolicy(maximum_attempts=3),
                 )
-                delay = 1 if result["indexed_sources"] == 30 else 15
+                delay = (
+                    1
+                    if result["indexed_sources"] == 30
+                    or result.get("lifecycle_transitions", 0) == 100
+                    else 15
+                )
             except ActivityError:
                 delay = 60
             await workflow.sleep(timedelta(seconds=delay))

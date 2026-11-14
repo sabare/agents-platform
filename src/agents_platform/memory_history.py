@@ -375,7 +375,10 @@ class MemoryActivities:
 
     @activity.defn
     async def index_memory(self):
-        """Restart-safe derived work. Retrying this activity never repeats a business tool."""
+        """Restart-safe indexing/lifecycle maintenance; never repeats a business tool."""
+        from agents_platform.memory_lifecycle import advance_lifecycles
+
+        lifecycle_transitions = await advance_lifecycles(self.database)
         scopes = set()
         async with self.database.sessions.begin() as session:
             rows = (
@@ -508,6 +511,7 @@ class MemoryActivities:
                     ):
                         break
         return {
+            "lifecycle_transitions": lifecycle_transitions,
             "indexed_sources": len(rows),
             "embedded_passages": embedded,
             "embedding_tokens": tokens,
