@@ -109,7 +109,7 @@ async def test_supervisor_delegates_once_and_verifies_worker_completion(setup, d
         events = client.get(
             f"/v1/firms/{fixture['firm_id']}/tasks/{task.id}/events", headers=AUTH
         ).json()
-        assert events[0]["actor_ref"] == "agent/case_supervisor/2"
+        assert events[0]["actor_ref"] == "agent/case_supervisor/3"
         run = {
             "tenant_id": fixture["firm_id"],
             "task_id": str(task.id),

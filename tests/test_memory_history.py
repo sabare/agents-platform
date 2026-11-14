@@ -616,3 +616,57 @@ async def test_exact_search_api_does_not_call_embedding_provider(setup, database
     )
     assert response.status_code == 200, response.text
     assert response.json()["method"] == "exact"
+
+
+async def test_semantic_only_answer_survives_many_weak_keyword_matches(setup, database_url):
+    _, fixture, _ = setup
+    query = "Who handles radiology records requests?"
+    answer = add_source(database_url, fixture, {"message": "Sofia Patel at the film desk."})
+    noise = [
+        add_source(
+            database_url,
+            fixture,
+            {
+                "message": (
+                    f"Radiology records requests administrative reference {i}; no staff details."
+                )
+            },
+        )
+        for i in range(12)
+    ]
+    database, _ = runtime(database_url)
+    try:
+        await index_all(database)
+        async with database.sessions.begin() as session:
+            rows = (
+                await session.scalars(
+                    select(MemoryPassage).where(MemoryPassage.source_id.in_([answer, *noise]))
+                )
+            ).all()
+            for passage in rows:
+                passage.embedding = (
+                    [1.0] + [0.0] * 1535
+                    if passage.source_id == answer
+                    else [0.9, 0.1] + [0.0] * 1534
+                )
+            session.add(
+                MemoryQuery(
+                    tenant_id=UUID(fixture["firm_id"]),
+                    case_id=UUID(fixture["assignment"]["case_id"]),
+                    text=query,
+                    query_hash=query_hash(query),
+                    embedding=[1.0] + [0.0] * 1535,
+                )
+            )
+        async with database.sessions() as session:
+            packet = await search_history(
+                session,
+                UUID(fixture["firm_id"]),
+                UUID(fixture["assignment"]["case_id"]),
+                query,
+                broad=True,
+                limit=6,
+            )
+            assert str(answer) in {hit["source_id"] for hit in packet["results"]}
+    finally:
+        await database.close()

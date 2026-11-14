@@ -112,16 +112,16 @@ async def test_reminder_action_validates_due_occurrence_and_reuses_saved_effect(
         with pytest.raises(ValueError):
             await invoke(tools["send_records_reminder"], {"occurrence": 1})
         await invoke(tools["send_records_request"], {})
-        with pytest.raises(ValueError):
-            await invoke(tools["send_records_reminder"], {"occurrence": 1})
+        rejected = await invoke(tools["send_records_reminder"], {"occurrence": 1})
+        assert rejected["status"] == "NOT_DUE" and not rejected["action_taken"]
         await due(database, task)
         with pytest.raises(ValueError):
             await invoke(tools["send_records_reminder"], {"occurrence": 2})
         first = await invoke(tools["send_records_reminder"], {"occurrence": 1})
         replay = await invoke(tools["send_records_reminder"], {"occurrence": 1})
         assert replay == first and replay["simulated"]
-        with pytest.raises(ValueError):
-            await invoke(tools["send_records_reminder"], {"occurrence": 2})
+        rejected = await invoke(tools["send_records_reminder"], {"occurrence": 2})
+        assert rejected["status"] == "NOT_DUE" and not rejected["action_taken"]
         with pytest.raises(ValueError):
             await invoke(tools["send_records_reminder"], {"occurrence": 4})
         async with database.sessions() as session:
@@ -303,4 +303,58 @@ async def test_temporal_restart_and_retry_do_not_repeat_a_reminder(
             assert request.reminder_count == 1
     finally:
         await temporal.get_workflow_handle(task["workflow_id"]).terminate()
+        await database.close()
+
+
+@pytest.mark.parametrize("change_kind", ["closed_case", "provider_role", "patient_role"])
+async def test_records_contact_rechecks_case_and_participant_roles_after_preparation(
+    setup, database_url, change_kind
+):
+    from agents_platform.domains import ActionStateChanged
+    from agents_platform.models import Case, CaseContact
+
+    client, fixture, _ = setup
+    task = create_v3(client, fixture)
+    database, worker = runtime(database_url)
+    try:
+        prepared = await worker._prepare(activation(fixture, task))
+        async with database.sessions.begin() as session:
+            if change_kind == "closed_case":
+                case = await session.get(Case, UUID(task["case_id"]))
+                case.status = "CLOSED"
+            else:
+                contact_id = fixture["assignment"][
+                    "provider_contact_id"
+                    if change_kind == "provider_role"
+                    else "patient_contact_id"
+                ]
+                participant = await session.scalar(
+                    select(CaseContact).where(
+                        CaseContact.tenant_id == UUID(fixture["firm_id"]),
+                        CaseContact.case_id == UUID(task["case_id"]),
+                        CaseContact.contact_id == UUID(contact_id),
+                    )
+                )
+                participant.roles = ["OTHER"]
+        tool = next(t for t in worker._tools(prepared) if t.name == "send_records_request")
+        with pytest.raises(ActionStateChanged):
+            await invoke(tool, {})
+        assert (await worker._commit(prepared, activation(fixture, task), None, {}))[
+            "status"
+        ] == "CONTINUE"
+        assert (await worker.execute_task(activation(fixture, task, 1)))["status"] == "BLOCKED"
+        if change_kind == "closed_case":
+            from test_human_requests import decide, requests
+
+            review = requests(client, fixture, task)[0]
+            stopped = decide(client, fixture, review, action="STOP_COLLECTION")
+            assert stopped.status_code == 200, stopped.text
+        async with database.sessions() as session:
+            assert not await session.scalar(
+                select(ToolInvocation.id).where(
+                    ToolInvocation.task_id == UUID(task["id"]),
+                    ToolInvocation.tool_name == "send_records_request",
+                )
+            )
+    finally:
         await database.close()

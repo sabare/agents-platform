@@ -518,15 +518,16 @@ async def test_model_cannot_complete_without_saved_record_evidence(
 
     monkeypatch.setattr(Runner, "run", invented_completion)
     try:
-        with pytest.raises(ValueError, match="saved evidence"):
-            await activities.execute_task(
-                {
-                    "tenant_id": fixture["firm_id"],
-                    "task_id": task["id"],
-                    "cycle": 0,
-                    "trigger": "created",
-                }
-            )
+        outcome = await activities.execute_task(
+            {
+                "tenant_id": fixture["firm_id"],
+                "task_id": task["id"],
+                "cycle": 0,
+                "trigger": "created",
+            }
+        )
+        assert outcome["status"] == "CONTINUE"
+        assert "saved evidence" in outcome["reason"]
         response = api.get(f"/v1/firms/{fixture['firm_id']}/tasks/{task['id']}", headers=AUTH)
         assert response.json()["status"] != "COMPLETED"
     finally:

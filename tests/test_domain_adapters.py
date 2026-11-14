@@ -231,6 +231,7 @@ async def test_second_domain_runs_tools_validation_and_commit_through_same_execu
             assert run.context_json["domain"] == {
                 "adapter": {"key": "receipt_test", "version": 1},
                 "state": {"reference": "R-17"},
+                "evidence_source_ids": [],
             }
             assert "records_request" not in run.context_json["task"]
             assert (
@@ -404,3 +405,39 @@ async def test_platform_obligation_gate_applies_after_domain_validation(
         assert "obligation" in result["reason"]
     finally:
         await database.close()
+
+
+@pytest.mark.integration
+@integration
+async def test_domain_snapshot_cannot_supply_another_cases_evidence(
+    setup, database_url, monkeypatch
+):
+    from test_memory_history import add_source
+
+    _, fixture, foreign = setup
+    foreign_source = add_source(database_url, foreign, {"message": "Private other-case evidence"})
+    db = Database(database_url)
+    adapter = ReceiptAdapter()
+
+    async def invalid_snapshot(session, task):
+        return DomainSnapshot(state={"reference": "R-17"}, evidence_source_ids=(foreign_source,))
+
+    monkeypatch.setattr(adapter, "load", invalid_snapshot)
+    worker = TaskActivities(
+        db, Settings(_env_file=None, agent_mode="scripted"), AdapterRegistry((adapter,))
+    )
+    try:
+        task = await create_receipt(db, fixture)
+        with pytest.raises(ValueError, match="outside this case"):
+            await worker._prepare(activation(task))
+        async with db.sessions() as session:
+            assert (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(ToolInvocation)
+                    .where(ToolInvocation.task_id == task.id)
+                )
+                == 0
+            )
+    finally:
+        await db.close()
