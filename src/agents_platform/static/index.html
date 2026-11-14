@@ -207,7 +207,7 @@
       <form id="create-form">
         <div class="modal-heading">
           <div>
-            <h2>Assign an agent</h2>
+            <h2>Create task</h2>
           </div>
           <button
             type="button"
@@ -218,15 +218,15 @@
             ×
           </button>
         </div>
-        <p>The agent starts automatically and reports back to this task.</p>
+        <p id="create-help">The supervisor plans the work, assigns specialists, and reviews their progress.</p>
         <label>Case<select id="create-case" required></select></label
-        ><label
+        ><label id="create-parent-field"
           >Part of<select id="create-parent">
             <option value="">No parent task</option>
           </select></label
         ><label
           >Agent<select id="create-agent">
-            <option value="medical_records">Medical records (v3)</option><option value="check_in">Client check-in (v1)</option>
+            <option value="supervisor" selected>Supervisor (default)</option><option value="medical_records">Medical records (v3)</option><option value="check_in">Client check-in (v1)</option>
           </select></label
         ><label
           >Task objective<textarea
@@ -237,6 +237,12 @@
             placeholder="Collect records and imaging from the provider…"
           ></textarea>
         </label>
+        <div id="create-supervisor-fields">
+          <p id="create-supervisor-note" class="muted"></p>
+          <label id="create-replace-field" class="wake-label" hidden><input type="checkbox" id="create-replace" /> Update this case's existing supervisor task</label>
+          <label class="wake-label"><input type="checkbox" id="create-scope" checked /> Approve the records scope below for automatic delegation</label>
+          <p class="muted">The supervisor delegates records collection. For a client check-in, select that specialist.</p>
+        </div>
         <div class="form-row">
           <label
             >Client / patient<select
@@ -270,7 +276,7 @@
         <div id="create-error" class="error" role="alert" hidden></div>
         <div class="modal-footer">
           <span>All external communication is simulated.</span
-          ><button type="submit" class="primary">Create & start task</button>
+          ><button id="create-submit" type="submit" class="primary">Create & start task</button>
         </div>
       </form>
     </dialog>

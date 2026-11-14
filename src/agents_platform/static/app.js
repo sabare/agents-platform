@@ -38,7 +38,7 @@ const names = {
   client_check_in: "Client check-in",
 };
 const agent = (t) =>
-  `<span class="agent-cell"><span class="agent-initial" aria-hidden="true">${t.agent_key === "client_check_in" ? "CI" : "MR"}</span>${e(names[t.agent_key] || (t.task_type === "case.coordination" ? "Case supervisor" : t.agent_key))} <small>v${e(t.agent_version || 1)}</small></span>`;
+  `<span class="agent-cell"><span class="agent-initial" aria-hidden="true">${t.task_type === "case.coordination" ? "S" : t.agent_key === "client_check_in" ? "CI" : "MR"}</span>${e(names[t.agent_key] || (t.task_type === "case.coordination" ? "Case supervisor" : t.agent_key))} <small>v${e(t.agent_version || 1)}</small></span>`;
 const state = {
   key: sessionStorage.getItem("operatorKey") || "local-development-only",
   firm: null,
@@ -666,18 +666,95 @@ async function loadMore() {
 document.querySelector("#create-series").addEventListener("change", updateCreateKind);
 
 function updateCreateKind() {
-  const checkIn = $("#create-agent").value === "check_in";
+  const kind = $("#create-agent").value;
+  const supervisor = kind === "supervisor";
+  const checkIn = kind === "check_in";
+  const preserved = supervisor && Boolean(state.createSavedTargets);
+  const scope = !supervisor || $("#create-scope").checked;
+  $("#create-supervisor-fields").hidden = !supervisor;
+  $("#create-parent-field").hidden = supervisor;
+  $("#create-parent").disabled = supervisor || (checkIn && $("#create-series").checked);
   $("#series-fields").hidden = !checkIn || !$("#create-series").checked;
-  $("#create-parent").disabled = checkIn && $("#create-series").checked;
-  $("#create-provider-field").hidden = checkIn;
-  $("#create-provider").required = !checkIn;
-  $("#create-records-fields").hidden = checkIn;
+  $("#create-provider-field").hidden = checkIn || !scope;
+  $("#create-records-fields").hidden = checkIn || !scope;
   $("#create-checkin-fields").hidden = !checkIn;
-  $("#from-date").required = !checkIn && !$("#all-dates").checked;
-  $("#through-date").required = !checkIn && !$("#all-dates").checked;
+  $("#create-patient").disabled = supervisor && (!scope || preserved);
+  $("#create-provider").required = !checkIn && scope;
+  $("#create-provider").disabled = preserved || !scope;
+  $("#create-scope").disabled = preserved;
+  $$('#create-records-fields input').forEach((el) => el.disabled = preserved || !scope);
+  $("#from-date").required = $("#through-date").required = !checkIn && scope && !preserved && !$("#all-dates").checked;
+  $("#date-range").hidden = $("#all-dates").checked;
+  $("#create-replace").required = supervisor && Boolean(state.createSupervisor?.revision);
+  $("#create-submit").disabled = supervisor && (state.createSupervisorLoading || !state.createSupervisor);
+  $("#create-submit").textContent = supervisor && state.createSupervisor?.revision ? "Update supervisor task" : "Create & start task";
+  $("#create-help").textContent = supervisor
+    ? "The supervisor plans the work, assigns specialists, and reviews their progress."
+    : "The selected specialist starts automatically and reports back to this task.";
   $("#create-objective").placeholder = checkIn ? "Check in with the client and report meaningful changes…" : "Collect records and imaging from the provider…";
 }
-$("#create-agent").addEventListener("change", updateCreateKind);
+$("#create-agent").addEventListener("change", () => {
+  state.createKey = null;
+  if ($("#create-agent").value === "supervisor") loadCreateSupervisor();
+  else {
+    state.createSupervisorEpoch = (state.createSupervisorEpoch || 0) + 1;
+    updateCreateKind();
+  }
+});
+$("#create-scope").addEventListener("change", updateCreateKind);
+
+async function loadCreateSupervisor() {
+  const caseId = $("#create-case").value;
+  const epoch = state.createSupervisorEpoch = (state.createSupervisorEpoch || 0) + 1;
+  state.createSupervisor = null;
+  state.createSavedTargets = null;
+  state.createSupervisorLoading = true;
+  state.createKey = null;
+  $("#create-replace").checked = false;
+  $("#create-replace-field").hidden = true;
+  $("#create-supervisor-note").textContent = "Loading case objective…";
+  updateCreateKind();
+  try {
+    const current = await api(`/v1/firms/${state.firm}/cases/${caseId}/supervisor`);
+    if (epoch !== state.createSupervisorEpoch || caseId !== $("#create-case").value) return;
+    state.createSupervisor = current;
+    const targets = current.objective?.targets || [];
+    // Keep complex scopes intact when updating through the single-provider form.
+    state.createSavedTargets = targets.length > 1 ? targets : null;
+    $("#create-replace-field").hidden = !current.revision;
+    $("#create-supervisor-note").textContent = current.revision
+      ? "This case already has a supervisor task. Saving updates it; existing specialist tasks continue."
+      : "A supervisor task will be created for this case, with specialist subtasks as needed.";
+    if (current.objective) {
+      $("#create-objective").value = current.objective.objective;
+      $("#create-scope").checked = Boolean(targets.length);
+      const target = targets[0];
+      if (target) {
+        $("#create-patient").value = target.patient_contact_id;
+        $("#create-provider").value = target.provider_contact_id;
+        const requirements = target.requirements;
+        // Mixed date ranges cannot be represented faithfully by the shared dates fields.
+        const ranges = new Set(requirements.map((r) => JSON.stringify([r.all_dates, r.from_date, r.through_date])));
+        if (ranges.size > 1) state.createSavedTargets = targets;
+        $$('input[name="record"]').forEach((el) => el.checked = requirements.some((r) => r.record_type === el.value));
+        $("#all-dates").checked = requirements[0].all_dates;
+        $("#from-date").value = requirements[0].from_date || "";
+        $("#through-date").value = requirements[0].through_date || "";
+        if (state.createSavedTargets) $("#create-supervisor-note").textContent += " Existing approved scopes are preserved.";
+      }
+    }
+  } catch (err) {
+    if (epoch !== state.createSupervisorEpoch) return;
+    $("#create-error").textContent = err.message;
+    $("#create-error").hidden = false;
+    $("#create-supervisor-note").textContent = "Could not load the case objective. Reopen this form to retry.";
+  } finally {
+    if (epoch === state.createSupervisorEpoch) {
+      state.createSupervisorLoading = false;
+      updateCreateKind();
+    }
+  }
+}
 
 function checkInHTML() {
   const checkIn=state.detail?.client_check_in;
@@ -707,7 +784,7 @@ $("#client-reply-form").addEventListener("submit", async (event) => {
   finally {button.disabled=false;}
 });
 
-function openCreate() {
+function openCreate(caseId = null) {
   if (!state.overview) return;
   state.createKey = null;
   state.createAt = null;
@@ -722,11 +799,17 @@ function openCreate() {
         `<option value="${e(c.id)}">${e(c.number)}: ${e(c.title)}</option>`,
     )
     .join("");
-  if (state.case) $("#create-case").value = state.case;
+  if (caseId || state.case) $("#create-case").value = caseId || state.case;
   updateCreateContacts();
   $("#create-modal").showModal();
 }
 function updateCreateContacts() {
+  state.createKey = null;
+  $("#create-objective").value = "";
+  $("#create-scope").checked = true;
+  $("#all-dates").checked = true;
+  $("#from-date").value = $("#through-date").value = "";
+  $$('input[name="record"]').forEach((el) => el.checked = el.defaultChecked);
   const caseId = $("#create-case").value,
     contacts = state.overview.contacts.filter((c) => c.case_id === caseId);
   $("#create-patient").innerHTML = contacts
@@ -745,6 +828,8 @@ function updateCreateContacts() {
       .join("");
   if ($("#create-parent").options.length > 1)
     $("#create-parent").selectedIndex = 1;
+  if ($("#create-agent").value === "supervisor") loadCreateSupervisor();
+  else updateCreateKind();
 }
 $("#create-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
@@ -773,8 +858,10 @@ $("#create-form").addEventListener("submit", async (ev) => {
       state.createKey=null; $("#create-modal").close(); toast("Check-in scheduled.");
       await refresh(true); await openTask(task.id); state.tab="context"; renderDetail(); return;
     }
+    const supervisor = $("#create-agent").value === "supervisor";
+    const scoped = !supervisor || $("#create-scope").checked;
     const types = $$("input[name=record]:checked").map((x) => x.value);
-    if (!types.length) throw new Error("Select at least one document type.");
+    if (scoped && !types.length) throw new Error("Select at least one document type.");
     const allDates = $("#all-dates").checked;
     const requirements = types.map((record_type) => ({
       record_type,
@@ -786,6 +873,29 @@ $("#create-form").addEventListener("submit", async (ev) => {
           }
         : {}),
     }));
+    if (supervisor) {
+      if (state.createSupervisorLoading || !state.createSupervisor) throw new Error("Wait for the case objective to load.");
+      if (state.createSupervisor.revision && !$("#create-replace").checked) throw new Error("Confirm the update to the existing supervisor task.");
+      const result = await api(`/v1/firms/${state.firm}/cases/${$("#create-case").value}/supervisor`, {
+        method: "POST",
+        headers: {"Idempotency-Key": (state.createKey ||= crypto.randomUUID())},
+        body: JSON.stringify({
+          objective: $("#create-objective").value,
+          expected_revision: state.createSupervisor.revision,
+          targets: state.createSavedTargets || (scoped ? [{
+            patient_contact_id: $("#create-patient").value,
+            provider_contact_id: $("#create-provider").value,
+            requirements,
+          }] : []),
+        }),
+      });
+      state.createKey = null;
+      $("#create-modal").close();
+      toast("Task assigned to supervisor. Delegation queued.");
+      await refresh(true);
+      await openTask(result.group_task_id);
+      return;
+    }
     const task = await api(`/v1/firms/${state.firm}/tasks/medical-records`, {
       method: "POST",
       headers: { "Idempotency-Key": (state.createKey ||= crypto.randomUUID()) },
@@ -945,7 +1055,7 @@ $("#status").addEventListener("change", () => {
 });
 $("#refresh").onclick = () => refresh(true);
 $("#load-more").onclick = loadMore;
-$("#new-task").onclick = openCreate;
+$("#new-task").onclick = () => openCreate();
 $("#close-detail").onclick = closeDetail;
 $("#drawer-backdrop").onclick = closeDetail;
 $("#copy-id").onclick = async () => {
@@ -976,11 +1086,7 @@ $("#firm").onchange = () => {
   refresh(true);
 };
 $("#create-case").onchange = updateCreateContacts;
-$("#all-dates").onchange = () => {
-  $("#date-range").hidden = $("#all-dates").checked;
-  $("#from-date").required = $("#through-date").required =
-    !$("#all-dates").checked;
-};
+$("#all-dates").onchange = updateCreateKind;
 $("#comment").addEventListener("input", () => {
   for (const a of state.workspace.agents)
     if (new RegExp(`@${a.key}(?![a-zA-Z0-9_])`).test($("#comment").value))
@@ -1025,117 +1131,14 @@ function supervisorPanel(c) {
     (s) => s.case_id === c.id,
   );
   if (!supervisor)
-    return `<div class="case-objective"><p>No case objective assigned.</p><button class="primary" data-objective="${e(c.id)}">Assign case objective</button></div>`;
+    return `<div class="case-objective"><p>No case objective assigned.</p><button class="primary" data-objective="${e(c.id)}">Assign task</button></div>`;
   const plan = supervisor.plan || {};
-  return `<div class="case-objective">${badge(supervisor.status)}<h4>${e(supervisor.objective.objective)}</h4><p>${e(plan.summary || "Supervisor activation queued.")}</p>${(plan.actions || []).map((a) => `<p><button class="task-link" data-task="${e(a.task_id)}">${short(a.task_id)}</button> ${e(statusName(a.type))}</p>`).join("")}${(plan.client_updates || []).map((u) => `<div class="instructions"><strong>Client-reported update</strong><p>${e(u.message)}</p><p>${e(u.changes.reasons.join("; "))}</p><button class="task-link" data-task="${e(u.task_id)}">${short(u.task_id)} / inspect report</button></div>`).join("")}${(plan.client_review_outcomes || []).filter((r) => r.decision).map((r) => `<div class="instructions"><strong>Client review / ${e(statusName(r.decision))}</strong><p>${e(r.reason)}</p><p>${e(r.decided_by)} / Task ${e(statusName(r.task_status || "pending"))}</p><button class="task-link" data-task="${e(r.task_id)}">Open reviewed task</button></div>`).join("")}${(plan.reviews || []).map((r) => `<div class="review-question"><strong>Unresolved review</strong><p>${e(r.question)}</p>${r.task_id ? `<button class="task-link" data-task="${e(r.task_id)}">Review task</button>` : ""}</div>`).join("")}<div class="objective-actions"><button class="text-button" data-task="${e(supervisor.group_task_id)}">Decisions, context & guidance</button><button class="text-button" data-objective="${e(c.id)}">Replace objective</button></div></div>`;
+  return `<div class="case-objective">${badge(supervisor.status)}<h4>${e(supervisor.objective.objective)}</h4><p>${e(plan.summary || "Supervisor activation queued.")}</p>${(plan.actions || []).map((a) => `<p><button class="task-link" data-task="${e(a.task_id)}">${short(a.task_id)}</button> ${e(statusName(a.type))}</p>`).join("")}${(plan.client_updates || []).map((u) => `<div class="instructions"><strong>Client-reported update</strong><p>${e(u.message)}</p><p>${e(u.changes.reasons.join("; "))}</p><button class="task-link" data-task="${e(u.task_id)}">${short(u.task_id)} / inspect report</button></div>`).join("")}${(plan.client_review_outcomes || []).filter((r) => r.decision).map((r) => `<div class="instructions"><strong>Client review / ${e(statusName(r.decision))}</strong><p>${e(r.reason)}</p><p>${e(r.decided_by)} / Task ${e(statusName(r.task_status || "pending"))}</p><button class="task-link" data-task="${e(r.task_id)}">Open reviewed task</button></div>`).join("")}${(plan.reviews || []).map((r) => `<div class="review-question"><strong>Unresolved review</strong><p>${e(r.question)}</p>${r.task_id ? `<button class="task-link" data-task="${e(r.task_id)}">Review task</button>` : ""}</div>`).join("")}<div class="objective-actions"><button class="text-button" data-task="${e(supervisor.group_task_id)}">Decisions, context & guidance</button><button class="text-button" data-objective="${e(c.id)}">Edit supervisor task</button></div></div>`;
 }
-const objectiveDialog = document.createElement("dialog");
-objectiveDialog.id = "objective-modal";
-objectiveDialog.innerHTML = `<form id="objective-form"><div class="modal-heading"><h2>Case objective</h2><button type="button" data-close="objective-modal" class="icon-button" aria-label="Close">×</button></div><p id="objective-case"></p><label>Objective<textarea id="objective-text" rows="3" required maxlength="2000" placeholder="Collect records and imaging from the hospital…"></textarea></label><label class="wake-label"><input type="checkbox" id="objective-records" checked> Approve records scope below (all dates)</label><p id="objective-scope-note" hidden></p><div class="form-row"><label>Client / patient<select id="objective-patient"></select></label><label>Provider<select id="objective-provider"></select></label></div><div class="checks"><label><input type="checkbox" name="supervisor-record" value="RECORDS" checked> Records</label><label><input type="checkbox" name="supervisor-record" value="IMAGING" checked> Imaging</label><label><input type="checkbox" name="supervisor-record" value="BILLS"> Bills</label></div><p>Routine assignments start automatically. Unsupported or unspecified scope is sent for human review. Provider operations are simulated.</p><div class="error" id="objective-error" role="alert" hidden></div><div class="modal-footer"><span id="objective-revision"></span><button class="primary" type="submit">Save objective & start</button></div></form>`;
-document.body.append(objectiveDialog);
-let objectiveCase, objectiveRevision, objectiveKey, objectiveSavedTargets;
-document.addEventListener("click", async (event) => {
+// Supervisor assignment and editing use the same task form as direct specialists.
+document.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-objective]");
-  if (!button) return;
-  objectiveCase = button.dataset.objective;
-  objectiveKey = crypto.randomUUID();
-  const c = state.overview.cases.find((c) => c.id === objectiveCase);
-  $("#objective-form").reset();
-  $("#objective-error").hidden = true;
-  $("#objective-case").textContent = `${c.number}: ${c.title}`;
-  const contacts = state.overview.contacts.filter(
-    (c) => c.case_id === objectiveCase,
-  );
-  const options = (role) =>
-    contacts
-      .filter((c) => c.roles.some((r) => role.includes(r)))
-      .map((c) => `<option value="${e(c.id)}">${e(c.name)}</option>`)
-      .join("");
-  $("#objective-patient").innerHTML = options(["PATIENT", "CLIENT"]);
-  $("#objective-provider").innerHTML = options(["MEDICAL_PROVIDER"]);
-  try {
-    const current = await api(
-      `/v1/firms/${state.firm}/cases/${objectiveCase}/supervisor`,
-    );
-    objectiveRevision = current.revision;
-    const existingTargets = current.objective?.targets || [];
-    objectiveSavedTargets =
-      existingTargets.length > 1 ||
-      existingTargets.some((t) => t.requirements.some((r) => !r.all_dates))
-        ? existingTargets
-        : null;
-    const note = $("#objective-scope-note");
-    note.hidden = !objectiveSavedTargets;
-    note.textContent =
-      "The existing provider scopes and date ranges will be preserved. This form edits one all-dates scope only.";
-    [
-      $("#objective-records"),
-      $("#objective-patient"),
-      $("#objective-provider"),
-      ...$$('input[name="supervisor-record"]'),
-    ].forEach((el) => (el.disabled = Boolean(objectiveSavedTargets)));
-    const target = existingTargets[0];
-    if (target) {
-      $("#objective-patient").value = target.patient_contact_id;
-      $("#objective-provider").value = target.provider_contact_id;
-      $$('input[name="supervisor-record"]').forEach(
-        (el) =>
-          (el.checked = target.requirements.some(
-            (r) => r.record_type === el.value,
-          )),
-      );
-    }
-    $("#objective-records").checked = !current.objective || Boolean(target);
-
-    $("#objective-text").value = current.objective?.objective || "";
-    $("#objective-revision").textContent = current.revision
-      ? `Explicit replacement of revision ${current.revision}`
-      : "New case objective";
-    objectiveDialog.showModal();
-  } catch (error) {
-    toast(error.message);
-  }
-});
-$("#objective-form").addEventListener(
-  "input",
-  () => (objectiveKey = crypto.randomUUID()),
-);
-$("#objective-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const button = event.submitter;
-  button.disabled = true;
-  $("#objective-error").hidden = true;
-  try {
-    const targets = objectiveSavedTargets ? [...objectiveSavedTargets] : [];
-    if (!objectiveSavedTargets && $("#objective-records").checked) {
-      const requirements = $$('input[name="supervisor-record"]:checked').map(
-        (x) => ({ record_type: x.value, all_dates: true }),
-      );
-      if (!requirements.length)
-        throw new Error("Select at least one required record type.");
-      targets.push({
-        patient_contact_id: $("#objective-patient").value,
-        provider_contact_id: $("#objective-provider").value,
-        requirements,
-      });
-    }
-    await api(`/v1/firms/${state.firm}/cases/${objectiveCase}/supervisor`, {
-      method: "POST",
-      headers: { "Idempotency-Key": objectiveKey },
-      body: JSON.stringify({
-        objective: $("#objective-text").value,
-        targets,
-        expected_revision: objectiveRevision,
-      }),
-    });
-    objectiveDialog.close();
-    await refresh(true);
-  } catch (error) {
-    $("#objective-error").textContent = error.message;
-    $("#objective-error").hidden = false;
-  } finally {
-    button.disabled = false;
-  }
+  if (button) openCreate(button.dataset.objective);
 });
 
 
