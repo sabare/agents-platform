@@ -174,9 +174,9 @@ async def create_check_in(tenant_id: UUID, body: CreateCheckIn, session: Session
 
 
 async def create_check_in_in_transaction(
-    session, tenant_id, body, key, *, series=None, occurrence=None
+    session, tenant_id, body, key, *, series=None, occurrence=None, monthly_occurrence=None
 ):
-    await policy_lock(session, tenant_id)
+    await policy_lock(session, tenant_id, publishing=True)
     case = await session.scalar(
         select(Case)
         .where(Case.tenant_id == tenant_id, Case.id == body.case_id)
@@ -215,6 +215,33 @@ async def create_check_in_in_transaction(
         raise HTTPException(
             409, "Client has a live series; use its controls instead of parallel check-ins"
         )
+    from agents_platform.check_in_contact import assess_contact, contact_lock
+    from agents_platform.check_in_contact import now as contact_now
+
+    await contact_lock(session, tenant_id, case.id, body.client_contact_id)
+    # Recheck after serialization: another caller may have created this exact task while we waited.
+    existing = await session.scalar(
+        select(Task).where(Task.tenant_id == tenant_id, Task.creation_key == creation_key)
+    )
+    if existing:
+        if existing.creation_hash != fingerprint:
+            raise HTTPException(409, "Idempotency-Key used for another assignment")
+        return await read_task(session, tenant_id, existing.id)
+    assessment = await assess_contact(
+        session,
+        tenant_id,
+        case.id,
+        body.client_contact_id,
+        at=max(body.scheduled_at, contact_now()),
+    )
+    if assessment["code"] != "ELIGIBLE":
+        raise HTTPException(409, assessment["reason"])
+    if monthly_occurrence and (
+        monthly_occurrence.tenant_id != tenant_id
+        or monthly_occurrence.case_id != case.id
+        or monthly_occurrence.task_id is not None
+    ):
+        raise HTTPException(422, "Monthly occurrence does not match this assignment")
     if body.parent_task_id:
         parent = await session.scalar(
             select(Task).where(
@@ -264,6 +291,7 @@ async def create_check_in_in_transaction(
             client_contact_id=body.client_contact_id,
             series_id=series.id if series else None,
             occurrence=occurrence,
+            monthly_occurrence_id=monthly_occurrence.id if monthly_occurrence else None,
             scheduled_at=body.scheduled_at,
             message=body.message,
         )
@@ -274,9 +302,17 @@ async def create_check_in_in_transaction(
         case_id=case.id,
         task_id=task_id,
         event_type="check_in.scheduled",
-        producer="check-in-series" if series else "operator",
+        producer="case-supervisor"
+        if monthly_occurrence
+        else "check-in-series"
+        if series
+        else "operator",
         dedupe_key=creation_key,
-        actor_ref="platform/series" if series else "local-operator",
+        actor_ref="platform/supervisor"
+        if monthly_occurrence
+        else "platform/series"
+        if series
+        else "local-operator",
         payload={
             "series_id": str(series.id) if series else None,
             "occurrence": occurrence,

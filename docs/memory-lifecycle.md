@@ -19,7 +19,9 @@ not itself change the restriction. The original evidence remains readable afterw
 `effective_from` says when an item starts applying. `review_at` asks for another
 review; it never lifts a hold. `due_at` is an obligation's due date, not an expiry.
 Only NOTE items accept `expires_at`. Recording time and closure time are retained
-separately. An old effective hold is not weakened merely because it is old.
+separately. An old effective hold is not weakened merely because it is old. Monthly check-ins
+use this same current-control load; a calendar date never releases a hold. Contact
+spacing and pending replies are checked separately through the shared contact service.
 
 ## Use the dashboard
 

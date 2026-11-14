@@ -82,7 +82,13 @@ async def read_task(session: AsyncSession, tenant_id: UUID, task_id: UUID) -> Ta
     fields = {
         name: getattr(task, name)
         for name in TaskView.model_fields
-        if name not in ("records_request", "client_check_in", "check_in_series")
+        if name
+        not in (
+            "records_request",
+            "client_check_in",
+            "check_in_series",
+            "monthly_check_in_schedule",
+        )
     }
     from agents_platform.client_check_in import check_in_view
 
@@ -122,8 +128,24 @@ async def read_task(session: AsyncSession, tenant_id: UUID, task_id: UUID) -> Ta
                 }
                 for c, t in occurrences
             ]
+    monthly = None
+    if task.task_type == "client.monthly_schedule":
+        from agents_platform.models import MonthlyCheckInSchedule
+        from agents_platform.monthly_check_ins import read_schedule
+
+        row = await session.scalar(
+            select(MonthlyCheckInSchedule).where(
+                MonthlyCheckInSchedule.tenant_id == tenant_id,
+                MonthlyCheckInSchedule.group_task_id == task.id,
+            )
+        )
+        monthly = await read_schedule(session, row) if row else None
     return TaskView(
-        **fields, records_request=request_view, client_check_in=check_in, check_in_series=series
+        **fields,
+        records_request=request_view,
+        client_check_in=check_in,
+        check_in_series=series,
+        monthly_check_in_schedule=monthly,
     )
 
 

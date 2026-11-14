@@ -127,8 +127,20 @@ async def overview(tenant_id: UUID, session: Session):
             select(CaseCoordination).where(CaseCoordination.tenant_id == tenant_id)
         )
     ).all()
+    from agents_platform.models import MonthlyCheckInSchedule
+    from agents_platform.monthly_check_ins import schedule_view
+
+    monthly = (
+        await session.scalars(
+            select(MonthlyCheckInSchedule)
+            .where(MonthlyCheckInSchedule.tenant_id == tenant_id)
+            .order_by(MonthlyCheckInSchedule.created_at.desc())
+            .limit(100)
+        )
+    ).all()
     return {
         "supervisors": [coordination_view(c) for c in coordinators],
+        "monthly_schedules": [schedule_view(r) for r in monthly],
         "counts": dict(totals),
         "executions": usage[0],
         "tokens": usage[1],

@@ -11,10 +11,17 @@ from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 
 from agents_platform.execution import now
-from agents_platform.models import CaseCoordination, CheckInSeries, OutboxMessage, Task
+from agents_platform.models import (
+    CaseCoordination,
+    CheckInSeries,
+    MonthlyCheckInSchedule,
+    OutboxMessage,
+    Task,
+)
 from agents_platform.orchestration.workflows import (
     CaseWorkflow,
     CheckInSeriesWorkflow,
+    MonthlyCheckInWorkflow,
     TaskWorkflow,
 )
 
@@ -34,7 +41,18 @@ async def dispatch_once(database, client, task_queue: str, tenant_id=None) -> bo
         if message is None:
             return False
         try:
-            if message.destination == "temporal.wake_series":
+            if message.destination == "temporal.wake_monthly":
+                row = await session.scalar(
+                    select(MonthlyCheckInSchedule).where(
+                        MonthlyCheckInSchedule.tenant_id == UUID(message.payload["tenant_id"]),
+                        MonthlyCheckInSchedule.case_id == UUID(message.payload["case_id"]),
+                        MonthlyCheckInSchedule.id == UUID(message.payload["schedule_id"]),
+                    )
+                )
+                if row is None or row.workflow_id != message.destination_key:
+                    raise ValueError("Outbox monthly schedule scope mismatch")
+                target, active = MonthlyCheckInWorkflow.run, True
+            elif message.destination == "temporal.wake_series":
                 series = await session.scalar(
                     select(CheckInSeries).where(
                         CheckInSeries.tenant_id == UUID(message.payload["tenant_id"]),

@@ -549,6 +549,7 @@ class MemoryQuery(TenantRow, Base):
 
 class ClientCheckIn(TenantRow, Base):
     __tablename__ = "client_check_ins"
+    monthly_occurrence_id: Mapped[UUID | None]
     case_id: Mapped[UUID]
     task_id: Mapped[UUID]
     client_contact_id: Mapped[UUID]
@@ -558,6 +559,18 @@ class ClientCheckIn(TenantRow, Base):
     series_id: Mapped[UUID | None]
     occurrence: Mapped[int | None]
     __table_args__ = (
+        CheckConstraint(
+            "monthly_occurrence_id IS NULL OR series_id IS NULL", name="one_check_in_cadence"
+        ),
+        UniqueConstraint("tenant_id", "monthly_occurrence_id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "monthly_occurrence_id"],
+            [
+                "monthly_check_in_occurrences.tenant_id",
+                "monthly_check_in_occurrences.case_id",
+                "monthly_check_in_occurrences.id",
+            ],
+        ),
         UniqueConstraint("tenant_id", "series_id", "occurrence"),
         ForeignKeyConstraint(
             ["tenant_id", "case_id", "series_id"],
@@ -708,4 +721,100 @@ class CheckInSeries(TenantRow, Base):
             unique=True,
             postgresql_where=sql_text("status IN ('ACTIVE','PAUSED')"),
         ),
+    )
+
+
+class MonthlyCheckInSchedule(TenantRow, Base):
+    """An approved calendar cadence; each due occurrence is reviewed by case coordination."""
+
+    __tablename__ = "monthly_check_in_schedules"
+    case_id: Mapped[UUID]
+    client_contact_id: Mapped[UUID]
+    group_task_id: Mapped[UUID]
+    workflow_id: Mapped[str] = mapped_column(unique=True)
+    status: Mapped[str] = mapped_column(default="ACTIVE")
+    version: Mapped[int] = mapped_column(default=1)
+    timezone: Mapped[str]
+    day_of_month: Mapped[int]
+    local_time: Mapped[str]
+    minimum_gap_days: Mapped[int] = mapped_column(default=28)
+    next_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dispatch_after: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    max_occurrences: Mapped[int] = mapped_column(default=12)
+    occurrence_count: Mapped[int] = mapped_column(default=0)
+    objective: Mapped[str]
+    message: Mapped[str]
+    creation_key: Mapped[str]
+    creation_hash: Mapped[str]
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "case_id", "id"),
+        UniqueConstraint("tenant_id", "creation_key"),
+        ForeignKeyConstraint(["tenant_id", "case_id"], ["cases.tenant_id", "cases.id"]),
+        ForeignKeyConstraint(
+            ["tenant_id", "client_contact_id"], ["contacts.tenant_id", "contacts.id"]
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "group_task_id"],
+            ["tasks.tenant_id", "tasks.case_id", "tasks.id"],
+        ),
+        CheckConstraint(
+            "status IN ('ACTIVE','PAUSED','STOPPED','FINISHED')", name="monthly_status"
+        ),
+        CheckConstraint(
+            "version > 0 AND day_of_month BETWEEN 1 AND 31 AND minimum_gap_days BETWEEN 1 AND 365 "
+            "AND max_occurrences BETWEEN 1 AND 120 AND occurrence_count BETWEEN 0 AND 120",
+            name="monthly_bounds",
+        ),
+        Index(
+            "ix_monthly_live_client",
+            "tenant_id",
+            "case_id",
+            "client_contact_id",
+            unique=True,
+            postgresql_where=sql_text("status IN ('ACTIVE','PAUSED')"),
+        ),
+    )
+
+
+class MonthlyCheckInOccurrence(TenantRow, Base):
+    __tablename__ = "monthly_check_in_occurrences"
+    case_id: Mapped[UUID]
+    schedule_id: Mapped[UUID]
+    month_key: Mapped[str]
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(default="DUE")
+    task_id: Mapped[UUID | None]
+    covering_task_id: Mapped[UUID | None]
+    reason: Mapped[str | None]
+    decision_source_id: Mapped[UUID | None]
+    decision_revision: Mapped[int] = mapped_column(default=0)
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "case_id", "id"),
+        UniqueConstraint("tenant_id", "schedule_id", "month_key"),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "schedule_id"],
+            [
+                "monthly_check_in_schedules.tenant_id",
+                "monthly_check_in_schedules.case_id",
+                "monthly_check_in_schedules.id",
+            ],
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "task_id"], ["tasks.tenant_id", "tasks.case_id", "tasks.id"]
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "covering_task_id"],
+            ["tasks.tenant_id", "tasks.case_id", "tasks.id"],
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "decision_source_id"],
+            ["sources.tenant_id", "sources.case_id", "sources.id"],
+        ),
+        CheckConstraint(
+            "status IN ('DUE','DELEGATED','COMPLETED','SKIPPED','BLOCKED','EXPIRED','MISSED')",
+            name="monthly_occurrence_status",
+        ),
+        Index("ix_monthly_occurrence_scope", "tenant_id", "case_id", "status"),
     )

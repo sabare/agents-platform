@@ -223,3 +223,56 @@ class CheckInSeriesWorkflow:
             cycle += 1
             if cycle % 100 == 0 or workflow.info().is_continue_as_new_suggested():
                 workflow.continue_as_new({**request, "cycle": cycle})
+
+
+@workflow.defn
+class MonthlyCheckInWorkflow:
+    """Calendar progression only: due occurrences wake the supervisor through its inbox."""
+
+    def __init__(self):
+        self.woken = False
+
+    @workflow.signal
+    def wake(self):
+        self.woken = True
+
+    @workflow.run
+    async def run(self, request: dict):
+        cycle = request.get("cycle", 0)
+        while True:
+            self.woken = False
+            try:
+                outcome = await workflow.execute_activity(
+                    "advance_monthly",
+                    request,
+                    result_type=dict,
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+            except ActivityError:
+                # Leave the durable cursor unchanged and retry later; never drop a calendar slot.
+                outcome = {
+                    "status": "WAITING",
+                    "wake_at": (workflow.now() + timedelta(minutes=1)).isoformat(),
+                }
+            if outcome["status"] == "CLOSED":
+                return outcome
+            if not self.woken:
+                if outcome.get("wake_at"):
+                    seconds = max(
+                        0,
+                        (
+                            datetime.fromisoformat(outcome["wake_at"]) - workflow.now()
+                        ).total_seconds(),
+                    )
+                    try:
+                        await workflow.wait_condition(
+                            lambda: self.woken, timeout=timedelta(seconds=seconds)
+                        )
+                    except TimeoutError:
+                        pass
+                else:
+                    await workflow.wait_condition(lambda: self.woken)
+            cycle += 1
+            if cycle % 100 == 0 or workflow.info().is_continue_as_new_suggested():
+                workflow.continue_as_new({**request, "cycle": cycle})

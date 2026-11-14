@@ -132,6 +132,9 @@ async def notify_series(session, task, event):
     )
     if not checkin:
         return
+    from agents_platform.monthly_check_ins import notify_monthly
+
+    await notify_monthly(session, task, event)
     rows = await session.scalars(
         select(CheckInSeries).where(
             CheckInSeries.tenant_id == task.tenant_id,
@@ -236,6 +239,25 @@ async def create_series(
             )
         ):
             raise HTTPException(409, "Client already has a live series in this case")
+        from agents_platform.check_in_contact import contact_policy
+        from agents_platform.models import MonthlyCheckInSchedule
+
+        if await session.scalar(
+            select(MonthlyCheckInSchedule.id).where(
+                MonthlyCheckInSchedule.tenant_id == tenant_id,
+                MonthlyCheckInSchedule.case_id == case_id,
+                MonthlyCheckInSchedule.client_contact_id == body.client_contact_id,
+                MonthlyCheckInSchedule.status.in_(["ACTIVE", "PAUSED"]),
+            )
+        ):
+            raise HTTPException(
+                409, "Client already has a live monthly schedule; stop it before another cadence"
+            )
+        policy = await contact_policy(session, tenant_id, case_id, body.client_contact_id)
+        if policy and body.interval_seconds < policy.minimum_gap_days * 86400:
+            raise HTTPException(
+                409, "Series interval conflicts with this client's contact-spacing policy"
+            )
         if not await session.get(AgentVersion, ("client_check_in", 1)):
             raise HTTPException(409, "Publish check-in definitions with the seed command")
         coord = await ensure_monitor(session, tenant_id, case_id)
@@ -495,6 +517,17 @@ class SeriesActivities:
                 row.blocked_reason = "Another check-in for this client is still open."
                 return waiting
             if row.next_due_at and row.next_due_at > now():
+                waiting["wake_at"] = min(
+                    row.next_due_at, row.ends_at or row.next_due_at
+                ).isoformat()
+                return waiting
+            from agents_platform.check_in_contact import assess_contact
+
+            assessment = await assess_contact(session, tenant, row.case_id, row.client_contact_id)
+            if assessment["code"] == "RECENT_CONTACT":
+                row.next_due_at = datetime.fromisoformat(assessment["eligible_after"])
+                row.blocked_reason = assessment["reason"]
+                row.version += 1
                 waiting["wake_at"] = min(
                     row.next_due_at, row.ends_at or row.next_due_at
                 ).isoformat()

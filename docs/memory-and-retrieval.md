@@ -33,6 +33,11 @@ the supervisor checks its plan/task/memory state before committing proposals.
 Changes can invalidate a decision and require a fresh activation.
 
 An old restriction remains important until explicitly resolved or replaced.
+Monthly coordination also reads current contact history directly: scheduled/pending
+tasks, actual sends and attributed replies. Those checks are not dependent on vector
+search; a recent manual check-in can suppress a due calendar slot. See
+[monthly check-ins](monthly-check-ins.md).
+
 Obsolete instructions can be retired. These operations and their audit history are
 explained in [memory lifecycle](memory-lifecycle.md).
 

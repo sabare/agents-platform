@@ -3,71 +3,34 @@
 Checked against the code on 14 November 2026. This is the proposed work order, not
 a delivery schedule. Items below are **not implemented** unless explicitly noted.
 
-The task form and memory lifecycle are now in place. The next product goal is:
+## Completed foundation
 
-> A saved monthly schedule wakes the supervisor. It reads current rules and work,
-> then delegates a client check-in when appropriate.
+The shared task form, explicit memory lifecycle and supervised monthly calendars
+are implemented. Calendar occurrences wake case coordination; deterministic rules
+check recent sends/replies, manual tasks, pending reviews and holds before delegation.
+The 28-day default spacing is checked again before sending. Unique month identities,
+a 24-hour dispatch window, pause/stop controls and no catch-up bursts are covered by
+tests, including seven months and a real Temporal worker restart.
+See [monthly check-ins](monthly-check-ins.md).
 
-## 1. Let the supervisor delegate check-ins
+## Next steps
 
-The check-in specialist already exists. The missing connection is the supervisor's
-records-only objective/action schema and assignment logic.
-
-- Add an approved check-in assignment type alongside records targets: client, time,
-  objective and message. Support mixed records/check-in objectives.
-- Reuse the existing check-in creation, reply, review and action-time hold checks.
-  Save the child task and wake intent together, under the supervisor's parent task.
-- Reuse existing covering work. Do not create a duplicate when a reply or review is
-  pending. Show whether the decision delegated, reused work or requested help.
-- Define completion per assignment type. Finishing records must not incorrectly
-  finish a mixed objective with outstanding check-in work.
-- Publish a new supervisor definition; keep existing pinned versions unchanged
-  unless an explicit upgrade/migration is chosen.
-
-**Done when:** a supervisor objective creates the right specialist tasks, and retries,
-concurrent decisions, changed scope and new restrictions cannot create extra sends.
-
-## 2. Add calendar-month schedules that wake the supervisor
-
-Keep this distinct from today's series, which waits an interval after completion
-and creates check-in tasks directly.
-
-Save the client, case, calendar day, local time, timezone, active/paused/stopped
-state, next due time and end bound in PostgreSQL. Use Temporal for waiting.
-The proposed default for a day missing from a month is its last day.
-
-Give each scheduled month a stable identity, such as schedule ID + `2027-04`.
-A due occurrence should wake case coordination once; the supervisor decides whether
-to delegate, reuse pending work, skip that occurrence or request review. Record the
-reason. Missed dates should not produce a burst of catch-up messages by default.
-
-Define how these schedules coexist with manual check-ins and existing live series;
-never run both outreach paths for the same client without an explicit policy.
-Pause/stop and changed schedule scope must invalidate inappropriate pending work.
-Neither a new month nor a supervisor decision can lift a contact hold.
-
-**Done when:** the configured monthly date reaches the supervisor reliably after
-restarts, with no duplicate monthly occurrence or overlapping client outreach.
-
-## 3. Verify the complete monthly flow
-
-Use a controllable clock and scripted agents to test months of state changes without
-waiting months. Cover:
-
-- February, leap years, the 29th–31st, timezones and daylight-saving changes.
-- Duplicate ticks, worker restarts, missed dates and a crash after saving an assignment.
-- An unanswered prior check-in, an open report review and a paused/stopped schedule.
-- A new, reviewed, replaced or resolved hold while the supervisor is thinking.
-- Ordinary completion, skipped occurrences, blockers and clear operator history.
-
-Then run a small labelled real-model evaluation for delegation/context decisions.
-Execution tests alone cannot establish the quality of model judgement.
+1. **Record off-platform contact.** Add attributed, source-backed intake for phone
+   calls or other channels, so recorded real contact can satisfy a monthly occurrence.
+   Free-text comments must not silently become verified contact or permission.
+2. **General check-in planning.** If needed beyond approved calendars, add typed
+   check-in targets to the supervisor model's objective/actions and completion rules.
+   Publish a new definition; do not silently change pinned records-only versions.
+3. **Broader human intervention.** Resolve records/objective reviews, correct replies,
+   support individual reviewer identity and provide deliberate takeover controls.
+4. **Evaluate real-model decisions.** Use labelled cases for delegation, changing
+   facts and context selection. Scripted execution tests do not establish judgement quality.
 
 ## Later work
 
 | Area | What remains |
 |---|---|
-| Human intervention | General records/objective review resolution, takeover, report corrections and individual reviewer identity |
+| Product refinements | Schedule editing, explicit contact-policy changes and richer operator review/navigation |
 | Memory quality | Better document chunks, optional reranking, suggested duplicate/conflict changes and tests of updated/delayed facts |
 | Scale | Batched policy-change fan-out, backlog partitioning, large-case context handling and retrieval measurements |
 | Real integrations | Messaging/provider systems, real document intake and reconciliation of uncertain delivery outcomes |

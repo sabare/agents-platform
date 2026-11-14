@@ -293,6 +293,9 @@ async def test_changed_report_and_old_supervisor_snapshot_fail_closed(setup, dat
                 )
             )
             assert not coord.plan_json["reviews"]  # Unread original flag did not reopen it.
+        # Acknowledgement does not finish the task; contact stays blocked until resumption.
+        assert create(client, fixture, key="pending-before-resume").status_code == 409
+        assert (await worker.execute_task(activation(task, 2)))["status"] == "COMPLETED"
         other = await blocked(client, fixture, worker, key="changed-report")
         async with database.sessions.begin() as session:
             source = await session.get(

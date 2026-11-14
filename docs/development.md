@@ -79,9 +79,9 @@ not a complete run-cost policy. See [memory and retrieval](memory-and-retrieval.
 ## Product walkthrough and demos
 
 Start with [task assignment](task-assignment.md). Supervisor is the default in the
-shared task form. Records delegation is implemented; supervisor check-in delegation
-and monthly calendar triggers are not. The existing check-in series uses a fixed
-delay after completion. **Memory & context** exposes the new memory lifecycle controls.
+shared task form. The supervisor delegates records through its model path and approved
+monthly check-ins through deterministic coordination. Choose **Monthly client check-ins**
+for the calendar settings. The existing interval series still uses a fixed delay after completion. **Memory & context** exposes the new memory lifecycle controls.
 
 Tracked demo commands, run in the activated host environment against the local stack:
 
@@ -112,6 +112,9 @@ reuse the saved result; conflicting reuse returns `409`.
 | `POST /tasks/{task}/client-reviews/{review}/decisions` | Allow completion or request changes, with reason and current task/review versions |
 | `GET/POST /cases/{case}/check-in-series` | List/create a bounded fixed-delay series |
 | `POST /cases/{case}/check-in-series/{series}/control` | PAUSE, RESUME or STOP, with reason and current version |
+| `GET/POST /cases/{case}/monthly-check-ins` | Inspect/create a supervised monthly calendar |
+| `GET /cases/{case}/monthly-check-ins/{schedule}` | Read monthly decisions and covering/delegated task links |
+| `POST /cases/{case}/monthly-check-ins/{schedule}/control` | Pause/resume/stop with reason, version and idempotency key |
 | `GET /cases/{case}/client-reports` | Read the latest 100 reports, optionally filtered by client |
 | `GET/POST /cases/{case}/supervisor` | Read or explicitly update the records objective |
 | `GET /tasks/{task}`, `/events`, `/executions` | Inspect state, timeline and execution evidence |
@@ -164,6 +167,7 @@ All modules below are under `src/agents_platform/`.
 | Durable coordination | `coordination.py`, `dispatch.py`, `orchestration/` |
 | Specialist execution | `execution.py`, `domains.py`, `medical_records.py`, `client_check_in.py` |
 | Current memory and lifecycle | `memory.py`, `memory_lifecycle.py`, `memory_api.py` |
+| Calendar coordination and contact spacing | `monthly_check_ins.py`, `check_in_contact.py` |
 | Indexing and context tools | `memory_history.py`, `context.py` |
 | Published definitions | `definitions/`, `registry.py`, `seed.py` |
 
@@ -179,3 +183,10 @@ to the supervisor's planning choices.
 The shared runtime owns identity, versions, memory, action keys, saved effects and
 workflow outcomes. Adapters are trusted application code and use its supplied
 transaction. They cannot overwrite core task fields or operational memory.
+
+
+Monthly calendar rules, 28-day default spacing, DST handling, 24-hour dispatch windows
+and persistent manual-contact spacing are documented in [monthly check-ins](monthly-check-ins.md).
+Run `pytest tests/test_monthly_calendar.py` for date/configuration checks and
+`RUN_INTEGRATION_TESTS=1 pytest tests/test_monthly_check_ins.py` for orchestration,
+contact suppression, seven-month progression and Temporal worker-restart coverage.

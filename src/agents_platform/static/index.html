@@ -238,10 +238,13 @@
           ></textarea>
         </label>
         <div id="create-supervisor-fields">
+          <label>Work type<select id="create-supervisor-mode"><option value="records">Records objective</option><option value="monthly">Monthly client check-ins</option></select></label>
+          <div id="create-records-supervision">
           <p id="create-supervisor-note" class="muted"></p>
           <label id="create-replace-field" class="wake-label" hidden><input type="checkbox" id="create-replace" /> Update this case's existing supervisor task</label>
           <label class="wake-label"><input type="checkbox" id="create-scope" checked /> Approve the records scope below for automatic delegation</label>
-          <p class="muted">The supervisor delegates records collection. For a client check-in, select that specialist.</p>
+          <p class="muted">The supervisor delegates records collection. Choose Monthly client check-ins for a calendar schedule.</p>
+          </div>
         </div>
         <div class="form-row">
           <label
@@ -252,6 +255,16 @@
           ><label id="create-provider-field"
             >Medical provider<select id="create-provider" required></select
           ></label>
+        </div>
+        <div id="create-monthly-fields" hidden>
+          <p class="muted">Each month the supervisor checks current restrictions and recent contact before assigning a check-in. This adds a schedule without replacing the case's records objective.</p>
+          <div class="form-row"><label>Day of month<input id="monthly-day" type="number" min="1" max="31" value="5" required disabled></label><label>Time in schedule timezone<input id="monthly-time" type="time" value="09:00" required disabled></label></div>
+          <label>Timezone<input id="monthly-zone" value="UTC" required maxlength="100" disabled></label>
+          <div class="form-row"><label>Start on or after (optional)<input id="monthly-start" type="date" disabled></label><label>Months in schedule<input id="monthly-count" type="number" min="1" max="120" value="12" required disabled></label></div>
+          <label>Minimum days between check-ins<input id="monthly-gap" type="number" min="1" max="365" value="28" required disabled></label>
+          <label>End time (optional, your local timezone)<input id="monthly-end" type="datetime-local" disabled></label>
+          <label>Check-in message<textarea id="monthly-message" rows="3" maxlength="2000" required disabled>How have you been? Please share changes in how you feel, treatment, daily activities, or anything the firm should know.</textarea></label>
+          <p class="muted">Recent manual check-ins and client replies count toward the minimum gap. Pending replies/reviews prevent another message. Missing dates use the month's last day; missed windows do not produce catch-up messages. Contact spacing also applies to manual tasks.</p>
         </div>
         <div id="create-records-fields"><label>Required documents</label>
         <div class="checks">

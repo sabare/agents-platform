@@ -23,9 +23,12 @@ preserved. The API supports up to ten records targets; the form edits one provid
 and a shared date range. **Assign task/Edit supervisor task** on the Supervisor
 screen opens the same form.
 
-The supervisor currently delegates **medical records only**. Unchecking approved
-records scope submits the objective for human review; it does not enable general
-planning or automatic check-in delegation.
+For a **Records objective**, model-driven delegation remains limited to approved
+records targets. Unchecking that scope submits the objective for human review;
+it does not enable arbitrary planning. For a calendar, keep Supervisor and choose
+**Monthly client check-ins**. The supervisor's deterministic schedule policy checks
+recent contact, pending work, reviews and holds before assigning a check-in.
+See [monthly check-ins](monthly-check-ins.md).
 
 ## Assign a specialist directly
 
@@ -60,5 +63,6 @@ A flagged client reply can block the task. **Allow completion** records that a
 teammate handled that report; **Request changes** gives guidance and keeps review
 open. The same task resumes. Neither decision clears contact holds or obligations.
 
-The next planned flow is **monthly date → supervisor review → check-in subtask**.
-Its scope and completion criteria are in the [roadmap](roadmap.md).
+The monthly flow is **calendar date → supervisor eligibility check → check-in task
+or an explained skip/block**. A recent manual check-in counts toward the default
+28-day contact gap. Monthly scheduling does not replace an existing records objective.

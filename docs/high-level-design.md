@@ -85,8 +85,15 @@ interval. Open replies/reviews prevent overlap. Pause blocks unsent outreach;
 stop is final and cancels an unsent child. Sent work can still finish. Series have
 an end bound and a hard cap of 100 occurrences; failed/cancelled children pause them.
 
-The supervisor monitors meaningful client updates but does **not** yet delegate
-check-ins. Calendar-month triggers are also unbuilt. See the [roadmap](roadmap.md).
+**Monthly calendars** wake the supervisor through its durable inbox. The coordinator
+uses deterministic rules for this explicitly approved cadence, reuses pending work,
+checks recent sends/replies and current holds, then creates a check-in task or records
+a skip/block. This does not change published records-only model definitions or enable
+arbitrary free-text check-in planning. Each schedule/month has a unique occurrence.
+
+The shared contact check serializes sends and rechecks spacing at action time.
+Manual check-ins count; open replies/reviews prevent overlap. Missed dates do not
+create catch-up bursts. See [monthly check-ins](monthly-check-ins.md) for the full policy.
 
 ## Current controls and historical evidence
 

@@ -19,6 +19,7 @@ from agents_platform.config import Settings, get_settings
 from agents_platform.dashboard import router as dashboard_router
 from agents_platform.db import Database
 from agents_platform.memory_api import router as memory_router
+from agents_platform.monthly_check_ins import router as monthly_router
 from agents_platform.orchestration.client import connect_temporal
 from agents_platform.orchestration.contracts import ProbeInput, ProbeResult
 from agents_platform.orchestration.workflows import InfrastructureProbe
@@ -53,6 +54,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(check_in_router)
     app.include_router(series_router)
     app.include_router(memory_router)
+    app.include_router(monthly_router)
     app.include_router(supervisor_router)
     app.include_router(dashboard_router)
     static = Path(__file__).parent / "static"

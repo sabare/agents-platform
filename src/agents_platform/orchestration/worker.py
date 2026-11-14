@@ -13,6 +13,7 @@ from agents_platform.db import Database
 from agents_platform.dispatch import dispatch_loop
 from agents_platform.execution import TaskActivities
 from agents_platform.memory_history import MemoryActivities
+from agents_platform.monthly_check_ins import MonthlyActivities
 from agents_platform.orchestration.activities import InfrastructureActivities
 from agents_platform.orchestration.client import connect_temporal
 from agents_platform.orchestration.workflows import (
@@ -20,6 +21,7 @@ from agents_platform.orchestration.workflows import (
     CheckInSeriesWorkflow,
     InfrastructureProbe,
     MemoryIndexWorkflow,
+    MonthlyCheckInWorkflow,
     TaskWorkflow,
 )
 
@@ -36,6 +38,7 @@ async def run_worker() -> None:
         supervisor = SupervisorActivities(database, settings)
         memory = MemoryActivities(database, settings)
         series = SeriesActivities(database)
+        monthly = MonthlyActivities(database)
         worker = Worker(
             client,
             task_queue=settings.temporal_task_queue,
@@ -44,11 +47,13 @@ async def run_worker() -> None:
                 InfrastructureProbe,
                 TaskWorkflow,
                 MemoryIndexWorkflow,
+                MonthlyCheckInWorkflow,
                 CheckInSeriesWorkflow,
             ],
             activities=[
                 memory.index_memory,
                 series.advance_series,
+                monthly.advance_monthly,
                 series.fail_series,
                 supervisor.coordinate_case,
                 supervisor.fail_supervisor,

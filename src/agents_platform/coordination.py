@@ -323,6 +323,13 @@ class SupervisorActivities:
 
     @activity.defn
     async def coordinate_case(self, activation: dict):
+        # Calendar cadence is operator-approved. Its deterministic delegation belongs to
+        # case coordination; published records-only model definitions remain unchanged.
+        from agents_platform.monthly_check_ins import delegate_due_monthly
+
+        await delegate_due_monthly(
+            self.database, UUID(activation["tenant_id"]), UUID(activation["case_id"])
+        )
         prepared = await self._prepare(activation)
         if isinstance(prepared, dict):
             return prepared

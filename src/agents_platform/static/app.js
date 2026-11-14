@@ -37,8 +37,9 @@ const names = {
   medical_records_collector: "Medical records",
   client_check_in: "Client check-in",
 };
-const agent = (t) =>
-  `<span class="agent-cell"><span class="agent-initial" aria-hidden="true">${t.task_type === "case.coordination" ? "S" : t.agent_key === "client_check_in" ? "CI" : "MR"}</span>${e(names[t.agent_key] || (t.task_type === "case.coordination" ? "Case supervisor" : t.agent_key))} <small>v${e(t.agent_version || 1)}</small></span>`;
+const agent = (t) => t.task_type === "client.monthly_schedule"
+  ? '<span class="agent-cell"><span class="agent-initial">S</span>Supervisor / monthly calendar</span>'
+  : `<span class="agent-cell"><span class="agent-initial" aria-hidden="true">${t.task_type === "case.coordination" ? "S" : t.agent_key === "client_check_in" ? "CI" : "MR"}</span>${e(names[t.agent_key] || (t.task_type === "case.coordination" ? "Case supervisor" : t.agent_key))} <small>v${e(t.agent_version || 1)}</small></span>`;
 const state = {
   key: sessionStorage.getItem("operatorKey") || "local-development-only",
   firm: null,
@@ -347,7 +348,7 @@ function renderSupervisor() {
             .filter((g) => g.case_id === c.id)
             .map((g) => `<button class="task-link" data-task="${e(g.id)}">${e(g.objective)}</button>`)
             .join("<br>") || "No parent task"
-        }</p>${supervisorPanel(c)}<div class="progress-track"><i style="width:${total ? Math.round((done / total) * 100) : 0}%"></i></div><div class="case-stats"><span>${done} of ${total} tasks complete</span><span>${blocked} need attention</span></div><button class="text-button" data-case="${e(c.id)}" style="margin-top:14px">View case tasks</button></article>`;
+        }</p>${supervisorPanel(c)}${monthlyPanel(c.id)}<div class="progress-track"><i style="width:${total ? Math.round((done / total) * 100) : 0}%"></i></div><div class="case-stats"><span>${done} of ${total} tasks complete</span><span>${blocked} need attention</span></div><button class="text-button" data-case="${e(c.id)}" style="margin-top:14px">View case tasks</button></article>`;
       })
       .join(
         "",
@@ -462,7 +463,7 @@ function renderDetail() {
   $("#detail-id").textContent = short(t.id);
   $("#detail-heading").innerHTML =
     `${badge(t.task_type === "case.coordination" ? state.overview.supervisors?.find((s) => s.group_task_id === t.id)?.status || t.status : t.status)}<h2>${e(t.objective)}</h2><dl class="detail-props"><dt>Task ID</dt><dd><code>${e(t.id)}</code></dd><dt>Assigned to</dt><dd>${agent(t)}</dd><dt>Case</dt><dd>${e(caseName(t))}</dd><dt>Part of</dt><dd>${e(group?.objective || "Standalone task")}</dd><dt>Next step</dt><dd>${e(reason || "Agent will assess the task.")}</dd>${outcome?.wake_at ? `<dt>Scheduled wake</dt><dd>${e(date(outcome.wake_at, true))}</dd>` : ""}<dt>Workflow</dt><dd><code>${e(t.workflow_id || t.check_in_series?.workflow_id || state.overview.supervisors?.find((s) => s.group_task_id === t.id)?.workflow_id)}</code></dd></dl>${t.records_request ? `<div class="requirements">${t.records_request.requirements.map((r) => `<span>${e(statusName(r.record_type))} / ${r.all_dates ? "all dates" : `${e(r.from_date)} ${e(r.through_date)}`}</span>`).join("")}<span>${e(statusName(t.records_request.status))}</span></div>${!closed(t) ? '<button class="text-button" data-provider>Simulate provider response</button>' : ""}` : ""}`;
-  $("#detail-heading").insertAdjacentHTML("beforeend", clientReviewHTML(t) + seriesHTML(t));
+  $("#detail-heading").insertAdjacentHTML("beforeend", clientReviewHTML(t) + seriesHTML(t) + monthlyHTML(t));
   if (t.records_request?.reminders_enabled) {
     const r = t.records_request;
     $("#detail-heading").insertAdjacentHTML("beforeend", `<p class="inline-note">Simulated reminders: ${r.reminder_count} / ${r.max_reminders}${r.next_reminder_at ? ` / Next due ${e(date(r.next_reminder_at,true))}` : ""}. Existing contact restrictions remain enforced.</p>`);
@@ -733,34 +734,47 @@ async function loadMore() {
 }
 document.querySelector("#create-series").addEventListener("change", updateCreateKind);
 
+function isMonthlyCreate() {
+  return $("#create-agent").value === "supervisor" && $("#create-supervisor-mode").value === "monthly";
+}
 function updateCreateKind() {
-  const kind = $("#create-agent").value;
-  const supervisor = kind === "supervisor";
-  const checkIn = kind === "check_in";
-  const preserved = supervisor && Boolean(state.createSavedTargets);
-  const scope = !supervisor || $("#create-scope").checked;
+  const supervisor = $("#create-agent").value === "supervisor";
+  const monthly = isMonthlyCreate();
+  const checkIn = $("#create-agent").value === "check_in";
+  const preserved = supervisor && !monthly && Boolean(state.createSavedTargets);
+  const scope = !monthly && (!supervisor || $("#create-scope").checked);
   $("#create-supervisor-fields").hidden = !supervisor;
+  $("#create-records-supervision").hidden = monthly;
+  $("#create-monthly-fields").hidden = !monthly;
+  $$('#create-monthly-fields input, #create-monthly-fields textarea').forEach((el) => el.disabled = !monthly);
   $("#create-parent-field").hidden = supervisor;
   $("#create-parent").disabled = supervisor || (checkIn && $("#create-series").checked);
   $("#series-fields").hidden = !checkIn || !$("#create-series").checked;
   $("#create-provider-field").hidden = checkIn || !scope;
   $("#create-records-fields").hidden = checkIn || !scope;
   $("#create-checkin-fields").hidden = !checkIn;
-  $("#create-patient").disabled = supervisor && (!scope || preserved);
+  $("#create-patient").disabled = supervisor && !monthly && (!scope || preserved);
   $("#create-provider").required = !checkIn && scope;
   $("#create-provider").disabled = preserved || !scope;
   $("#create-scope").disabled = preserved;
   $$('#create-records-fields input').forEach((el) => el.disabled = preserved || !scope);
   $("#from-date").required = $("#through-date").required = !checkIn && scope && !preserved && !$("#all-dates").checked;
   $("#date-range").hidden = $("#all-dates").checked;
-  $("#create-replace").required = supervisor && Boolean(state.createSupervisor?.revision);
-  $("#create-submit").disabled = supervisor && (state.createSupervisorLoading || !state.createSupervisor);
-  $("#create-submit").textContent = supervisor && state.createSupervisor?.revision ? "Update supervisor task" : "Create & start task";
-  $("#create-help").textContent = supervisor
-    ? "The supervisor plans the work, assigns specialists, and reviews their progress."
+  $("#create-replace").required = supervisor && !monthly && Boolean(state.createSupervisor?.revision);
+  $("#create-submit").disabled = supervisor && !monthly && (state.createSupervisorLoading || !state.createSupervisor);
+  $("#create-submit").textContent = monthly ? "Create monthly schedule" : supervisor && state.createSupervisor?.revision ? "Update supervisor task" : "Create & start task";
+  $("#create-help").textContent = monthly ? "The calendar wakes the supervisor each month to review and delegate a check-in."
+    : supervisor ? "The supervisor plans the work, assigns specialists, and reviews their progress."
     : "The selected specialist starts automatically and reports back to this task.";
-  $("#create-objective").placeholder = checkIn ? "Check in with the client and report meaningful changes…" : "Collect records and imaging from the provider…";
+  $("#create-objective").placeholder = monthly ? "Check in with the client monthly and report meaningful changes…" : checkIn ? "Check in with the client and report meaningful changes…" : "Collect records and imaging from the provider…";
 }
+$("#create-supervisor-mode").addEventListener("change", () => {
+  state.createKey = null;
+  state.createSupervisorEpoch = (state.createSupervisorEpoch || 0) + 1;
+  $("#create-objective").value = "";
+  if (isMonthlyCreate()) updateCreateKind();
+  else loadCreateSupervisor();
+});
 $("#create-agent").addEventListener("change", () => {
   state.createKey = null;
   if ($("#create-agent").value === "supervisor") loadCreateSupervisor();
@@ -772,6 +786,7 @@ $("#create-agent").addEventListener("change", () => {
 $("#create-scope").addEventListener("change", updateCreateKind);
 
 async function loadCreateSupervisor() {
+  if (isMonthlyCreate()) { updateCreateKind(); return; }
   const caseId = $("#create-case").value;
   const epoch = state.createSupervisorEpoch = (state.createSupervisorEpoch || 0) + 1;
   state.createSupervisor = null;
@@ -784,7 +799,7 @@ async function loadCreateSupervisor() {
   updateCreateKind();
   try {
     const current = await api(`/v1/firms/${state.firm}/cases/${caseId}/supervisor`);
-    if (epoch !== state.createSupervisorEpoch || caseId !== $("#create-case").value) return;
+    if (epoch !== state.createSupervisorEpoch || caseId !== $("#create-case").value || isMonthlyCreate()) return;
     state.createSupervisor = current;
     const targets = current.objective?.targets || [];
     // Keep complex scopes intact when updating through the single-provider form.
@@ -857,6 +872,7 @@ function openCreate(caseId = null) {
   state.createKey = null;
   state.createAt = null;
   $("#create-form").reset();
+  $("#monthly-zone").value = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
   $("#date-range").hidden = true;
   updateCreateKind();
   $("#create-error").hidden = true;
@@ -905,6 +921,22 @@ $("#create-form").addEventListener("submit", async (ev) => {
   button.disabled = true;
   $("#create-error").hidden = true;
   try {
+    if (isMonthlyCreate()) {
+      const payload = {
+        client_contact_id: $("#create-patient").value,
+        timezone: $("#monthly-zone").value.trim(), day_of_month: Number($("#monthly-day").value),
+        local_time: $("#monthly-time").value, minimum_gap_days: Number($("#monthly-gap").value),
+        max_occurrences: Number($("#monthly-count").value), objective: $("#create-objective").value,
+        message: $("#monthly-message").value,
+        ...($("#monthly-start").value ? {starts_on: $("#monthly-start").value} : {}),
+        ...($("#monthly-end").value ? {ends_at:new Date($("#monthly-end").value).toISOString()} : {}),
+      };
+      const row = await api(`/v1/firms/${state.firm}/cases/${$("#create-case").value}/monthly-check-ins`, {
+        method:"POST", headers:{"Idempotency-Key":(state.createKey ||= crypto.randomUUID())}, body:JSON.stringify(payload),
+      });
+      state.createKey = null; $("#create-modal").close(); toast("Monthly schedule created. The supervisor will review each due check-in.");
+      await refresh(true); await openTask(row.group_task_id); return;
+    }
     if ($("#create-agent").value === "check_in") {
       const scheduled = $("#checkin-at").value ? new Date($("#checkin-at").value).toISOString() : (state.createAt ||= new Date().toISOString());
       if ($("#create-series").checked) {
@@ -1289,4 +1321,44 @@ document.addEventListener("submit",async event=>{
     state.seriesWrite=null;state.seriesDraft=null;toast("Series control recorded.");await refreshDetail(true);await refresh();
   }catch(err){if(err.status===409){state.seriesWrite=null;await refreshDetail(true);}toast(err.message);}
   finally{button.disabled=false;}
+});
+
+
+function monthlyPanel(caseId) {
+  return (state.overview.monthly_schedules || []).filter((s) => s.case_id === caseId).map((s) =>
+    `<div class="case-objective"><strong>Monthly client check-ins / ${e(statusName(s.status))}</strong><p>Day ${s.day_of_month} at ${e(s.local_time)} (${e(s.timezone)}) / minimum ${s.minimum_gap_days} days between contacts</p><button class="task-link" data-task="${e(s.group_task_id)}">View schedule and decisions</button></div>`).join("");
+}
+function monthlyHTML(task) {
+  const s = task.monthly_check_in_schedule;
+  if (!s) return "";
+  const draft = state.monthlyDraft?.id === s.id ? state.monthlyDraft : {};
+  return `<section class="task-memory"><h3>Monthly client check-ins / ${e(statusName(s.status))}</h3>
+    <p>Day ${s.day_of_month} at ${e(s.local_time)} (${e(s.timezone)}). A missing day uses the last day of the month.</p>
+    <p>${s.next_due_at ? `Next calendar date: ${e(new Date(s.next_due_at).toLocaleString(undefined, {dateStyle:"medium", timeStyle:"short", timeZone:s.timezone}))}` : "No further calendar dates queued."} / ${s.occurrence_count} of ${s.max_occurrences} monthly slots</p>
+    <p class="inline-note">Minimum ${s.minimum_gap_days} local calendar days after the latest sent check-in or client reply, including manual work. This spacing policy remains after stopping the calendar. Pending replies/reviews prevent overlap. The supervisor handles due occurrences within 24 hours; missed windows are skipped.</p>
+    ${(s.occurrences || []).map((o) => `<div class="instructions"><strong>${e(o.month)} / ${e(statusName(o.status))}</strong><p>${e(o.reason || "Waiting for supervisor review.")}</p>${o.task_id ? `<button class="task-link" data-task="${e(o.task_id)}">View check-in task</button>` : ""}${o.covering_task_id ? `<button class="task-link" data-task="${e(o.covering_task_id)}">View the check-in that covered this occurrence</button>` : ""}</div>`).join("") || '<p class="inline-note">No monthly occurrences are due yet.</p>'}
+    ${!["STOPPED","FINISHED"].includes(s.status) ? `<form data-monthly-control="${e(s.id)}" data-version="${s.version}"><label>Action<select name="action">${s.status === "ACTIVE" ? '<option value="PAUSE">Pause automatic check-ins</option>' : '<option value="RESUME">Resume monthly schedule</option>'}<option value="STOP">Stop calendar / cancel unsent monthly work</option></select></label><label>Reason<input name="reason" required maxlength="2000" value="${e(draft.reason || "")}"></label><button type="submit" class="text-button">Apply schedule control</button></form>` : ""}
+  </section>`;
+}
+document.addEventListener("input", (event) => {
+  const form = event.target.closest('[data-monthly-control]');
+  if (form) state.monthlyDraft = {id:form.dataset.monthlyControl, reason:form.querySelector('[name="reason"]').value};
+});
+document.addEventListener("submit", async (event) => {
+  const form = event.target.closest('[data-monthly-control]');
+  if (!form) return;
+  event.preventDefault();
+  const button = event.submitter; button.disabled = true;
+  const data = new FormData(form), id = form.dataset.monthlyControl;
+  const payload = {expected_version:Number(form.dataset.version), action:data.get('action'), reason:data.get('reason')};
+  const intent = JSON.stringify({id, action:payload.action, reason:payload.reason});
+  if (state.monthlyWrite?.intent !== intent) state.monthlyWrite = {intent, key:crypto.randomUUID(), body:JSON.stringify(payload)};
+  try {
+    await api(`/v1/firms/${state.firm}/cases/${state.detail.case_id}/monthly-check-ins/${id}/control`, {
+      method:"POST", headers:{"Idempotency-Key":state.monthlyWrite.key}, body:state.monthlyWrite.body,
+    });
+    state.monthlyWrite = null; state.monthlyDraft = null; toast("Monthly schedule updated.");
+    await refreshDetail(true); await refresh();
+  } catch (err) { if (err.status === 409) state.monthlyWrite = null; toast(err.message); }
+  finally { button.disabled = false; }
 });
