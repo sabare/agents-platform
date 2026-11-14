@@ -1,112 +1,170 @@
-# How the platform works
+# Agents platform — simple high-level design
 
-Checked against the code on 14 November 2026.
+## 1. The idea
 
-The system keeps a job alive without keeping an AI conversation running all day.
-**PostgreSQL remembers the work. Temporal remembers when to wake it. An agent works
-for a short turn, saves its result and stops.**
+**PostgreSQL remembers the work. Temporal remembers when to wake it. An agent runs a short turn, saves its result and stops.**
 
-## The main parts
+An assignment may last months; a model call lasts seconds. The application keeps the
+assignment alive through saved state, timers and events. It does not keep one AI
+conversation running continuously.
 
-| Part | Job |
-|---|---|
-| Dashboard and FastAPI | Let a person assign work, inspect it and supply updates |
-| PostgreSQL | Store tasks, plans, rules, original evidence and execution history |
-| Outbox and inbox | Save outgoing start/wake requests and incoming events so crashes do not lose them |
-| Temporal workflows | Wait for dates or events, retry work and recover after restarts |
-| Case supervisor | Review one case objective and propose permitted records assignments |
-| Specialist runtime | Load context, run a bounded agent turn, check actions and save the result |
-| Domain adapters | Define each specialist's tools, state and completion requirements |
-| Memory and retrieval | Load current controls and find supporting historical evidence |
+This is a working demo. Outreach and document receipt are simulated. Scripted
+responses and real model calls use the same tools and backend validation.
 
-These are parts of one Python application. The API and worker are separate processes;
-PostgreSQL and Temporal run alongside them. Each row does not represent a separate service.
+## 2. The architecture
 
 ```mermaid
-flowchart TD
-    Human[Person using the dashboard] --> API[FastAPI: validate and save]
+flowchart LR
+    Person[Operator / dashboard] --> API[FastAPI]
     API --> DB[(PostgreSQL)]
     DB --> Dispatch[Outbox dispatcher]
     Dispatch --> Temporal[Temporal: wait and wake]
-    Temporal --> Supervisor[Supervisor: review and propose]
-    Supervisor --> Checks[Backend checks and saved subtasks]
+    Temporal --> Runtime[Worker: prepare / decide / commit]
+    Runtime --> Model[Model or scripted response]
+    Model --> Checks[Checked tools and outcomes]
     Checks --> DB
-    Temporal --> Specialist[Specialist: prepare, decide, commit]
-    DB --> Context[Current rules and retrieved evidence]
-    Context --> Supervisor
-    Context --> Specialist
-    Specialist --> Tools[Checked simulated tools]
-    Tools --> DB
 ```
 
-## Follow one job
+This is one Python application. The API and worker run as separate processes,
+next to PostgreSQL and Temporal. The diagram does not represent microservices.
 
-A person assigns "collect Ravi's records" through the shared task form. The
-supervisor receives approved provider/document targets. It checks existing tasks,
-then proposes any missing records assignments. The backend validates the scope,
-reuses covering work and rejects overlapping requests before saving new subtasks.
-Each executable subtask gets its own workflow and can wait independently.
+| Part | Responsibility |
+|---|---|
+| Dashboard + API | Assign work, supply updates and record human decisions |
+| PostgreSQL | Store business facts, evidence, current rules and execution history |
+| Temporal | Persist timers, wake workflows and retry activities across restarts |
+| Runtime | Load context, run a bounded agent turn and validate its outcome |
+| Domain adapter | Supply a use case's state, tools and completion checks |
+| Supervisor | Discover registered capabilities, delegate durable child tasks and monitor updates |
+| Memory/retrieval | Load current controls and find historical evidence |
+| Operations/telemetry | Expose failures, delays and unresolved work with correlated logs |
 
-A specialist activation has three steps:
+## 3. What is saved?
 
-1. **Prepare:** load the pinned agent definition, current domain state, applicable
-   rules, new events and supporting history. Save that starting context.
-2. **Decide:** run the model or scripted equivalent. Tools check scope, versions,
-   contact holds and duplicate-action keys before a simulated action.
-3. **Commit:** recheck versions and current memory, verify evidence, then save
-   progress and events. Relevant outcomes wake the supervisor.
+| Object | Meaning |
+|---|---|
+| Task | The assignment: objective, case, status and pinned agent version |
+| Execution | One activation's saved context, result, attempts and usage |
+| ToolInvocation | An action result and a logical key preventing duplicate effects |
+| Source / RecordEvidence | Original information and links to the requirements it satisfies |
+| ActivityEvent | A recorded business change |
+| Inbox / Outbox | Unprocessed incoming events / undelivered start-or-wake requests |
+| HumanRequest / HumanDecision | A question for a person and their attributed response |
+| HumanContinuation | One authorized follow-up with exact dates |
+| ExecutionIncident | Failed execution needing an operator's recovery decision |
+| ManualContact | An attributed account of contact outside the app |
 
-No database lock spans a model call. If information changes while the agent is
-thinking, its decision can be rejected as stale and retried with fresh context.
-Saved tool results protect retries from repeating simulated effects. The full
-intermediate reasoning of the model is not checkpointed.
+**One task can have many executions.** Group tasks organize work; they do not run specialists.
+Business rows hold current state; events retain history. This is not full event sourcing.
 
-A task normally moves through `PENDING`, `RUNNING`, `WAITING`, `BLOCKED` and
-`COMPLETED`. Exhausted retries can produce `FAILED`. `CANCELLED` is supported as a
-terminal state, but there is no general operator takeover/cancellation product flow.
-Group tasks organize work; they are not specialist executions.
+## 4. Follow one job
 
-## Records and check-ins
+1. **Assign:** validate the case, people, scope and published agent. Save the task,
+   business request, event and outbox message together.
+2. **Dispatch:** deliver the saved start/wake request to Temporal. Failed delivery
+   leaves the message available for retry.
+3. **Prepare:** load current state, active rules, new events and relevant history.
+   Save the context and expected task version.
+4. **Decide:** the model selects tools and proposes a next step. Tools independently
+   check scope, restrictions, due times and duplicate-action keys.
+5. **Commit:** recheck versions and rules, verify evidence, then save progress and events.
+   Evidence IDs exposed by adapters are case-checked. Invalid model proposals receive
+   bounded correction feedback; rejected output remains available for inspection.
+6. **Wait or finish:** Temporal sleeps until a date/signal or ends the workflow.
 
-**Records v3** sends an initial simulated request and up to three due-checked
-reminders. Completion requires saved evidence for every required item and no open
-obligations. Missing evidence or exhausted follow-up policy requires human help.
-Records v2 remains executable without reminders; v1 is analysis-only. New supervisor
-v2 objectives delegate records v3. Existing work retains its pinned definitions.
+A wake signal says “check your inbox.” The saved event carries the business facts.
+Approved schedules and human continuations can advance through deterministic code
+without spending a model call.
 
-**Client check-ins** send at a scheduled time and accept one attributed reply per
-task. Saved self-reports are compared with the previous report. Configured demo
-rules flag changes or concerns; they are not clinical assessments. Flagged reports
-require an explicit teammate decision before completion.
+No database lock spans a model call. If facts change during reasoning, the old
+proposal can be discarded and replanned. The full model reasoning is not checkpointed. The automatic polling budget resets
+when new business information arrives; it does not limit total task lifetime.
 
-**Recurring series** are assigned by a person. A series workflow creates one
-check-in task at a time and waits for its completion before starting the next
-interval. Open replies/reviews prevent overlap. Pause blocks unsent outreach;
-stop is final and cancels an unsent child. Sent work can still finish. Series have
-an end bound and a hard cap of 100 occurrences; failed/cancelled children pause them.
+Typical states: `PENDING → RUNNING → WAITING / BLOCKED / COMPLETED`.
+Exhausted retries produce `FAILED`; explicit stopping can produce `CANCELLED`.
 
-**Monthly calendars** wake the supervisor through its durable inbox. The coordinator
-uses deterministic rules for this explicitly approved cadence, reuses pending work,
-checks recent sends/replies and current holds, then creates a check-in task or records
-a skip/block. This does not change published records-only model definitions or enable
-arbitrary free-text check-in planning. Each schedule/month has a unique occurrence.
+## 5. How the use cases differ
 
-The shared contact check serializes sends and rechecks spacing at action time.
-Manual check-ins count; open replies/reviews prevent overlap. Missed dates do not
-create catch-up bursts. See [monthly check-ins](monthly-check-ins.md) for the full policy.
+**Records:** each requirement has a document type and date scope. Bills can arrive
+without records or imaging. Every follow-up requests only currently missing items.
+Completion requires saved evidence for every required item and no open obligations.
+Records v3 permits three automatic reminders; a person can explicitly authorize one
+additional attempt. Case state and participant roles are rechecked before contact.
 
-## Current controls and historical evidence
+**Client check-ins:** send once, accept one attributed reply, compare structured
+self-report fields with the previous report, and require review for configured concerns.
+Self-reports remain unverified. Raw narrative understanding is not established by
+labelled model evaluations.
 
-Every activation gets applicable firm/provider instructions, effective open holds
-and obligations. SQL loads these directly; they do not depend on a similarity search.
-Resolved, superseded and retired items stay out of current controls. Only optional
-notes can expire. Review dates never lift holds. The indexing worker also processes
-scheduled lifecycle transitions; action-time checks independently enforce dates.
+**Schedules:** interval series wait for completion before the next delay. Monthly
+calendars retain calendar dates, use unique occurrences and skip missed slots.
+Pending interactions and contact-spacing checks prevent overlapping outreach.
 
-Original evidence and searchable passages remain available through `retrieve_context`
-and `read_evidence`. Historical text cannot grant permission or prove completion.
-See [memory and retrieval](memory-and-retrieval.md) and [memory lifecycle](memory-lifecycle.md).
+**Coordination:** supervisor intake interprets a description into a reviewable plan
+for records, one-off check-ins, monthly calendars or interval series. Approval
+atomically records the approved assignments. Supervisor v3 also discovers developer-registered
+capabilities and generates typed delegation tools for new domains. Approved hospital targets
+retain their evidence and overlap checks; calendar delegation remains deterministic. New
+specialists run as durable child tasks. See `adding-agents.md` and `supervisor-intake.md`.
 
-The supervisor loads at most 200 task summaries and 100 inbox events per activation;
-an incomplete task overview requests review. Mandatory memory is loaded separately
-and is not silently cut to those limits. Oversized essential context requests help.
+## 6. Human intervention and recovery
+
+A business blocker creates a request showing the question, evidence and permitted
+decisions. The backend validates the person's response and wakes the same task.
+Resolving one request does not clear other restrictions or missing evidence.
+
+A manual call stores the contact, actual time, outcome and operator notes. It does
+not create documents, clear holds or count as a client reply. Reached client contact
+contributes to the configured spacing policy; voicemail does not.
+
+An execution incident represents exhausted technical retries. Recovery retains the
+business task, evidence and action keys, but starts a new Temporal workflow identity,
+execution generation and fresh context. Late old-generation work cannot mutate it.
+The demo allows three operator recoveries. A person can also cancel the assignment.
+
+## 7. Important decisions and implications
+
+| Decision | Why | Implication |
+|---|---|---|
+| Separate business state from orchestration | Facts and timers have different jobs | PostgreSQL and Temporal need a reliable bridge |
+| Save inbox/outbox records | A crash must not lose a wake-up | Delivery may repeat; processing must be idempotent |
+| Model proposes; backend enforces | Model confidence is not permission or proof | Domain checks belong in trusted code |
+| Keep logical action keys across retries | The same send must not happen twice | Recovery reuses saved results |
+| Recheck state before actions and commit | Humans and providers update facts concurrently | Stale model work may be discarded |
+| Load active controls through SQL | Search must never hide a contact hold | Oversized mandatory context needs human help |
+| Retrieve history as evidence | Months of history cannot fit every model call | Historical text cannot grant permission |
+| Pin published agent definitions | Existing work should not change silently | New behavior needs a new version and explicit adoption |
+| Separate adapters from runtime | Reuse execution safeguards across domains | Each domain still supplies intake, tools and completion rules |
+| Separate reviews from incidents | A missing authorization differs from a broken model call | Operators receive different recovery options |
+
+Duplicate protection covers transactional **simulated effects**. It does not prove
+exactly-once delivery for future email/phone integrations. Unknown external delivery
+must be reconciled before retry; blind retry is blocked today.
+
+## 8. Extend, learn and explain
+
+To add insurance claim-status follow-up: define typed input and evidence, implement
+an adapter, register/publish its definition, add intake and human-response handling,
+and test waiting, updates, retries and completion. Export its `AgentCapability` from a
+module in `agent_plugins/`; `expose_to_supervisor` defaults to true. Discovery supplies
+the supervisor and assignment planner with the capability and generates its typed
+delegation tool. No supervisor-specific dispatch branch is required. See
+[Adding agents](adding-agents.md) for the registration, deployment and versioning contract.
+
+Read the code in this order:
+
+1. `models.py`, `task_contracts.py` — saved objects and accepted inputs.
+2. `tasks.py`, `task_api.py` — assignment and evidence intake.
+3. `dispatch.py`, `orchestration/workflows.py` — durable waiting and delivery.
+4. `execution.py`, `domains.py` — prepare, decide and commit.
+5. Domain adapters, human-request handlers and `recovery.py` — business differences.
+6. Memory, coordination, scheduling and operations modules — context and oversight.
+
+Ask at every step: **What is saved? Who may change it? What if this runs twice?
+What if new facts arrive before it finishes?**
+
+The demo uses shared development credentials and Temporal's development server.
+Real integrations, individual authorization, evidence correction and scale testing
+remain unfinished. Backend tests establish execution mechanics; model judgment and
+browser journeys need separate evaluation. The old inline CLI is a scaffold; the
+API, database, outbox, Temporal and worker form the durable product path.

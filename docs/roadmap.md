@@ -15,14 +15,15 @@ See [monthly check-ins](monthly-check-ins.md).
 
 ## Next steps
 
-1. **Record off-platform contact.** Add attributed, source-backed intake for phone
-   calls or other channels, so recorded real contact can satisfy a monthly occurrence.
-   Free-text comments must not silently become verified contact or permission.
+1. **Extend recorded manual contact.** Attributed calls, explicit provider follow-up
+   and reached-client spacing are implemented. Next add corrections and real channel
+   integrations. Contact records do not automatically complete existing pending check-ins.
 2. **General check-in planning.** If needed beyond approved calendars, add typed
    check-in targets to the supervisor model's objective/actions and completion rules.
    Publish a new definition; do not silently change pinned records-only versions.
-3. **Broader human intervention.** Resolve records/objective reviews, correct replies,
-   support individual reviewer identity and provide deliberate takeover controls.
+3. **Extend human intervention.** Shared records/client/objective requests are implemented.
+   Next add evidence-backed manual actions, reply corrections, individual reviewer
+   identity, external escalation and deliberate takeover controls.
 4. **Evaluate real-model decisions.** Use labelled cases for delegation, changing
    facts and context selection. Scripted execution tests do not establish judgement quality.
 

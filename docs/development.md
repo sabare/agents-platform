@@ -91,6 +91,7 @@ Tracked demo commands, run in the activated host environment against the local s
 | `python examples/supervisor_demo.py --restart-worker` | Records delegation, reuse and objective verification |
 | `python examples/memory_demo.py` | Evidence retrieval, holds, obligations and restart |
 | `python examples/check_in_demo.py` | Scheduled messages, changed replies and review |
+| `python examples/human_intervention_demo.py` | Exhausted records reminders, one authorized extra attempt and same-task completion |
 | `python examples/client_review_demo.py` | Guidance, explicit acknowledgement and same-task resumption |
 
 Demos add fictional data. Restart scenarios briefly stop the shared local worker.
@@ -133,7 +134,8 @@ The default demo policy uses three reminders at 30-second intervals.
 
 Client-report decisions are `ALLOW_COMPLETION` or `REQUEST_CHANGES`; they resume
 the same task and do not clear restrictions. Changed report evidence invalidates
-acknowledgement. This is not a general takeover or records-approval API.
+acknowledgement. The compatible client-review endpoint remains available. Shared records and supervisor
+intervention use the [human-work API](human-intervention.md); arbitrary takeover remains unfinished.
 
 ## Checks
 
@@ -167,6 +169,7 @@ All modules below are under `src/agents_platform/`.
 | Durable coordination | `coordination.py`, `dispatch.py`, `orchestration/` |
 | Specialist execution | `execution.py`, `domains.py`, `medical_records.py`, `client_check_in.py` |
 | Current memory and lifecycle | `memory.py`, `memory_lifecycle.py`, `memory_api.py` |
+| Human work | `human_requests.py`, `human_request_handlers.py`; [guide](human-intervention.md) |
 | Calendar coordination and contact spacing | `monthly_check_ins.py`, `check_in_contact.py` |
 | Indexing and context tools | `memory_history.py`, `context.py` |
 | Published definitions | `definitions/`, `registry.py`, `seed.py` |
@@ -184,9 +187,91 @@ The shared runtime owns identity, versions, memory, action keys, saved effects a
 workflow outcomes. Adapters are trusted application code and use its supplied
 transaction. They cannot overwrite core task fields or operational memory.
 
+## Provider callback appointments
+
+Records agent v3 tasks accept provider-specific callback appointments through
+`POST /v1/firms/{firm_id}/tasks/{task_id}/provider-updates` and the dashboard's
+**Simulate provider response → Callback schedule** fields. Contact remains simulated.
+
+```json
+{
+  "status": "PENDING",
+  "message": "Please call back Friday at 2pm.",
+  "callback_timezone": "America/New_York"
+}
+```
+
+The resolver supports a single callback directive with a weekday, `today`,
+`tomorrow`, or an ISO date, optionally followed by `at 14:30` or `at 2pm`.
+Without a time in the message, it uses `callback_local_time` (default `09:00`),
+shown in the form. Relative dates use the supplied hospital IANA timezone, not
+server time. Ambiguous prose and DST wall times require an exact appointment.
+An operator can override prose with `callback_date` + `callback_local_time` +
+`callback_timezone`, or an offset-aware `callback_at`. Past appointments are rejected.
+
+The original response, resolved appointment, event, task inbox and outbox wake
+are committed together. The records adapter returns an absolute `ready_at` to
+Temporal; the normal short demo follow-up interval cannot shorten this wait.
+Rescheduling invalidates in-flight work and replaces the timer when the outbox is
+delivered. An ordinary pending response preserves an existing appointment;
+`clear_callback: true` cancels it and restores the normal reminder interval.
+Receiving all records clears the callback and wakes completion immediately.
+
+At the agreed time, the existing bounded simulated reminder tool performs the
+follow-up once and clears the appointment. It consumes one of the task's maximum
+three reminders; an exhausted limit requires teammate review. Contact holds still
+apply. Callback scheduling does not upgrade pinned agent versions or add voice calls.
+
 
 Monthly calendar rules, 28-day default spacing, DST handling, 24-hour dispatch windows
 and persistent manual-contact spacing are documented in [monthly check-ins](monthly-check-ins.md).
 Run `pytest tests/test_monthly_calendar.py` for date/configuration checks and
 `RUN_INTEGRATION_TESTS=1 pytest tests/test_monthly_check_ins.py` for orchestration,
 contact suppression, seven-month progression and Temporal worker-restart coverage.
+
+
+## Partial records receipt
+
+Provider updates accept `status: "PARTIAL"` with a nonempty
+`received_requirement_ids` list. IDs refer to the exact requirements returned by
+`GET /tasks/{task}` (including their date scope), not just document types. The
+dashboard provides **Receive selected items** checkboxes.
+
+Only selected items receive synthetic evidence. The server derives `PARTIAL` versus
+`RECEIVED` from accumulated evidence; it never removes received evidence on a later
+processing update. A final selected delivery can use `PARTIAL` and will automatically
+become `RECEIVED` when it covers the remaining required items. `RECEIVED` with IDs
+requires full accumulated coverage. For compatibility, `RECEIVED` without IDs is an
+explicit all-items delivery.
+
+Exact retries reuse the source. Re-delivering an already received item under a new
+key saves the provider message but does not duplicate its evidence. Invalid IDs
+(including another task's requirements), empty/duplicate lists and contradictory
+statuses are rejected. A task lock serializes concurrent deliveries; task versions
+invalidate in-flight plans and sends.
+
+Every reminder, including an additional human-authorized follow-up, snapshots the
+currently missing requirement IDs, full date scopes and simulated message at send
+time. Received bills are excluded from a later request for records and imaging.
+Pending callbacks stay in effect after partial deliveries; complete receipt clears
+them. Human authorizations still require a fresh review if provider information
+changes after approval. No database migration is needed: existing requirement and
+evidence rows provide the coverage state.
+
+Run `RUN_INTEGRATION_TESTS=1 pytest tests/test_partial_receipts.py` for coverage and
+`python examples/partial_receipt_demo.py` for a real API/worker walkthrough. Pass
+`--leave-partial` to keep bills received and records/imaging outstanding for review
+in the dashboard. Outreach and received artifacts remain simulated in both modes.
+
+
+## Execution incidents and manual contact
+
+See [recovery and contact](recovery-and-contact.md) for operator steps, API contracts,
+recovery generations, contact spacing and current limits. The schema revision
+`6e8b9252f1d6` follows shared human requests. Back up and migrate using the coordinated
+procedure above before restarting API and worker.
+
+`python examples/recovery_contact_demo.py` creates a controlled fictional post-send
+failure, records a provider call, resumes the original assignment and checks that
+its initial simulated send was not duplicated. Pass `--leave-failed` to inspect the
+incident in the dashboard. Tests run in disposable databases and isolated queues.
