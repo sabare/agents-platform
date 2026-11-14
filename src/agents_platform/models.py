@@ -138,7 +138,16 @@ class RecordsRequest(TenantRow, Base):
     patient_contact_id: Mapped[UUID]
     provider_contact_id: Mapped[UUID]
     status: Mapped[str] = mapped_column(default="DRAFT")
+    reminder_count: Mapped[int] = mapped_column(default=0, server_default="0")
+    max_reminders: Mapped[int] = mapped_column(default=3, server_default="3")
+    reminder_interval_seconds: Mapped[int] = mapped_column(default=30, server_default="30")
+    next_reminder_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
+        CheckConstraint(
+            "reminder_count BETWEEN 0 AND max_reminders AND max_reminders BETWEEN 1 AND 3 "
+            "AND reminder_interval_seconds >= 10",
+            name="records_reminder_bounds",
+        ),
         UniqueConstraint("tenant_id", "case_id", "id"),
         UniqueConstraint("tenant_id", "task_id"),
         ForeignKeyConstraint(

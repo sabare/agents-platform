@@ -34,7 +34,7 @@ class CreateRecordsTask(Contract):
     parent_task_id: UUID | None = None
     patient_contact_id: UUID
     provider_contact_id: UUID
-    agent_version: int = Field(default=2, gt=0)
+    agent_version: int = Field(default=3, gt=0)
     objective: str = Field(min_length=1, max_length=2000)
     requirements: list[RecordRequirementInput] = Field(min_length=1, max_length=20)
 
@@ -58,6 +58,10 @@ class RecordsRequestView(Contract):
     provider_contact_id: UUID
     status: str
     requirements: list[RequirementView]
+    reminders_enabled: bool = False
+    reminder_count: int = 0
+    max_reminders: int = 3
+    next_reminder_at: datetime | None = None
 
 
 class TaskSnapshot(Contract):

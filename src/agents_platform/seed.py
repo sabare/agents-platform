@@ -37,7 +37,9 @@ async def seed_demo(session: AsyncSession, firm_id: UUID = DEMO_FIRM_ID) -> dict
         for agent_key, version in (
             ("medical_records_collector", 1),
             ("medical_records_collector", 2),
+            ("medical_records_collector", 3),
             ("case_supervisor", 1),
+            ("case_supervisor", 2),
             ("client_check_in", 1),
         ):
             definition = load_definition(agent_key, version)

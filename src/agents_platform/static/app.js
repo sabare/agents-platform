@@ -283,7 +283,7 @@ function render() {
       `<div class="audit-feed">${state.activity.length ? state.activity.map(eventHTML).join("") : '<div class="empty">No activity yet. Create a task to get started.</div>'}</div>`;
   if (state.view === "agents")
     $("#content").innerHTML =
-      `<div class="agent-grid">${state.workspace.agents.map((a) => `<article class="agent-card"><span class="agent-initial">${a.key === "supervisor" ? "S" : a.key === "client_check_in" ? "CI" : "MR"}</span><h3>${e(a.name)}</h3><p>${e(a.capability)}</p><small>${e(a.key)}</small><p>${a.key === "medical_records_collector" ? "Published v2 / task-scoped tools / bounded executions / durable follow-ups" : a.key === "supervisor" ? "Coordinates approved case objectives through independent durable specialist tasks." : "Published v1 / scheduled simulated outreach / attributed replies / meaningful-update comparison."}</p></article>`).join("")}</div>`;
+      `<div class="agent-grid">${state.workspace.agents.map((a) => `<article class="agent-card"><span class="agent-initial">${a.key === "supervisor" ? "S" : a.key === "client_check_in" ? "CI" : "MR"}</span><h3>${e(a.name)}</h3><p>${e(a.capability)}</p><small>${e(a.key)}</small><p>${a.key === "medical_records_collector" ? "Published v3 / task-scoped tools / bounded simulated reminders / durable follow-ups" : a.key === "supervisor" ? "Coordinates approved case objectives through independent durable specialist tasks." : "Published v1 / scheduled simulated outreach / attributed replies / meaningful-update comparison."}</p></article>`).join("")}</div>`;
   $("#load-more").hidden = !(state.view === "tasks"
     ? state.next
     : state.view === "activity"
@@ -355,6 +355,7 @@ function renderSupervisor() {
 }
 const eventTitles = {
   "client.review_decided": "Teammate recorded a client-report decision",
+  "records.reminder_sent": "Simulated provider reminder sent",
   "series.occurrence_created": "Recurring check-in created",
   "series.controlled": "Check-in series control recorded",
   "series.ended": "Check-in series ended",
@@ -462,6 +463,10 @@ function renderDetail() {
   $("#detail-heading").innerHTML =
     `${badge(t.task_type === "case.coordination" ? state.overview.supervisors?.find((s) => s.group_task_id === t.id)?.status || t.status : t.status)}<h2>${e(t.objective)}</h2><dl class="detail-props"><dt>Task ID</dt><dd><code>${e(t.id)}</code></dd><dt>Assigned to</dt><dd>${agent(t)}</dd><dt>Case</dt><dd>${e(caseName(t))}</dd><dt>Part of</dt><dd>${e(group?.objective || "Standalone task")}</dd><dt>Next step</dt><dd>${e(reason || "Agent will assess the task.")}</dd>${outcome?.wake_at ? `<dt>Scheduled wake</dt><dd>${e(date(outcome.wake_at, true))}</dd>` : ""}<dt>Workflow</dt><dd><code>${e(t.workflow_id || t.check_in_series?.workflow_id || state.overview.supervisors?.find((s) => s.group_task_id === t.id)?.workflow_id)}</code></dd></dl>${t.records_request ? `<div class="requirements">${t.records_request.requirements.map((r) => `<span>${e(statusName(r.record_type))} / ${r.all_dates ? "all dates" : `${e(r.from_date)} ${e(r.through_date)}`}</span>`).join("")}<span>${e(statusName(t.records_request.status))}</span></div>${!closed(t) ? '<button class="text-button" data-provider>Simulate provider response</button>' : ""}` : ""}`;
   $("#detail-heading").insertAdjacentHTML("beforeend", clientReviewHTML(t) + seriesHTML(t));
+  if (t.records_request?.reminders_enabled) {
+    const r = t.records_request;
+    $("#detail-heading").insertAdjacentHTML("beforeend", `<p class="inline-note">Simulated reminders: ${r.reminder_count} / ${r.max_reminders}${r.next_reminder_at ? ` / Next due ${e(date(r.next_reminder_at,true))}` : ""}. Existing contact restrictions remain enforced.</p>`);
+  }
   $$(".detail-tabs button").forEach((b) =>
     b.classList.toggle("selected", b.dataset.tab === state.tab),
   );
@@ -789,7 +794,7 @@ $("#create-form").addEventListener("submit", async (ev) => {
         parent_task_id: $("#create-parent").value || null,
         patient_contact_id: $("#create-patient").value,
         provider_contact_id: $("#create-provider").value,
-        agent_version: 2,
+        agent_version: 3,
         objective: $("#create-objective").value,
         requirements,
       }),

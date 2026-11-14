@@ -1,6 +1,7 @@
 """Medical-records business adapter and the original analysis-only agent factory."""
 
 import json
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from agents import Agent, Model, ModelResponse, Usage
@@ -9,6 +10,7 @@ from openai.types.responses import (
     ResponseOutputMessage,
     ResponseOutputText,
 )
+from pydantic import Field
 from sqlalchemy import select
 
 from agents_platform.domains import DomainSnapshot, DomainValidation, ToolResult, ToolSpec
@@ -32,6 +34,10 @@ class RecordsInput(Contract):
     request_id: UUID
 
 
+class ReminderArguments(Contract):
+    occurrence: int = Field(ge=1, le=3)
+
+
 class MedicalRecordsAdapter:
     key = "medical_records"
     version = 1
@@ -41,6 +47,13 @@ class MedicalRecordsAdapter:
     output_schemas = ("records_decision.v1", "specialist_result.v1")
     decision_type = RecordsDecision
     tools = (
+        ToolSpec(
+            "send_records_reminder",
+            "Send the next due simulated reminder; maximum three per task.",
+            "contact",
+            ReminderArguments,
+            task_key=lambda args: f"records-reminder/{args.occurrence}",
+        ),
         ToolSpec("get_provider_details", "Look up this task's simulated provider.", "read"),
         ToolSpec(
             "send_records_request",
@@ -66,8 +79,25 @@ class MedicalRecordsAdapter:
         if request is None:
             raise ValueError("Records assignment has no matching request")
         view = (await read_task(session, task.tenant_id, task.id)).model_dump(mode="json")
+        reminder = {
+            "enabled": task.agent_version >= 3,
+            "count": request.reminder_count,
+            "maximum": request.max_reminders,
+            "interval_seconds": request.reminder_interval_seconds,
+            "next_occurrence": request.reminder_count + 1,
+            "next_due_at": request.next_reminder_at.isoformat()
+            if request.next_reminder_at
+            else None,
+            "is_due": bool(
+                task.agent_version >= 3
+                and request.next_reminder_at
+                and request.next_reminder_at <= datetime.now(timezone.utc)
+                and request.status in ("SENT", "PENDING")
+                and request.reminder_count < request.max_reminders
+            ),
+        }
         return DomainSnapshot(
-            state={"records_request": view["records_request"]},
+            state={"records_request": view["records_request"], "reminder": reminder},
             instruction_provider_ids=(request.provider_contact_id,),
             task_fields={"records_request": view["records_request"]},
             action_requirements={
@@ -99,7 +129,44 @@ class MedicalRecordsAdapter:
         elif name == "send_records_request":
             if request.status == "DRAFT":
                 request.status = "SENT"
+                if task.agent_version >= 3:
+                    request.next_reminder_at = datetime.now(timezone.utc) + timedelta(
+                        seconds=request.reminder_interval_seconds
+                    )
             data = {"request_ref": f"SIM-{request.id}", "simulated": True}
+        elif name == "send_records_reminder":
+            if task.agent_version < 3:
+                raise ValueError("This pinned agent version cannot send reminders")
+            if request.status not in ("SENT", "PENDING"):
+                raise ValueError("Reminders require an outstanding sent request")
+            if (
+                arguments.occurrence != request.reminder_count + 1
+                or request.reminder_count >= request.max_reminders
+            ):
+                raise ValueError("Reminder occurrence is not the next permitted occurrence")
+            if request.next_reminder_at is None or request.next_reminder_at > datetime.now(
+                timezone.utc
+            ):
+                raise ValueError("Reminder is not due")
+            request.reminder_count += 1
+            request.next_reminder_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=request.reminder_interval_seconds)
+                if request.reminder_count < request.max_reminders
+                else None
+            )
+            return ToolResult(
+                {
+                    "occurrence": arguments.occurrence,
+                    "request_ref": f"SIM-{request.id}",
+                    "summary": f"Simulated provider reminder {arguments.occurrence} sent.",
+                    "next_due_at": request.next_reminder_at.isoformat()
+                    if request.next_reminder_at
+                    else None,
+                    "simulated": True,
+                },
+                source_kind="SIMULATED_RECORDS_REMINDER",
+                event_type="records.reminder_sent",
+            )
         elif name == "check_request_status":
             evidence_ids = tuple(
                 (
@@ -171,24 +238,51 @@ class MedicalRecordsAdapter:
             request.status != "RECEIVED" or covered != {r.id for r in requirements}
         ):
             raise ValueError("Completion requires saved evidence for every required item")
-        invalid = action.type == "wait" and request.status == "DRAFT"
-        replans = task.progress_json.get("draft_replans", 0)
+        if (
+            task.agent_version >= 3
+            and action.type == "wait"
+            and request.status != "RECEIVED"
+            and request.reminder_count >= request.max_reminders
+        ):
+            action = self.review(
+                "Simulated reminder limit reached; "
+                "teammate review or a provider update is required."
+            ).next_action
+        due_reminder = bool(
+            task.agent_version >= 3
+            and action.type == "wait"
+            and request.status in ("SENT", "PENDING")
+            and request.next_reminder_at
+            and request.next_reminder_at <= datetime.now(timezone.utc)
+            and request.reminder_count < request.max_reminders
+        )
+        invalid_draft = action.type == "wait" and request.status == "DRAFT"
+        invalid = invalid_draft or due_reminder
+        replans = task.progress_json.get("reminder_replans" if due_reminder else "draft_replans", 0)
         feedback = None
         if invalid:
             feedback = (
-                "Wait rejected: request is still DRAFT. "
-                "Send it once or explain why human review is needed."
+                f"Wait rejected: simulated reminder {request.reminder_count + 1} is due. "
+                "Send the next permitted reminder or request human review."
+                if due_reminder
+                else (
+                    "Wait rejected: request is still DRAFT. "
+                    "Send it once or explain why human review is needed."
+                )
             )
             if replans >= 2:
                 action = self.review(
-                    "Agent repeatedly tried to wait on an unsent request. Review the draft."
+                    "Agent repeatedly waited without a due reminder. Review the follow-up."
+                    if due_reminder
+                    else "Agent repeatedly tried to wait on an unsent request. Review the draft."
                 ).next_action
         return DomainValidation(
             action=action,
             rejected=invalid,
             replan_reason=feedback if invalid and replans < 2 else None,
             progress={
-                "draft_replans": replans + 1 if invalid else 0,
+                "draft_replans": replans + 1 if invalid_draft else 0,
+                "reminder_replans": replans + 1 if due_reminder else 0,
                 "validation_feedback": feedback,
                 "outstanding_requirement_ids": [
                     str(r.id) for r in requirements if r.id not in covered
@@ -205,6 +299,10 @@ class ScriptedModel(Model):
         self.plan = ["get_provider_details"]
         if context["task"]["records_request"]["status"] == "DRAFT":
             self.plan.append("send_records_request")
+        reminder = context.get("domain", {}).get("state", {}).get("reminder", {})
+        self.reminder_occurrence = reminder.get("next_occurrence", 1)
+        if reminder.get("enabled") and reminder.get("is_due"):
+            self.plan.append("send_records_reminder")
         self.plan.append("check_request_status")
         self.turn = 0
 
@@ -216,7 +314,9 @@ class ScriptedModel(Model):
                 ResponseFunctionToolCall(
                     type="function_call",
                     name=name,
-                    arguments="{}",
+                    arguments=json.dumps({"occurrence": self.reminder_occurrence})
+                    if name == "send_records_reminder"
+                    else "{}",
                     call_id=f"demo-call-{self.turn}",
                     id=f"demo-call-{self.turn}",
                 )

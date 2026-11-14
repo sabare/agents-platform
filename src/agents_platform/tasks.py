@@ -64,6 +64,10 @@ async def read_task(session: AsyncSession, tenant_id: UUID, task_id: UUID) -> Ta
             patient_contact_id=request.patient_contact_id,
             provider_contact_id=request.provider_contact_id,
             status=request.status,
+            reminders_enabled=(task.agent_version or 0) >= 3,
+            reminder_count=request.reminder_count,
+            max_reminders=request.max_reminders,
+            next_reminder_at=request.next_reminder_at,
             requirements=[
                 RequirementView(
                     id=item.id,
@@ -376,6 +380,8 @@ async def receive_provider_update(session, tenant_id, task_id, body: ProviderUpd
                     )
                 )
         request.status = body.status
+        if body.status == "RECEIVED":
+            request.next_reminder_at = None
         task.version += 1  # An older in-flight execution must re-read this update.
         event = ActivityEvent(
             id=uuid4(),

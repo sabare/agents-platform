@@ -275,7 +275,8 @@ class TaskActivities:
                 argument_hash = hashlib.sha256(
                     json.dumps(arguments_json, sort_keys=True).encode()
                 ).hexdigest()
-                key = spec.task_key or (
+                action_key = spec.task_key(arguments) if callable(spec.task_key) else spec.task_key
+                key = action_key or (
                     f"{execution_id}/{name}"
                     if not arguments_json
                     else f"{execution_id}/{name}/{argument_hash}"
@@ -310,6 +311,19 @@ class TaskActivities:
                     )
                     session.add(source)
                     await session.flush()
+                    if domain_result.event_type:
+                        session.add(
+                            ActivityEvent(
+                                tenant_id=tenant_id,
+                                case_id=current.case_id,
+                                task_id=task_id,
+                                event_type=domain_result.event_type,
+                                producer="domain-tool",
+                                dedupe_key=f"{task_id}/{key}",
+                                actor_ref=f"agent/{current.agent_key}/{current.agent_version}",
+                                payload={"source_id": str(source.id), "tool": name, **result},
+                            )
+                        )
                     result = {
                         **result,
                         "source_id": str(source.id),

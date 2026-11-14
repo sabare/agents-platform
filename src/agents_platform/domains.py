@@ -1,5 +1,6 @@
 """Code-owned domain boundary. Adapters supply business rules, never workflow control."""
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal, Protocol
@@ -22,7 +23,9 @@ class ToolSpec:
     description: str
     effect: Literal["read", "contact"]
     arguments: type[Contract] = EmptyArguments
-    task_key: str | None = None  # A logical action that must happen once across activations.
+    task_key: str | Callable[[Contract], str] | None = (
+        None  # A logical action that must happen once across activations.
+    )
 
 
 @dataclass
@@ -30,6 +33,7 @@ class ToolResult:
     data: dict
     evidence_source_ids: tuple[UUID, ...] = ()
     source_kind: str = "TOOL_RESULT"
+    event_type: str | None = None
 
 
 @dataclass

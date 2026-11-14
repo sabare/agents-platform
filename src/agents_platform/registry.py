@@ -8,7 +8,9 @@ def load_definition(agent_key: str, version: int) -> dict:
     if (agent_key, version) not in {
         ("medical_records_collector", 1),
         ("medical_records_collector", 2),
+        ("medical_records_collector", 3),
         ("case_supervisor", 1),
+        ("case_supervisor", 2),
         ("client_check_in", 1),
     }:
         raise ValueError("Unknown agent definition")

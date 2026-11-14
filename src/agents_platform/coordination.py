@@ -244,7 +244,12 @@ async def submit_objective(session, tenant_id, case_id, body, key):
             raise TaskError(409, "Objective revision changed; reload and explicitly replace it")
         if not coord and body.expected_revision is not None:
             raise TaskError(409, "There is no objective to replace")
-        if await session.get(AgentVersion, ("case_supervisor", 1)) is None:
+        if (
+            await session.get(
+                AgentVersion, ("case_supervisor", coord.agent_version if coord else 2)
+            )
+            is None
+        ):
             raise TaskError(422, "Publish the supervisor definition with agents-seed first")
         for target in body.targets:
             for contact, roles in (
@@ -285,6 +290,7 @@ async def submit_objective(session, tenant_id, case_id, body, key):
                 group_task_id=group.id,
                 workflow_id=f"firm/{tenant_id}/case/{case_id}/supervisor",
                 objective_json={},
+                agent_version=2,
             )
             session.add(coord)
             await session.flush()
@@ -424,7 +430,7 @@ class SupervisorActivities:
                 "capabilities": [
                     {
                         "agent_key": "medical_records_collector",
-                        "version": 2,
+                        "version": 3 if coord.agent_version >= 2 else 2,
                         "stage": "durable_demo",
                     }
                 ],
@@ -726,6 +732,7 @@ class SupervisorActivities:
                     assignment = CreateRecordsTask(
                         case_id=coord.case_id,
                         parent_task_id=coord.group_task_id,
+                        agent_version=3 if coord.agent_version >= 2 else 2,
                         objective=f"Collect {record_names} from {provider.display_name}",
                         **target,
                     )
