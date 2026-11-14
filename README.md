@@ -1,21 +1,39 @@
 # HelloCounsel Agents Platform
 
-A working prototype for agent tasks that continue over time. A task is saved, an agent runs briefly, and Temporal waits for a timer or new information before running it again.
+A local prototype that helps a law-office teammate assign work, follow progress,
+and handle jobs that take days or months. The system saves the job, wakes an agent
+when needed, and remembers where it left off.
 
-The platform supports medical-records collection, scheduled client check-ins, a case supervisor, operator guidance, and shared memory/retrieval. All provider/client communication and document evidence are simulated. Agents can use real OpenAI calls or an explicitly labelled scripted mode.
+All client/provider messages and received documents are simulated. Agents can use
+scripted responses or real OpenAI model calls; outreach stays simulated in both modes.
 
-## Read the docs
+## Start here
 
-| Document | Read it for |
+| Question | Guide |
 |---|---|
-| [Architecture](docs/high-level-design.md) | How the layers work, why they exist, and what each workflow does |
-| [Memory and retrieval](docs/memory-and-retrieval.md) | What agents remember, how they request evidence, and how context stays bounded |
-| [Development and demos](docs/development.md) | Setup, commands, API entry points, tests, and adding another specialist |
-| [Roadmap and decisions](docs/roadmap.md) | What is unfinished, why we chose this design, and research references |
+| How do I assign work and follow it? | [Task assignment](docs/task-assignment.md) |
+| What are the parts, and how do they fit together? | [Architecture](docs/high-level-design.md) |
+| What do agents remember, and how do they search it? | [Memory and retrieval](docs/memory-and-retrieval.md) |
+| What happens when a rule changes or becomes obsolete? | [Memory lifecycle](docs/memory-lifecycle.md) |
+| How do I run, test or extend the code? | [Development](docs/development.md) |
+| What should we build next? | [Roadmap](docs/roadmap.md) |
 
-These documents describe the current code. Unbuilt capabilities appear only in the roadmap or explicit limitations, rather than being mixed into the implementation description.
+## What works today
 
-## Start locally
+- One task form, with **Supervisor** selected by default and direct specialist options.
+- Supervisor delegation of approved medical-records work into saved subtasks.
+- Medical-records collection, evidence checks and up to three simulated reminders.
+- One-off client check-ins and bounded recurring series, assigned by a person.
+- Client reply comparison and an explicit human-review loop for flagged reports.
+- Current rules loaded automatically; historical evidence available through search/read tools.
+- Memory review, replacement, resolution, note expiry and instruction retirement, with history retained.
+- Saved progress, timers, retry protection and recovery after worker restarts.
+
+**Still to build:** calendar-month schedules that wake the supervisor, and supervisor
+delegation to the check-in specialist. The existing recurring series waits an interval
+**after completion**; it is not a monthly calendar schedule. See the [next steps](docs/roadmap.md).
+
+## Run locally
 
 ```sh
 cp -n .env.example .env
@@ -23,31 +41,11 @@ docker compose up --build -d
 docker compose run --rm migrate python -m agents_platform.seed
 ```
 
-Open the [dashboard](http://localhost:8000), [API docs](http://localhost:8000/docs), or [Temporal UI](http://localhost:8233). The default operator key is `local-development-only`; use your configured `OPERATOR_API_KEY` if changed.
+Open the [dashboard](http://localhost:8000), [API reference](http://localhost:8000/docs)
+or [Temporal UI](http://localhost:8233). The default development operator credential
+is `local-development-only`. Default scripted mode needs no OpenAI key.
 
-Default `AGENT_MODE=scripted` needs no OpenAI key. For real model calls, set `AGENT_MODE=openai` and `OPENAI_API_KEY` in `.env`, then recreate API/worker containers. Provider and client operations remain simulated in either mode.
-
-## What works
-
-- Persistent, parent-linked tasks pinned to published agent versions.
-- Durable waiting, event wake-ups, bounded retries, and worker-restart recovery.
-- Records collection with evidence checks and duplicate-safe simulated sends.
-- One scheduled check-in and attributed reply per task, comparison with the client's prior report, and review of sensitive updates.
-- A case supervisor that delegates records work and monitors meaningful client updates.
-- Approved instruction revisions, obligations, task/case contact holds, historical keyword/vector search, and question-specific context tools.
-- A client-report human-review loop: explicit decisions/reasons, same-task resumption and supervisor outcomes, without clearing contact holds.
-- An operator dashboard with task progress, comments, history, tool results, usage and saved context.
-
-Broader approval/takeover flows beyond client-report review, recurring check-in series, temporal fact reconciliation and production integrations remain unfinished. This is a local prototype with a development operator credential, not production firm-user access control.
-
-## Check changes
-
-In an activated host environment installed with `pip install -e '.[dev]'`:
-
-```sh
-make check
-make test
-make smoke
-```
-
-`make smoke` requires PostgreSQL and Temporal, creates disposable test databases and isolated workflow queues, and does not clear application data. See [development](docs/development.md) for setup and validation limits.
+For updates to an existing database, follow the coordinated
+[upgrade procedure](docs/development.md#updating-an-existing-stack).
+This prototype uses a shared development credential; production user permissions
+and real messaging integrations remain unfinished.

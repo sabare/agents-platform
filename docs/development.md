@@ -1,8 +1,6 @@
-# Development and demos
+# Run and extend the platform
 
-## Local setup
-
-Use Docker Compose for PostgreSQL, Temporal, migrations, API and worker:
+## First setup
 
 ```sh
 cp -n .env.example .env
@@ -10,134 +8,174 @@ docker compose up --build -d
 docker compose run --rm migrate python -m agents_platform.seed
 ```
 
-Seeding creates fictional firm/case/contacts and published definitions. It is explicit and repeatable; published definitions are not overwritten. Tasks stay pinned to their assigned version.
+Seeding creates fictional contacts/cases and publishes agent definitions. It is
+repeatable and never overwrites an already published definition.
 
 | Surface | Address |
 |---|---|
 | Dashboard | http://localhost:8000 |
-| API docs | http://localhost:8000/docs |
+| Generated API reference | http://localhost:8000/docs |
 | Liveness / readiness | http://localhost:8000/health/live · http://localhost:8000/health/ready |
 | Temporal UI | http://localhost:8233 |
-| PostgreSQL | localhost:5432, database/user/password `agents` |
+| Local PostgreSQL | localhost:5432; database/user/password `agents` |
 
-The dashboard is served by FastAPI; no frontend build/server is required. The API docs remain available during infrastructure outages; readiness checks PostgreSQL and Temporal. The development operator key is entered through Swagger **Authorize** or dashboard connection settings. `OPERATOR_API_KEY` defaults to `local-development-only`; the OpenAI key stays on the server. This is not per-firm user authentication.
+Enter the operator credential through the dashboard connection settings or Swagger
+**Authorize**. It defaults to `local-development-only`. This credential grants local
+all-firm access; it is not production per-user authorization. OpenAI keys stay server-side.
 
-PostgreSQL and the Temporal development server use persistent volumes. `docker compose down` preserves them; `docker compose down -v` deletes them. Temporal's local server stores its state in SQLite and is not a production deployment.
+The dashboard is plain HTML/CSS/JavaScript served by FastAPI; it needs no frontend
+build server. PostgreSQL and Temporal use persistent volumes. `docker compose down`
+preserves them; adding `-v` deletes them. Temporal's local development server is not
+a production deployment.
 
-For host development and demo scripts:
+## Updating an existing stack
+
+Build first. Stop API and worker before a schema migration so old and new memory
+storage layouts cannot be used at the same time. Take a database backup before
+migration; use a fresh backup filename each time.
+
+```sh
+docker compose build api worker migrate
+docker compose stop api worker
+mkdir -p work/backups
+umask 077
+docker compose exec -T postgres pg_dump -U agents agents > work/backups/pre-upgrade.sql
+docker compose run --rm --no-deps migrate
+docker compose up -d --no-deps --wait api worker
+docker compose run --rm --no-deps migrate python -m agents_platform.seed
+```
+
+Check readiness and logs. If migration fails, keep the application processes stopped
+until the failure is resolved. Memory downgrade deliberately refuses to discard
+lifecycle settings that older code could not enforce. Definition seeding publishes
+new versions; it does not silently upgrade existing tasks or coordinators.
+
+## Host development and modes
 
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[dev]'
-```
-
-To run API/worker on the host, start only infrastructure and then use separate activated terminals:
-
-```sh
+python -m pip install -c constraints-runtime.txt -e '.[dev]'
 docker compose up -d postgres temporal
 make migrate seed
 make api
-# In another activated terminal:
+# Another activated terminal:
 make worker
 ```
 
-Choose host or Compose API/worker processes for development. Both use the same configured database, namespace and task queue unless changed.
+Choose host or Compose API/worker processes; they otherwise share the configured
+database and task queue. `constraints-runtime.txt` pins the tested runtime dependencies.
+Docker caches their installation separately from source changes.
 
-## Modes and configuration
+`.env.example` lists settings. `AGENT_MODE=scripted` uses deterministic SDK responses;
+`AGENT_MODE=openai` requires `OPENAI_API_KEY`. Durable definitions select their model.
+`OPENAI_MODEL` configures the legacy CLI scaffold. Outreach remains simulated.
 
-`.env.example` lists configuration. `AGENT_MODE=scripted` uses deterministic SDK model responses for offline demos/tests. `AGENT_MODE=openai` requires `OPENAI_API_KEY`. Published durable definitions select their model; `OPENAI_MODEL` configures the original CLI scaffold. Real model calls do not make provider/client integrations real.
+Demo defaults are a 30-second follow-up cap and six automatic specialist cycles
+before review. Context defaults are 12,000 estimated input tokens, 1,500 output
+tokens and four retrieval/read calls per activation. These are demo/per-call limits,
+not a complete run-cost policy. See [memory and retrieval](memory-and-retrieval.md).
 
-`DEMO_FOLLOW_UP_SECONDS` defaults to 30 and caps specialist follow-up delays. `DEMO_MAX_ACTIVATIONS` defaults to six and bounds automatic follow-up cycles before review. Context input/output/call limits are described in [memory and retrieval](memory-and-retrieval.md).
+## Product walkthrough and demos
 
-After changing code or Compose environment, rebuild/recreate the affected services:
+Start with [task assignment](task-assignment.md). Supervisor is the default in the
+shared task form. Records delegation is implemented; supervisor check-in delegation
+and monthly calendar triggers are not. The existing check-in series uses a fixed
+delay after completion. **Memory & context** exposes the new memory lifecycle controls.
 
-```sh
-docker compose up --build -d api worker
-docker compose logs -f api worker
-```
-
-## Walk through the product
-
-Use the dashboard to create a records task or client check-in. Open a task for comments, event history, executions, tool results, usage and starting context. A plain comment is recorded; use **Wake assigned agent** for an explicit specialist wake. Supervisor mentions wake configured case coordination.
-
-A blocked sensitive client report shows a **Teammate review** panel on every task tab. Choose **Allow completion** or **Request changes**, enter a reason, and record the decision. The same task and case supervisor wake. Allow completion acknowledges only that report; requesting changes leaves its review open. Other restrictions remain active. Decisions appear in task history and the supervisor overview.
-
-The memory/context area supports obligations, task/case/provider holds, explicit resolution, history search and source inspection. Provider updates and client replies are entered through simulation controls. Instruction revisions and focused retrieval are also available through the API; not every API has a dedicated dashboard editor.
-
-In **Supervisor**, submit an objective with approved records targets. The current UI supports one provider with all dates; the API supports up to ten explicit targets. Editing preserves existing multi-provider/date scope. Client check-ins are manually assigned and monitored; autonomous check-in delegation is not implemented.
-
-## Demo scripts
-
-Run from the repo in the activated host environment while the stack is up:
+Tracked demo commands, run in the activated host environment against the local stack:
 
 | Command | Demonstrates |
 |---|---|
-| `python examples/demo.py --restart-worker` | Records request, durable wait, worker restart, simulated receipt and completion |
-| `python examples/supervisor_demo.py --restart-worker` | Objective replay, duplicate-safe delegation, specialist completion and objective verification |
-| `python examples/memory_demo.py` | Old evidence retrieval, case hold/release, obligations and worker restart |
-| `python examples/client_review_demo.py` | Blocked report → guidance → explicit acknowledgement → same-task completion → supervisor outcome |
-| `python examples/check_in_demo.py` | Scheduled sends, baseline/changed client reports, restart recovery and teammate review |
+| `python examples/demo.py --restart-worker` | Records collection, waiting, restart and completion |
+| `python examples/supervisor_demo.py --restart-worker` | Records delegation, reuse and objective verification |
+| `python examples/memory_demo.py` | Evidence retrieval, holds, obligations and restart |
+| `python examples/check_in_demo.py` | Scheduled messages, changed replies and review |
+| `python examples/client_review_demo.py` | Guidance, explicit acknowledgement and same-task resumption |
 
-Scripts create fictional data. Restart scenarios stop/restart the Compose worker and temporarily affect other local demo work. They never send real communications. The legacy `agents-platform "assignment"` CLI calls specialists inline; it is not the durable API/worker path. `agents-platform --check` only checks its wiring.
+Demos add fictional data. Restart scenarios briefly stop the shared local worker.
+The original `agents-platform "assignment"` CLI calls specialists inline; the durable
+product path uses the API, saved tasks, dispatcher and worker.
 
-## Main API entry points
+## Main API paths
 
-All business routes use the development operator credential. Prefix these with `/v1/firms/{firm}` and use [Swagger](http://localhost:8000/docs) for exact fields and generated schemas.
+Prefix these with `/v1/firms/{firm}`. Use [Swagger](http://localhost:8000/docs) for
+exact request/response schemas. Creation/intake uses `Idempotency-Key`: exact retries
+reuse the saved result; conflicting reuse returns `409`.
 
 | Route | Purpose |
 |---|---|
-| `POST /tasks/medical-records` | Create a records assignment; example body in `examples/medical-records-task.json` |
-| `POST /tasks/{task}/provider-updates` | Simulate `PENDING` or `RECEIVED`; received documents are synthetic |
-| `POST /tasks/client-check-in` | Schedule one check-in for a case/client with a timezone-aware send time |
-| `POST /tasks/{task}/client-replies` | Record one attributed reply after the simulated send |
-| `POST /tasks/{task}/client-reviews/{review}/decisions` | Decide a blocked report using `decision`, `reason`, `expected_task_version` and `expected_review_version`; requires `Idempotency-Key` |
-| `GET /cases/{case}/client-reports` | Latest 100 reports; optional client filter |
-| `GET/POST /cases/{case}/supervisor` | Read coordinator state or submit/replace a records objective |
-| `GET /tasks/{task}` | Read current state and domain projection |
-| `GET /tasks/{task}/events` | Read timeline |
-| `GET /tasks/{task}/executions` | Read saved context, tools, decisions, outcome and usage |
+| `POST /tasks/medical-records` | Assign records work; sample in `examples/medical-records-task.json` |
+| `POST /tasks/{task}/provider-updates` | Simulate provider progress or synthetic document receipt |
+| `POST /tasks/client-check-in` | Schedule one client check-in |
+| `POST /tasks/{task}/client-replies` | Save one attributed reply after sending |
+| `POST /tasks/{task}/client-reviews/{review}/decisions` | Allow completion or request changes, with reason and current task/review versions |
+| `GET/POST /cases/{case}/check-in-series` | List/create a bounded fixed-delay series |
+| `POST /cases/{case}/check-in-series/{series}/control` | PAUSE, RESUME or STOP, with reason and current version |
+| `GET /cases/{case}/client-reports` | Read the latest 100 reports, optionally filtered by client |
+| `GET/POST /cases/{case}/supervisor` | Read or explicitly update the records objective |
+| `GET /tasks/{task}`, `/events`, `/executions` | Inspect state, timeline and execution evidence |
+| `POST /cases/{case}/context/retrieve`, `/context/read` | Use the scoped search/read service directly |
 
-Creation/intake endpoints require `Idempotency-Key`: same key/body reuses the result; conflicting reuse returns `409`. Replacing a supervisor objective requires its `expected_revision`. Terminal records tasks reject late updates. A check-in accepts one reply; another check-in requires another task. Memory/retrieval routes are listed in the [memory guide](memory-and-retrieval.md).
+[Memory lifecycle](memory-lifecycle.md) lists memory/review/instruction routes.
+Operator workspace, overview, list and activity routes live under `/v1/operator`.
 
-Client review decisions are `ALLOW_COMPLETION` or `REQUEST_CHANGES`. A successful response includes the current review, saved decision and task version; replay returns `replayed: true`. The task itself resumes through its existing workflow rather than being completed directly by the HTTP request. `ClientReport.needs_review` remains the original flag; API `needs_review` reflects current effective review state, while `flagged_for_review` retains the original value. `human_review` includes the question, version, last decision, reason, local actor and decision-source reference. Changed evidence sets `review_stale` and prevents completion. The narrow API does not resolve records/objective reviews or consent holds.
+Series require a timezone-aware first due time, an interval of at least 60 seconds,
+and a count limit or end date. The hard cap is 100 occurrences. One live series per
+client/case is allowed; existing open check-ins/reviews prevent overlap. Stop is final.
 
-## Checks and evidence
+Records v3 reminder occurrences are 1–3. Backend checks enforce order, due time,
+current request state, contact holds and stable `records-reminder/N` action keys.
+The default demo policy uses three reminders at 30-second intervals.
+
+Client-report decisions are `ALLOW_COMPLETION` or `REQUEST_CHANGES`; they resume
+the same task and do not clear restrictions. Changed report evidence invalidates
+acknowledgement. This is not a general takeover or records-approval API.
+
+## Checks
 
 ```sh
-make check   # Ruff lint/format and CLI wiring
-make test    # Tests without external infrastructure
-make smoke   # PostgreSQL + Temporal integration tests
+make check   # Lint, formatting and CLI wiring
+make test    # Tests without infrastructure
+make smoke   # PostgreSQL and Temporal integration tests
 ```
 
-Integration tests create disposable databases and isolated workflow queues. PostgreSQL test credentials need create/drop-database permission; `TEST_POSTGRES_ADMIN_URL` can override the default local connection. Tests do not clear the application database. Use `pytest --collect-only -q` for the current inventory rather than treating a count in prose as a guarantee.
+Integration tests use disposable databases and isolated queues, not the application
+database. Test credentials need create/drop-database permission;
+`TEST_POSTGRES_ADMIN_URL` overrides the default connection. Use
+`pytest --collect-only -q` for the current test inventory.
 
-Coverage includes scope/relationship checks, duplicate intake, transactional rollback, migrations, restart/timer recovery, stale decisions, completion evidence, contact holds, client-report comparisons and SDK tool invocation. Human-review tests cover same-task completion, guidance without premature closure, version conflicts, concurrent/replayed decisions, scope/authentication, transactional rollback, contact holds/obligations, migration backfill and worker restart with a decision saved offline. Focused retrieval tests include 240 distracting updates across seven months, provider/date selection, exact/vector scope checks, evidence pagination and context overflow.
+Coverage includes scope isolation, replay/duplicates, rollback, migration backfill,
+waiting/restarts, evidence checks, report reviews, reminders and series controls.
+Memory tests cover archived capacity, note expiry, effective-date fencing, separate
+activation/review timers, instruction retirement and stale historical evidence.
+Retrieval tests include seven months of distracting history, filters and overflow.
+Scripted models and synthetic vectors test execution behavior; they do not establish
+real-model answer quality or months of continuous production operation.
 
-Scripted tests establish execution behavior, not real-model answer quality. Synthetic vectors establish SQL ranking/isolation, not embedding relevance. Past real-model demos are useful smoke checks, not a production benchmark or proof of months of continuous operation. This documentation cleanup does not rerun those demos.
+## Code map and adding a specialist
 
-## Add another specialist
+All modules below are under `src/agents_platform/`.
 
-`domains.py` defines the code-owned adapter contract. `medical_records.py` and `client_check_in.py` are the two shipped adapters.
-
-1. Define typed assignment/result schemas and saved domain state.
-2. Implement `load`, tool declarations, `execute_tool`, `validate`, `review` and a scripted test model. `load` supplies domain state and relevant provider IDs; `validate` supplies evidence checks and a next action.
-3. Register the task-type/input-schema/agent-key binding. Unknown bindings, unsupported tools/results and incompatible saved adapter versions fail closed.
-4. Publish a new immutable agent definition, add intake/update APIs and UI where needed, and test the workflow end to end. Supervisor delegation needs explicit support; registering an adapter does not add automatic planning for it.
-
-The shared executor owns identity, snapshots, versions, memory, domain-tool allowlists, tool-result persistence, task transitions and Temporal outcomes. Contact tools declare a stable task-scoped logical action key; reads use activation/arguments. Adapters use the supplied scoped transaction and do not commit or control workflows. They cannot overwrite core task fields, operational memory or reserved platform progress.
-
-Adapters are trusted application code, not sandboxed plugins. Their version is saved on executions; incompatible changes need migration or retained old support. The registry currently has one binding per task/input/agent combination. The receipt adapter in tests is not registered in the application.
-
-## Code map
-
-All Python modules below are in `src/agents_platform/`.
-
-| Area | Files |
+| Area | Main files |
 |---|---|
-| HTTP and dashboard | `api.py`, `task_api.py`, `check_in_api.py`, `client_reviews.py`, `supervisor_api.py`, `dashboard.py`, `static/` |
-| Tasks and storage | `tasks.py`, `models.py`; schema history in root `migrations/` |
-| Durable execution | `dispatch.py`, `orchestration/workflows.py`, `orchestration/worker.py` |
-| Agent runtime and domains | `execution.py`, `coordination.py`, `domains.py`, `medical_records.py`, `client_check_in.py` |
-| Memory and retrieval | `memory.py`, `memory_api.py`, `memory_history.py`, `context.py` |
-| Published behavior | `definitions/`, `registry.py`, `seed.py` |
+| API/UI | `api.py`, `dashboard.py`, domain API modules, `static/` |
+| Storage | `models.py`, `tasks.py`; root `migrations/` |
+| Durable coordination | `coordination.py`, `dispatch.py`, `orchestration/` |
+| Specialist execution | `execution.py`, `domains.py`, `medical_records.py`, `client_check_in.py` |
+| Current memory and lifecycle | `memory.py`, `memory_lifecycle.py`, `memory_api.py` |
+| Indexing and context tools | `memory_history.py`, `context.py` |
+| Published definitions | `definitions/`, `registry.py`, `seed.py` |
+
+`supervisor.py` belongs to the legacy inline CLI path; `coordination.py` implements
+the durable case supervisor used by the dashboard.
+
+To add a specialist: define typed inputs/results and saved state; implement its
+adapter's load/tools/execute/validate/review behavior; register the binding; publish
+an immutable definition; add intake/update surfaces and end-to-end tests. Supervisor
+delegation needs separate explicit support. Registering an adapter does not add it
+to the supervisor's planning choices.
+
+The shared runtime owns identity, versions, memory, action keys, saved effects and
+workflow outcomes. Adapters are trusted application code and use its supplied
+transaction. They cannot overwrite core task fields or operational memory.

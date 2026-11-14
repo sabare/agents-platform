@@ -1,125 +1,103 @@
-# Memory and context retrieval
+# Memory and retrieval
 
-Reviewed against the code on 14 November 2026. This is the current implementation, including the focused retrieval service.
+Think of **memory as the filing cabinet** and **context as the briefing an agent
+gets for one turn**. Both live in the existing PostgreSQL system; the model does
+not retain an endless private conversation.
 
-## Three kinds of information
+## What is stored
 
-| Kind | Storage and selection | Authority |
+| Information | Storage | How it reaches the agent |
 |---|---|---|
-| Current operational state | Task/domain state, approved instruction revisions, open obligations and applicable task/case holds; selected directly with SQL | Current controls and responsibilities, checked by backend code |
-| Original evidence | Sources and activity events, linked to case/task identities | What was received or observed; not automatically verified truth |
-| Supporting history | Derived passages, embeddings and a source-linked digest | Searchable evidence; cannot grant permission or prove completion |
+| Current firm/provider instructions | `instructions`, with `instruction_revisions` history | Loaded directly for the applicable scope |
+| Task holds, obligations and notes | `task_memory_items` | Effective open controls load directly; notes are optional |
+| Case-wide/provider-specific holds | `case_restrictions` | Applicable effective open holds load directly |
+| Work and progress | Tasks, case coordination, check-ins and series tables | Current task/case state loads directly |
+| Original evidence and changes | `sources` and `activity_events` | New relevant events/sources and explicit evidence reads |
+| Searchable history | `memory_passages`, `memory_summaries`, query embeddings | Selected search results and a small source-linked digest |
 
-Mandatory memory always loads, regardless of age or similarity. A months-old open restriction does not need to win a vector search. Each activation records selected instruction/item revisions, source IDs and a fingerprint. The specialist checks task version and memory again before a simulated action and final commit; the supervisor also checks its saved plan/task/memory state.
+Scopes overlap: firm rules, provider instructions within that firm, case holds and
+task-specific responsibilities. There is no blanket "most specific wins" rule.
+Task parent/child structure is not automatic inheritance of every memory item.
+A provider identity never authorizes reading another firm's case.
 
-Approved instructions have immutable revision history. An operator publishes a revision with a reason. Task obligations and stop-contact items require explicit resolution or an authorized replacement; holds do not expire automatically. Task memory now uses normalized `task_memory_items` rows, with active, archived and scheduled items kept separate in the briefing. Review dates never lift a hold. Only optional informational notes can expire automatically. Whole-case or provider-specific case holds apply to existing and future tasks. A free-text “stop” comment does not automatically create a typed restriction. Resolving an item records the operator's reason; it does not establish that consent is legally sufficient.
+## What loads automatically
 
-## Indexing and search
+When an activation starts, application code prepares current work state, applicable
+instructions, effective open restrictions/obligations, new events, and supporting
+history. Specialist context concerns its task; the supervisor gathers case work.
 
-A durable background workflow reads saved sources in batches, creates passages and refreshes the case digest. It polls roughly every 15 seconds, faster while draining a backlog, and resumes after restarts. Derived text commits before embedding calls; embedding failures retain keyword search and retry with backoff.
+Multiple model calls inside that activation use the saved starting snapshot, packed
+to fit each call. The system does not reread the entire database before every model
+call. It rechecks current versions/memory before specialist actions and commits;
+the supervisor checks its plan/task/memory state before committing proposals.
+Changes can invalidate a decision and require a fresh activation.
 
-Current choices:
+An old restriction remains important until explicitly resolved or replaced.
+Obsolete instructions can be retired. These operations and their audit history are
+explained in [memory lifecycle](memory-lifecycle.md).
 
-- Source content is serialized as JSON and split into 1,600-character passages with 200-character overlap. These are simple cuts, not document-section-aware chunks.
-- Embeddings use `text-embedding-3-small`, 1,536 dimensions. Scripted mode does not generate fake embeddings. Changing the embedding profile requires reindexing/migration.
-- Exact source ID/key lookup works before indexing. PostgreSQL full-text search and exact vector-distance ranking operate within the authorized firm/case. There is a text-search index; approximate vector indexes are not used.
-- Rank fusion combines keyword and vector candidate lists. Vector search needs both source and query embeddings; missing embeddings leave keyword search working.
-- Passages and digests carry source hashes. Changed/missing sources invalidate their derived copies until rebuilt.
-- The versioned digest contains excerpts from eight recent sources, with coverage and references. It is not a generated summary of the whole case.
+## Ingestion: making incoming information searchable
 
-Current time filters use **source recording time**, not symptom/treatment dates or when a fact became true. The system does not yet reconcile contradictory historical claims into a dated current-fact model.
+1. Intake code saves a reply, update or other source with firm/case identity.
+2. A durable background worker reads saved sources in batches.
+3. It serializes source JSON and cuts it into 1,600-character passages with
+   200 characters of overlap. Each passage retains its original source reference/hash.
+4. Keyword search can use those passages. When enabled, embeddings add meaning search.
+5. A small digest keeps excerpts from the eight latest sources, with links and coverage.
 
-## Agent-requested context
+The digest is not a complete AI-written case summary. Chunk boundaries are simple
+text cuts, not document sections. The worker normally polls every 15 seconds and
+speeds up for a backlog. Embedding failures leave keyword search working and retry
+with backoff. Exact source lookup works before indexing.
 
-Both specialist and supervisor SDK paths receive platform-owned read-only tools, separately from published domain tools:
+Embeddings use `text-embedding-3-small`, 1,536 dimensions, stored through `pgvector`.
+Scripted mode does not invent embeddings. Changed sources invalidate stale derived
+passages/digests until rebuilt.
 
-| Tool | Use |
-|---|---|
-| `retrieve_context` | Ask a specific historical question, optionally filtering by an authorized case provider and recording-date interval |
-| `read_evidence` | Expand a source; continue long content with `next_offset` and `expected_hash` |
+## The two agent tools
 
-Identity comes from the execution, not agent-supplied firm/case arguments. Provider filters require a case participant with the medical-provider role and use saved event/request, evidence or backend tool-source links. Unlinked sources are excluded by a provider filter; provider names do not establish those links.
+**`retrieve_context` finds relevant passages.** The agent supplies a question and
+optional provider/recording-date filters. Execution code supplies the trusted firm
+and case IDs. The service validates access, then searches by exact source ID/key,
+PostgreSQL full-text matching and, when embeddings exist, cosine-distance similarity.
+It combines rankings using reciprocal rank fusion, removes duplicate text within
+a source, and returns up to six passages from at most 12 candidates within budget.
+There is no learned reranker. Vector ranking is exact over the authorized subset.
 
-Retrieval considers up to 12 fused candidates, removes identical passage text within each source, and returns at most six passages within the requested response budget. Separate reports with the same wording retain their own source IDs, dates and event links. This is rank fusion and duplicate removal, not a learned reranker. Results include source IDs/hashes, timestamps, linked event IDs, applied filters, search method, unindexed-source count and truncation. An empty or partially indexed result is not proof that something never happened.
+**`read_evidence` opens an original source.** The agent supplies its source ID.
+The service checks case access and returns a bounded portion of the saved JSON.
+`next_offset` continues long content; `expected_hash` prevents continuing across a
+changed source. Offsets are characters in serialized JSON, capped at one million.
 
-Reads can expand unindexed sources. Their offsets refer to characters in serialized source JSON. Supplying the returned hash prevents continuation across a changed revision. The prototype caps read offsets at one million characters.
+Results include source IDs, hashes, recording times and linked events. Historical
+memory sources also carry their current lifecycle state. Search reports incomplete
+indexing/truncation; an empty result does not prove an event never happened.
+Arguments/results are saved in the tool ledger, and identical requests in an
+execution reuse the saved response. The default limit is four calls per activation.
 
-Requests are serialized and capped per activation. Invocation arguments/results are saved in the existing tool ledger; identical repeated requests reuse their saved response. Retrieval does not create new Sources from its results. Historical citations remain separate from domain completion evidence.
+Date filters use **when a source was recorded**, not when a symptom started or a
+fact became true. Automatic reconciliation of contradictory historical claims is
+still unbuilt. Current lifecycle metadata does not change those search semantics.
 
-## One budget before every model call
+## Who decides what matters?
 
-The full starting snapshot remains saved on the execution. A model-facing copy is packed before each SDK call, including later calls after tools have added history.
+Application rules select mandatory current controls. Search ranking selects
+historical passages that match a question. The agent interprets the supplied
+information and can ask for more. A relevance score cannot lift a restriction,
+approve an action or prove the work is complete.
 
-The filter counts instructions, tool schemas, structured-output schema and messages using `o200k_base`, with extra message/serialization reserves. This is an estimate, not provider billing-token accounting. Other model families require tokenizer validation.
+## Keeping the briefing small
 
-| Setting | Default |
-|---|---:|
-| `CONTEXT_INPUT_TOKENS` | 12,000 estimated input tokens per call |
-| `CONTEXT_OUTPUT_TOKENS` | 1,500 output tokens per call |
-| `CONTEXT_RETRIEVAL_CALLS` | 4 retrieval/read calls per activation |
-| Retrieval/read `max_tokens` | 1,800; allowed range 256–2,500 |
+Defaults are 12,000 estimated input tokens per call, 1,500 output tokens and four
+retrieval/read calls per activation. Each context response defaults to 1,800 tokens
+and can request 256–2,500. The budget includes instructions, schemas and messages.
 
-Packing removes duplicated instructions, reduces optional historical passages/digest/recent events, and replaces large supporting source bodies with excerpts and expansion references. All retrieval/read results remain available when they fit. Only when the input still exceeds the budget do older evidence bodies become source references, oldest first. Their IDs, hashes, dates, event links and read offsets remain available for expansion. The newest evidence result, call/output pairs and domain-action results remain intact. Usage records show estimated tokens, selected initial source IDs, omissions and compaction.
+Packing removes optional notes/history and shortens supporting sources first.
+Older evidence bodies can become references that the agent can reopen. Current
+hard controls, essential state, unread events and domain-action results are not
+silently discarded. If they cannot fit, the system asks for operator review.
+Full starting snapshots and saved tool results remain available for inspection.
+These are per-call limits, not a total run-cost budget.
 
-Mandatory memory, task/domain state and unread event payloads are not silently shortened. If essential information or retained tool history cannot fit, the agent requests operator review. A large unread backlog can therefore block work; automatic backlog partitioning is not implemented. Per-call budgets supplement existing model-turn/activation limits; they are not a total run-cost budget.
-
-## Operator API
-
-The authenticated operator routes use the same service as agent tools. Prefix all paths below with `/v1/firms/{firm}`. Full schemas are in [Swagger](http://localhost:8000/docs).
-
-| Route | Purpose |
-|---|---|
-| `GET/POST /tasks/{task}/memory` | Read/add/resolve task memory |
-| `GET/POST /instructions/{instruction}/revisions` | Read history/publish an approved instruction revision |
-| `GET /cases/{case}/memory` | Case memory version, restrictions and digest |
-| `POST /cases/{case}/restrictions` | Add/resolve whole-case or provider-specific holds |
-| `GET /cases/{case}/memory/search?q=...` | Basic scoped historical search |
-| `GET /cases/{case}/sources/{source}` | Read an original source |
-| `POST /cases/{case}/context/retrieve` | Question-specific, filtered, budgeted evidence |
-| `POST /cases/{case}/context/read` | Bounded source expansion |
-
-Memory/restriction writes require `Idempotency-Key` and the current `expected_version`. Instruction publication uses `expected_revision`. Resolution requires an item ID and reason text. Task memory permits at most 100 open, unexpired items; archived history does not consume this limit. History is paginated independently of the complete current-control load. Policy/hold changes currently fan out to affected tasks in one transaction.
-
-Example retrieval body:
-
-```json
-{
-  "question": "Why was MRI reference ZQ731 blocked?",
-  "provider_id": "<case provider UUID>",
-  "recorded_after": "2026-03-01T00:00:00Z",
-  "recorded_before": "2026-04-01T00:00:00Z",
-  "max_tokens": 1800
-}
-```
-
-The lower date bound is inclusive and the upper bound exclusive; timestamps require timezones. To read a returned source, send `source_id`, optional `offset`, `expected_hash` and `max_tokens` to the read endpoint.
-
-Core files: `memory.py`, `memory_api.py`, `memory_history.py`, `context.py` under `src/agents_platform/`. Broader temporal memory, retention/deletion and retrieval-quality work are in the [roadmap](roadmap.md).
-
-
-## Read the code for the demo
-
-The two former context modules are combined in **`context.py`**. No additional storage or framework is introduced.
-
-| Part | Responsibility |
-|---|---|
-| `pack_context` / `ModelBudget` | Fit a model-facing copy into the input budget; preserve mandatory state and keep evidence while it fits |
-| `RetrievalRequest` / `EvidenceRequest` | Small validated inputs; no caller-supplied firm or case identity |
-| `RetrievalService` | Search and read within the trusted case, with dates, provider filters and source references |
-| `ExecutionRetrieval` | Expose both SDK tools, limit calls and save requests/results in the existing audit ledger |
-
-Follow one request: agent asks a question → execution supplies firm/case identity → service searches indexed history → cited results are saved and returned → budget checks the next model call. The original snapshot and full tool results remain saved even if the model-facing copy is shortened.
-
-The other memory files have separate jobs: `memory.py` loads current controls; `memory_history.py` indexes/searches historical evidence; `memory_api.py` exposes operator routes. They remain separate to keep current controls, background indexing and HTTP handling easy to locate.
-
-
-## Maintaining current memory
-
-See [Memory lifecycle](memory-lifecycle.md) for exact-duplicate reuse, explicit
-supersession, effective/review dates, instruction retirement and bounded history.
-The existing indexing worker also performs bounded lifecycle sweeps. Action-time
-checks independently honor effective and expiry dates, even if the sweep is late.
-Both agent retrieval tools label historical memory sources with their current
-status, active flag and replacement reference. Retrieved text cannot revive a
-resolved or superseded restriction. This is an explicit operator-managed lifecycle;
-automatic natural-language contradiction resolution remains unimplemented.
+For routes, fields and code locations, see [development](development.md) and the
+[generated API reference](http://localhost:8000/docs).
