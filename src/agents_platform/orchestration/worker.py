@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.worker import Worker
 
+from agents_platform.check_in_series import SeriesActivities
 from agents_platform.config import get_settings
 from agents_platform.coordination import SupervisorActivities
 from agents_platform.db import Database
@@ -16,6 +17,7 @@ from agents_platform.orchestration.activities import InfrastructureActivities
 from agents_platform.orchestration.client import connect_temporal
 from agents_platform.orchestration.workflows import (
     CaseWorkflow,
+    CheckInSeriesWorkflow,
     InfrastructureProbe,
     MemoryIndexWorkflow,
     TaskWorkflow,
@@ -33,12 +35,21 @@ async def run_worker() -> None:
         task_activities = TaskActivities(database, settings)
         supervisor = SupervisorActivities(database, settings)
         memory = MemoryActivities(database, settings)
+        series = SeriesActivities(database)
         worker = Worker(
             client,
             task_queue=settings.temporal_task_queue,
-            workflows=[CaseWorkflow, InfrastructureProbe, TaskWorkflow, MemoryIndexWorkflow],
+            workflows=[
+                CaseWorkflow,
+                InfrastructureProbe,
+                TaskWorkflow,
+                MemoryIndexWorkflow,
+                CheckInSeriesWorkflow,
+            ],
             activities=[
                 memory.index_memory,
+                series.advance_series,
+                series.fail_series,
                 supervisor.coordinate_case,
                 supervisor.fail_supervisor,
                 activities.check_database,

@@ -345,7 +345,7 @@ function renderSupervisor() {
         return `<article class="case-card"><div class="case-card-top">${e(c.number)} / ${e(c.status)}</div><h3>${e(c.title)}</h3><p>${
           state.overview.groups
             .filter((g) => g.case_id === c.id)
-            .map((g) => e(g.objective))
+            .map((g) => `<button class="task-link" data-task="${e(g.id)}">${e(g.objective)}</button>`)
             .join("<br>") || "No parent task"
         }</p>${supervisorPanel(c)}<div class="progress-track"><i style="width:${total ? Math.round((done / total) * 100) : 0}%"></i></div><div class="case-stats"><span>${done} of ${total} tasks complete</span><span>${blocked} need attention</span></div><button class="text-button" data-case="${e(c.id)}" style="margin-top:14px">View case tasks</button></article>`;
       })
@@ -355,6 +355,9 @@ function renderSupervisor() {
 }
 const eventTitles = {
   "client.review_decided": "Teammate recorded a client-report decision",
+  "series.occurrence_created": "Recurring check-in created",
+  "series.controlled": "Check-in series control recorded",
+  "series.ended": "Check-in series ended",
   "case.objective_submitted": "Case objective submitted",
   "supervisor.review_completed": "Supervisor reviewed case",
   "supervisor.failed": "Supervisor needs recovery",
@@ -457,8 +460,8 @@ function renderDetail() {
     "";
   $("#detail-id").textContent = short(t.id);
   $("#detail-heading").innerHTML =
-    `${badge(t.task_type === "case.coordination" ? state.overview.supervisors?.find((s) => s.group_task_id === t.id)?.status || t.status : t.status)}<h2>${e(t.objective)}</h2><dl class="detail-props"><dt>Task ID</dt><dd><code>${e(t.id)}</code></dd><dt>Assigned to</dt><dd>${agent(t)}</dd><dt>Case</dt><dd>${e(caseName(t))}</dd><dt>Part of</dt><dd>${e(group?.objective || "Standalone task")}</dd><dt>Next step</dt><dd>${e(reason || "Agent will assess the task.")}</dd>${outcome?.wake_at ? `<dt>Scheduled wake</dt><dd>${e(date(outcome.wake_at, true))}</dd>` : ""}<dt>Workflow</dt><dd><code>${e(t.workflow_id || state.overview.supervisors?.find((s) => s.group_task_id === t.id)?.workflow_id)}</code></dd></dl>${t.records_request ? `<div class="requirements">${t.records_request.requirements.map((r) => `<span>${e(statusName(r.record_type))} / ${r.all_dates ? "all dates" : `${e(r.from_date)} ${e(r.through_date)}`}</span>`).join("")}<span>${e(statusName(t.records_request.status))}</span></div>${!closed(t) ? '<button class="text-button" data-provider>Simulate provider response</button>' : ""}` : ""}`;
-  $("#detail-heading").insertAdjacentHTML("beforeend", clientReviewHTML(t));
+    `${badge(t.task_type === "case.coordination" ? state.overview.supervisors?.find((s) => s.group_task_id === t.id)?.status || t.status : t.status)}<h2>${e(t.objective)}</h2><dl class="detail-props"><dt>Task ID</dt><dd><code>${e(t.id)}</code></dd><dt>Assigned to</dt><dd>${agent(t)}</dd><dt>Case</dt><dd>${e(caseName(t))}</dd><dt>Part of</dt><dd>${e(group?.objective || "Standalone task")}</dd><dt>Next step</dt><dd>${e(reason || "Agent will assess the task.")}</dd>${outcome?.wake_at ? `<dt>Scheduled wake</dt><dd>${e(date(outcome.wake_at, true))}</dd>` : ""}<dt>Workflow</dt><dd><code>${e(t.workflow_id || t.check_in_series?.workflow_id || state.overview.supervisors?.find((s) => s.group_task_id === t.id)?.workflow_id)}</code></dd></dl>${t.records_request ? `<div class="requirements">${t.records_request.requirements.map((r) => `<span>${e(statusName(r.record_type))} / ${r.all_dates ? "all dates" : `${e(r.from_date)} ${e(r.through_date)}`}</span>`).join("")}<span>${e(statusName(t.records_request.status))}</span></div>${!closed(t) ? '<button class="text-button" data-provider>Simulate provider response</button>' : ""}` : ""}`;
+  $("#detail-heading").insertAdjacentHTML("beforeend", clientReviewHTML(t) + seriesHTML(t));
   $$(".detail-tabs button").forEach((b) =>
     b.classList.toggle("selected", b.dataset.tab === state.tab),
   );
@@ -655,8 +658,12 @@ async function loadMore() {
     button.disabled = false;
   }
 }
+document.querySelector("#create-series").addEventListener("change", updateCreateKind);
+
 function updateCreateKind() {
   const checkIn = $("#create-agent").value === "check_in";
+  $("#series-fields").hidden = !checkIn || !$("#create-series").checked;
+  $("#create-parent").disabled = checkIn && $("#create-series").checked;
   $("#create-provider-field").hidden = checkIn;
   $("#create-provider").required = !checkIn;
   $("#create-records-fields").hidden = checkIn;
@@ -742,6 +749,17 @@ $("#create-form").addEventListener("submit", async (ev) => {
   try {
     if ($("#create-agent").value === "check_in") {
       const scheduled = $("#checkin-at").value ? new Date($("#checkin-at").value).toISOString() : (state.createAt ||= new Date().toISOString());
+      if ($("#create-series").checked) {
+        const series = await api(`/v1/firms/${state.firm}/cases/${$("#create-case").value}/check-in-series`, {
+          method:"POST",headers:{"Idempotency-Key":(state.createKey ||= crypto.randomUUID())},
+          body:JSON.stringify({client_contact_id:$("#create-patient").value,first_due_at:scheduled,
+            interval_seconds:Number($("#series-interval").value)*60,
+            max_occurrences:$("#series-max").value ? Number($("#series-max").value) : null,
+            ends_at:$("#series-end").value ? new Date($("#series-end").value).toISOString() : null,
+            objective:$("#create-objective").value,message:$("#checkin-message").value})});
+        state.createKey=null; $("#create-modal").close();toast("Recurring series scheduled.");
+        await refresh(true);await openTask(series.group_task_id);return;
+      }
       const task = await api(`/v1/firms/${state.firm}/tasks/client-check-in`, {
         method:"POST", headers:{"Idempotency-Key": (state.createKey ||= crypto.randomUUID())},
         body: JSON.stringify({case_id:$("#create-case").value, client_contact_id:$("#create-patient").value,
@@ -1162,4 +1180,37 @@ document.addEventListener("submit", async (event) => {
     if (err.status === 409) { state.reviewWrite = null; await refreshDetail(true); }
     toast(err.message);
   } finally { button.disabled = false; }
+});
+
+
+function seriesHTML(task) {
+  const s=task.check_in_series;
+  if (!s) return "";
+  return `<section class="task-memory"><h3>Recurring check-in series / ${e(statusName(s.status))}</h3>
+    <p>${s.occurrence_count} / ${s.max_occurrences || "100 (safety cap)"} occurrences · Interval ${e(s.interval_seconds/60)} minutes after completion</p>
+    <p>Next due: ${e(s.next_due_at ? date(s.next_due_at,true) : ["STOPPED","FINISHED"].includes(s.status) ? "No future occurrence" : "After the current occurrence completes")}${s.ends_at ? ` / Ends ${e(date(s.ends_at,true))}` : ""}</p>
+    ${s.blocked_reason ? `<p>${e(s.blocked_reason)}</p>` : ""}
+    ${s.active_task_id ? `<button class="task-link" data-task="${e(s.active_task_id)}">Inspect current occurrence ${short(s.active_task_id)}</button>` : ""}
+    ${!["STOPPED","FINISHED"].includes(s.status) ? `<form data-series-control="${e(s.id)}" data-version="${s.version}"><label>Action<select name="action">${s.status === "ACTIVE" ? '<option value="PAUSE">Pause unsent outreach</option>' : '<option value="RESUME">Resume series</option>'}<option value="STOP">Stop series / cancel an unsent occurrence</option></select></label><label>Reason<input name="reason" required maxlength="2000" value="${e(state.seriesDraft?.id === s.id ? state.seriesDraft.reason : "")}" /></label><p class="inline-note">Sent replies and reviews can still be handled. No overlapping occurrence or catch-up burst will be created.</p><button class="text-button" type="submit">Apply series control</button></form>` : ""}
+    <details><summary>Occurrences / ${s.occurrence_count}</summary>${(s.occurrences || []).map(o=>`<p><button class="task-link" data-task="${e(o.task_id)}">Check-in ${o.occurrence} / ${e(statusName(o.status))}</button> / ${e(date(o.scheduled_at,true))}</p>`).join("")}</details>
+    <code>${e(s.workflow_id)}</code></section>`;
+}
+
+document.addEventListener("input",event=>{
+  const form=event.target.closest("[data-series-control]");
+  if(form)state.seriesDraft={id:form.dataset.seriesControl,reason:form.elements.reason.value};
+});
+document.addEventListener("submit",async event=>{
+  const form=event.target.closest("[data-series-control]");if(!form)return;
+  event.preventDefault();const button=event.submitter;
+  const target=`/v1/firms/${state.firm}/cases/${state.detail.case_id}/check-in-series/${form.dataset.seriesControl}/control`;
+  const payload={expected_version:Number(form.dataset.version),action:form.elements.action.value,reason:form.elements.reason.value.trim()};
+  const intent=JSON.stringify({action:payload.action,reason:payload.reason});
+  if(state.seriesWrite?.intent!==intent||state.seriesWrite?.target!==target)state.seriesWrite={intent,target,key:crypto.randomUUID(),body:JSON.stringify(payload)};
+  button.disabled=true;
+  try{
+    await api(target,{method:"POST",headers:{"Idempotency-Key":state.seriesWrite.key},body:state.seriesWrite.body});
+    state.seriesWrite=null;state.seriesDraft=null;toast("Series control recorded.");await refreshDetail(true);await refresh();
+  }catch(err){if(err.status===409){state.seriesWrite=null;await refreshDetail(true);}toast(err.message);}
+  finally{button.disabled=false;}
 });

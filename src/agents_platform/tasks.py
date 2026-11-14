@@ -78,12 +78,49 @@ async def read_task(session: AsyncSession, tenant_id: UUID, task_id: UUID) -> Ta
     fields = {
         name: getattr(task, name)
         for name in TaskView.model_fields
-        if name not in ("records_request", "client_check_in")
+        if name not in ("records_request", "client_check_in", "check_in_series")
     }
     from agents_platform.client_check_in import check_in_view
 
     check_in = await check_in_view(session, task) if task.task_type == "client.check_in" else None
-    return TaskView(**fields, records_request=request_view, client_check_in=check_in)
+    series = None
+    if task.task_type == "client.check_in_series":
+        from agents_platform.check_in_series import series_view
+        from agents_platform.models import CheckInSeries
+
+        row = await session.scalar(
+            select(CheckInSeries).where(
+                CheckInSeries.tenant_id == tenant_id, CheckInSeries.group_task_id == task.id
+            )
+        )
+        series = series_view(row) if row else None
+        if row:
+            from agents_platform.models import ClientCheckIn
+
+            occurrences = await session.execute(
+                select(ClientCheckIn, Task)
+                .join(
+                    Task,
+                    (Task.id == ClientCheckIn.task_id)
+                    & (Task.tenant_id == ClientCheckIn.tenant_id),
+                )
+                .where(ClientCheckIn.tenant_id == tenant_id, ClientCheckIn.series_id == row.id)
+                .order_by(ClientCheckIn.occurrence)
+                .limit(100)
+            )
+            series["occurrences"] = [
+                {
+                    "task_id": str(t.id),
+                    "occurrence": c.occurrence,
+                    "status": t.status,
+                    "scheduled_at": c.scheduled_at.isoformat(),
+                    "sent_at": c.sent_at.isoformat() if c.sent_at else None,
+                }
+                for c, t in occurrences
+            ]
+    return TaskView(
+        **fields, records_request=request_view, client_check_in=check_in, check_in_series=series
+    )
 
 
 async def create_records_task(

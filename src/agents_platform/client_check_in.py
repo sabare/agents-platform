@@ -84,9 +84,14 @@ async def check_in_view(session, task):
             ClientReport.check_in_id == row.id,
         )
     )
+    from agents_platform.check_in_series import check_in_gate
+
+    series = await check_in_gate(session, row)
     review = await review_for_report(session, report)
     return {
         "id": str(row.id),
+        "series": series,
+        "occurrence": row.occurrence,
         "client_contact_id": str(row.client_contact_id),
         "scheduled_at": row.scheduled_at.isoformat(),
         "sent_at": row.sent_at.isoformat() if row.sent_at else None,
@@ -137,9 +142,14 @@ class ClientCheckInAdapter:
         )
         return DomainSnapshot(
             state={"check_in": view, "previous_report": report_view(previous)},
-            ready_at=datetime.fromisoformat(view["scheduled_at"]),
+            ready_at=(
+                None
+                if (view.get("series") or {}).get("suspension_reason")
+                else datetime.fromisoformat(view["scheduled_at"])
+            ),
             task_fields={"client_check_in": view},
             action_requirements={
+                "suspension_reason": (view.get("series") or {}).get("suspension_reason"),
                 "before_waiting": "Send once when due, then wait for a reply.",
                 "reports_are_unverified_client_statements": True,
                 "human_review": view["report"].get("human_review") if view["report"] else None,
@@ -157,6 +167,11 @@ class ClientCheckInAdapter:
             )
         )
         if name == "send_client_check_in":
+            from agents_platform.check_in_series import check_in_gate
+
+            gate = await check_in_gate(session, row)
+            if gate and gate["suspension_reason"]:
+                raise ValueError(gate["suspension_reason"])
             if row.scheduled_at > datetime.now(timezone.utc):
                 raise ValueError("Check-in is not due")
             if row.sent_at is None:
@@ -197,7 +212,9 @@ class ClientCheckInAdapter:
             not report or str(decision.report_id) != report["id"] or report["id"] not in exposed
         ):
             raise ValueError("Agent cited a client report it was not given")
-        if report and report["needs_review"]:
+        if (view.get("series") or {}).get("suspension_reason"):
+            action = self.review(view["series"]["suspension_reason"]).next_action
+        elif report and report["needs_review"]:
             action = self.review(
                 "Client-reported change requires teammate review: "
                 + "; ".join(report["changes"]["reasons"])

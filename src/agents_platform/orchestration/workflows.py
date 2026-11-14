@@ -163,3 +163,58 @@ class MemoryIndexWorkflow:
                 delay = 60
             await workflow.sleep(timedelta(seconds=delay))
         workflow.continue_as_new()
+
+
+@workflow.defn
+class CheckInSeriesWorkflow:
+    """One durable timer/event loop per bounded series; children keep TaskWorkflow."""
+
+    def __init__(self):
+        self.woken = False
+
+    @workflow.signal
+    def wake(self):
+        self.woken = True
+
+    @workflow.run
+    async def run(self, request: dict):
+        cycle = request.get("cycle", 0)
+        while True:
+            self.woken = False
+            try:
+                outcome = await workflow.execute_activity(
+                    "advance_series",
+                    request,
+                    result_type=dict,
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+            except ActivityError:
+                await workflow.execute_activity(
+                    "fail_series",
+                    request,
+                    start_to_close_timeout=timedelta(seconds=10),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+                outcome = {"status": "WAITING"}
+            if outcome["status"] == "CLOSED":
+                return outcome
+            if not self.woken:
+                if outcome.get("wake_at"):
+                    seconds = max(
+                        0,
+                        (
+                            datetime.fromisoformat(outcome["wake_at"]) - workflow.now()
+                        ).total_seconds(),
+                    )
+                    try:
+                        await workflow.wait_condition(
+                            lambda: self.woken, timeout=timedelta(seconds=seconds)
+                        )
+                    except TimeoutError:
+                        pass
+                else:
+                    await workflow.wait_condition(lambda: self.woken)
+            cycle += 1
+            if cycle % 100 == 0 or workflow.info().is_continue_as_new_suggested():
+                workflow.continue_as_new({**request, "cycle": cycle})

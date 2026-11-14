@@ -25,6 +25,7 @@ from agents_platform.models import (
     Case,
     CaseContact,
     CaseCoordination,
+    CheckInSeries,
     ClientCheckIn,
     ClientReport,
     OutboxMessage,
@@ -152,6 +153,7 @@ async def ensure_monitor(session, tenant_id, case_id):
         tenant_id=tenant_id,
         case_id=case_id,
         group_task_id=group.id,
+        agent_version=2 if await session.get(AgentVersion, ("case_supervisor", 2)) else 1,
         workflow_id=f"firm/{tenant_id}/case/{case_id}/supervisor",
         objective_json={
             "objective": "Monitor client reports and surface meaningful changes for the firm.",
@@ -168,112 +170,133 @@ async def ensure_monitor(session, tenant_id, case_id):
 @router.post("/tasks/client-check-in", status_code=201)
 async def create_check_in(tenant_id: UUID, body: CreateCheckIn, session: Session, key: Key):
     async with session.begin():
-        await policy_lock(session, tenant_id)
-        case = await session.scalar(
-            select(Case)
-            .where(Case.tenant_id == tenant_id, Case.id == body.case_id)
-            .with_for_update(key_share=True)
+        return await create_check_in_in_transaction(session, tenant_id, body, key)
+
+
+async def create_check_in_in_transaction(
+    session, tenant_id, body, key, *, series=None, occurrence=None
+):
+    await policy_lock(session, tenant_id)
+    case = await session.scalar(
+        select(Case)
+        .where(Case.tenant_id == tenant_id, Case.id == body.case_id)
+        .with_for_update(key_share=True)
+    )
+    if not case:
+        raise HTTPException(404, "Case not found")
+    creation_key = f"check-in/{key}"
+    existing = await session.scalar(
+        select(Task).where(Task.tenant_id == tenant_id, Task.creation_key == creation_key)
+    )
+    fingerprint = digest(body.model_dump(mode="json"))
+    if existing:
+        if existing.creation_hash != fingerprint:
+            raise HTTPException(409, "Idempotency-Key used for another assignment")
+        return await read_task(session, tenant_id, existing.id)
+    if case.status != "OPEN":
+        raise HTTPException(409, "Check-in requires an open case")
+    client = await session.scalar(
+        select(CaseContact).where(
+            CaseContact.tenant_id == tenant_id,
+            CaseContact.case_id == case.id,
+            CaseContact.contact_id == body.client_contact_id,
         )
-        if not case:
-            raise HTTPException(404, "Case not found")
-        creation_key = f"check-in/{key}"
-        existing = await session.scalar(
-            select(Task).where(Task.tenant_id == tenant_id, Task.creation_key == creation_key)
+    )
+    if not client or not {"CLIENT", "PATIENT"}.intersection(client.roles):
+        raise HTTPException(422, "Client must belong to this case")
+    if series is None and await session.scalar(
+        select(CheckInSeries.id).where(
+            CheckInSeries.tenant_id == tenant_id,
+            CheckInSeries.case_id == case.id,
+            CheckInSeries.client_contact_id == body.client_contact_id,
+            CheckInSeries.status.in_(["ACTIVE", "PAUSED"]),
         )
-        fingerprint = digest(body.model_dump(mode="json"))
-        if existing:
-            if existing.creation_hash != fingerprint:
-                raise HTTPException(409, "Idempotency-Key used for another assignment")
-            return await read_task(session, tenant_id, existing.id)
-        if case.status != "OPEN":
-            raise HTTPException(409, "Check-in requires an open case")
-        client = await session.scalar(
-            select(CaseContact).where(
-                CaseContact.tenant_id == tenant_id,
-                CaseContact.case_id == case.id,
-                CaseContact.contact_id == body.client_contact_id,
+    ):
+        raise HTTPException(
+            409, "Client has a live series; use its controls instead of parallel check-ins"
+        )
+    if body.parent_task_id:
+        parent = await session.scalar(
+            select(Task).where(
+                Task.tenant_id == tenant_id,
+                Task.case_id == case.id,
+                Task.id == body.parent_task_id,
+                Task.kind == "GROUP",
+                Task.status.not_in(["COMPLETED", "CANCELLED", "FAILED"]),
             )
         )
-        if not client or not {"CLIENT", "PATIENT"}.intersection(client.roles):
-            raise HTTPException(422, "Client must belong to this case")
-        if body.parent_task_id:
-            parent = await session.scalar(
-                select(Task).where(
-                    Task.tenant_id == tenant_id,
-                    Task.case_id == case.id,
-                    Task.id == body.parent_task_id,
-                    Task.kind == "GROUP",
-                    Task.status.not_in(["COMPLETED", "CANCELLED", "FAILED"]),
-                )
-            )
-            if not parent:
-                raise HTTPException(422, "Parent must be an open grouping task in this case")
-        if not await session.get(AgentVersion, ("client_check_in", 1)) or not await session.get(
-            AgentVersion, ("case_supervisor", 1)
-        ):
-            raise HTTPException(
-                409, "Publish check-in and supervisor definitions with the seed command"
-            )
-        coord = await ensure_monitor(session, tenant_id, case.id)
-        task_id, check_in_id, event_id = uuid4(), uuid4(), uuid4()
-        task = Task(
-            id=task_id,
-            tenant_id=tenant_id,
-            case_id=case.id,
-            parent_task_id=body.parent_task_id or coord.group_task_id,
-            kind="AGENT",
-            task_type="client.check_in",
-            objective=body.objective,
-            agent_key="client_check_in",
-            agent_version=1,
-            input_schema="check_in_assignment.v1",
-            input_json={"check_in_id": str(check_in_id)},
-            progress_json={},
-            completion_json={"schema": "check_in_completion.v1", "requires_attributed_reply": True},
-            workflow_id=f"firm/{tenant_id}/task/{task_id}",
-            creation_key=creation_key,
-            creation_hash=fingerprint,
+        if not parent:
+            raise HTTPException(422, "Parent must be an open grouping task in this case")
+    if not await session.get(AgentVersion, ("client_check_in", 1)) or not await session.get(
+        AgentVersion, ("case_supervisor", 1)
+    ):
+        raise HTTPException(
+            409, "Publish check-in and supervisor definitions with the seed command"
         )
-        session.add(task)
-        await session.flush()
-        session.add(
-            ClientCheckIn(
-                id=check_in_id,
-                tenant_id=tenant_id,
-                case_id=case.id,
-                task_id=task_id,
-                client_contact_id=body.client_contact_id,
-                scheduled_at=body.scheduled_at,
-                message=body.message,
-            )
-        )
-        event = ActivityEvent(
-            id=event_id,
+    coord = await ensure_monitor(session, tenant_id, case.id)
+    task_id, check_in_id, event_id = uuid4(), uuid4(), uuid4()
+    task = Task(
+        id=task_id,
+        tenant_id=tenant_id,
+        case_id=case.id,
+        parent_task_id=body.parent_task_id or coord.group_task_id,
+        kind="AGENT",
+        task_type="client.check_in",
+        objective=body.objective,
+        agent_key="client_check_in",
+        agent_version=1,
+        input_schema="check_in_assignment.v1",
+        input_json={"check_in_id": str(check_in_id)},
+        progress_json={},
+        completion_json={"schema": "check_in_completion.v1", "requires_attributed_reply": True},
+        workflow_id=f"firm/{tenant_id}/task/{task_id}",
+        creation_key=creation_key,
+        creation_hash=fingerprint,
+    )
+    session.add(task)
+    await session.flush()
+    session.add(
+        ClientCheckIn(
+            id=check_in_id,
             tenant_id=tenant_id,
             case_id=case.id,
             task_id=task_id,
-            event_type="check_in.scheduled",
-            producer="operator",
-            dedupe_key=creation_key,
-            actor_ref="local-operator",
-            payload={
-                "scheduled_at": body.scheduled_at.isoformat(),
-                "client_contact_id": str(body.client_contact_id),
-            },
+            client_contact_id=body.client_contact_id,
+            series_id=series.id if series else None,
+            occurrence=occurrence,
+            scheduled_at=body.scheduled_at,
+            message=body.message,
         )
-        session.add(event)
-        await session.flush()
-        session.add(
-            OutboxMessage(
-                tenant_id=tenant_id,
-                event_id=event_id,
-                destination="temporal.start_task",
-                destination_key=task.workflow_id,
-                payload={"tenant_id": str(tenant_id), "task_id": str(task_id)},
-            )
+    )
+    event = ActivityEvent(
+        id=event_id,
+        tenant_id=tenant_id,
+        case_id=case.id,
+        task_id=task_id,
+        event_type="check_in.scheduled",
+        producer="check-in-series" if series else "operator",
+        dedupe_key=creation_key,
+        actor_ref="platform/series" if series else "local-operator",
+        payload={
+            "series_id": str(series.id) if series else None,
+            "occurrence": occurrence,
+            "scheduled_at": body.scheduled_at.isoformat(),
+            "client_contact_id": str(body.client_contact_id),
+        },
+    )
+    session.add(event)
+    await session.flush()
+    session.add(
+        OutboxMessage(
+            tenant_id=tenant_id,
+            event_id=event_id,
+            destination="temporal.start_task",
+            destination_key=task.workflow_id,
+            payload={"tenant_id": str(tenant_id), "task_id": str(task_id)},
         )
-        await enqueue_supervisor(session, event)
-        return await read_task(session, tenant_id, task_id)
+    )
+    await enqueue_supervisor(session, event)
+    return await read_task(session, tenant_id, task_id)
 
 
 @router.post("/tasks/{task_id}/client-replies", status_code=201)

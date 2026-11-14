@@ -366,6 +366,8 @@ class TaskActivities:
             holds = stop_contact(context["memory"])
             if holds:
                 decision = run.adapter.review("; ".join(i["text"] for i in holds))
+            elif context["action_requirements"].get("suspension_reason"):
+                decision = run.adapter.review(context["action_requirements"]["suspension_reason"])
             elif definition.get("capability_stage") != "durable_demo":
                 decision = run.adapter.review(
                     "This published version is analysis-only; explicitly assign a runnable version."
@@ -565,6 +567,9 @@ class TaskActivities:
                 },
             )
             session.add(event)
+            from agents_platform.check_in_series import notify_series
+
+            await notify_series(session, task, event)
             if validation.replan_reason:
                 await session.flush()
                 session.add(
@@ -615,3 +620,6 @@ class TaskActivities:
                 from agents_platform.coordination import enqueue_supervisor
 
                 await enqueue_supervisor(session, event)
+                from agents_platform.check_in_series import notify_series
+
+                await notify_series(session, task, event)

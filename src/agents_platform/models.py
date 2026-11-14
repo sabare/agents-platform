@@ -492,7 +492,19 @@ class ClientCheckIn(TenantRow, Base):
     scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     message: Mapped[str]
+    series_id: Mapped[UUID | None]
+    occurrence: Mapped[int | None]
     __table_args__ = (
+        UniqueConstraint("tenant_id", "series_id", "occurrence"),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "series_id"],
+            ["check_in_series.tenant_id", "check_in_series.case_id", "check_in_series.id"],
+        ),
+        CheckConstraint(
+            "(series_id IS NULL AND occurrence IS NULL) OR "
+            "(series_id IS NOT NULL AND occurrence IS NOT NULL AND occurrence > 0)",
+            name="check_in_occurrence",
+        ),
         UniqueConstraint("tenant_id", "task_id"),
         UniqueConstraint("tenant_id", "case_id", "id"),
         ForeignKeyConstraint(
@@ -577,5 +589,60 @@ class ClientReview(TenantRow, Base):
             "(status = 'RESOLVED' AND COALESCE(decision, '') = 'ALLOW_COMPLETION') OR "
             "(status = 'OPEN' AND (decision IS NULL OR decision = 'REQUEST_CHANGES'))",
             name="client_review_decision",
+        ),
+    )
+
+
+class CheckInSeries(TenantRow, Base):
+    __tablename__ = "check_in_series"
+    case_id: Mapped[UUID]
+    client_contact_id: Mapped[UUID]
+    group_task_id: Mapped[UUID]
+    active_task_id: Mapped[UUID | None]
+    workflow_id: Mapped[str] = mapped_column(unique=True)
+    status: Mapped[str] = mapped_column(default="ACTIVE")
+    version: Mapped[int] = mapped_column(default=1)
+    interval_seconds: Mapped[int]
+    next_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    max_occurrences: Mapped[int | None]
+    occurrence_count: Mapped[int] = mapped_column(default=0)
+    objective: Mapped[str]
+    message: Mapped[str]
+    blocked_reason: Mapped[str | None]
+    creation_key: Mapped[str]
+    creation_hash: Mapped[str]
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "case_id", "id"),
+        UniqueConstraint("tenant_id", "creation_key"),
+        ForeignKeyConstraint(["tenant_id", "case_id"], ["cases.tenant_id", "cases.id"]),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "client_contact_id"],
+            ["case_contacts.tenant_id", "case_contacts.case_id", "case_contacts.contact_id"],
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "group_task_id"],
+            ["tasks.tenant_id", "tasks.case_id", "tasks.id"],
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "case_id", "active_task_id"],
+            ["tasks.tenant_id", "tasks.case_id", "tasks.id"],
+        ),
+        CheckConstraint("status IN ('ACTIVE','PAUSED','STOPPED','FINISHED')", name="series_status"),
+        CheckConstraint(
+            "interval_seconds >= 60 AND version > 0 AND occurrence_count BETWEEN 0 AND 100",
+            name="series_bounds",
+        ),
+        CheckConstraint(
+            "max_occurrences IS NULL OR max_occurrences BETWEEN 1 AND 100", name="series_max"
+        ),
+        CheckConstraint("ends_at IS NOT NULL OR max_occurrences IS NOT NULL", name="series_end"),
+        Index(
+            "uq_live_client_series",
+            "tenant_id",
+            "case_id",
+            "client_contact_id",
+            unique=True,
+            postgresql_where=sql_text("status IN ('ACTIVE','PAUSED')"),
         ),
     )

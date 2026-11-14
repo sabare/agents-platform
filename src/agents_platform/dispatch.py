@@ -8,10 +8,15 @@ from uuid import UUID
 from sqlalchemy import select
 from temporalio.common import WorkflowIDReusePolicy
 from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.service import RPCError, RPCStatusCode
 
 from agents_platform.execution import now
-from agents_platform.models import CaseCoordination, OutboxMessage, Task
-from agents_platform.orchestration.workflows import CaseWorkflow, TaskWorkflow
+from agents_platform.models import CaseCoordination, CheckInSeries, OutboxMessage, Task
+from agents_platform.orchestration.workflows import (
+    CaseWorkflow,
+    CheckInSeriesWorkflow,
+    TaskWorkflow,
+)
 
 
 async def dispatch_once(database, client, task_queue: str, tenant_id=None) -> bool:
@@ -29,7 +34,35 @@ async def dispatch_once(database, client, task_queue: str, tenant_id=None) -> bo
         if message is None:
             return False
         try:
-            if message.destination == "temporal.wake_case":
+            if message.destination == "temporal.wake_series":
+                series = await session.scalar(
+                    select(CheckInSeries).where(
+                        CheckInSeries.tenant_id == UUID(message.payload["tenant_id"]),
+                        CheckInSeries.case_id == UUID(message.payload["case_id"]),
+                        CheckInSeries.id == UUID(message.payload["series_id"]),
+                    )
+                )
+                if series is None or series.workflow_id != message.destination_key:
+                    raise ValueError("Outbox series scope mismatch")
+                target, active = CheckInSeriesWorkflow.run, True
+            elif message.destination == "temporal.signal_task":
+                task = await session.get(Task, UUID(message.payload["task_id"]))
+                if (
+                    task is None
+                    or str(task.tenant_id) != message.payload["tenant_id"]
+                    or task.workflow_id != message.destination_key
+                ):
+                    raise ValueError("Outbox task scope mismatch")
+                try:
+                    await client.get_workflow_handle(message.destination_key).signal(
+                        "wake", rpc_timeout=timedelta(seconds=3)
+                    )
+                except RPCError as exc:
+                    if exc.status != RPCStatusCode.NOT_FOUND:
+                        raise
+                message.status = "DELIVERED"
+                return True
+            elif message.destination == "temporal.wake_case":
                 coord = await session.scalar(
                     select(CaseCoordination).where(
                         CaseCoordination.tenant_id == UUID(message.payload["tenant_id"]),

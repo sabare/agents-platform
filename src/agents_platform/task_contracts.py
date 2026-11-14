@@ -83,6 +83,7 @@ class TaskSnapshot(Contract):
 class TaskView(TaskSnapshot):
     records_request: RecordsRequestView | None
     client_check_in: dict | None = None
+    check_in_series: dict | None = None
 
 
 class EventView(Contract):

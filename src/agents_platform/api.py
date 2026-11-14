@@ -14,6 +14,7 @@ from temporalio.client import WorkflowExecutionStatus
 from temporalio.service import RPCError, RPCStatusCode
 
 from agents_platform.check_in_api import router as check_in_router
+from agents_platform.check_in_series import router as series_router
 from agents_platform.config import Settings, get_settings
 from agents_platform.dashboard import router as dashboard_router
 from agents_platform.db import Database
@@ -50,6 +51,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="HelloCounsel Agents Platform", version="0.1.0", lifespan=lifespan)
     app.include_router(task_router)
     app.include_router(check_in_router)
+    app.include_router(series_router)
     app.include_router(memory_router)
     app.include_router(supervisor_router)
     app.include_router(dashboard_router)
