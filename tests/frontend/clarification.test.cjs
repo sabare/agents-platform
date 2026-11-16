@@ -190,3 +190,15 @@ test('a registered agent plan renders its name and reviewed inputs without built
   assert.match(html, /Approve & start/);
   assert.doesNotMatch(html, /undefined/);
 });
+
+test('execution trace links accept http dashboards and reject executable URLs', () => {
+  const start = source.indexOf('function executionTraceLinks(run)');
+  const end = source.indexOf('\n}', start) + 2;
+  const html = vm.runInNewContext(`${source.slice(start,end)}\nexecutionTraceLinks(run)`, {
+    e: value=>value,
+    run:{observability:{jaeger_url:'http://localhost:16686/trace/abc',langfuse_url:'javascript:alert(1)'}},
+  });
+  assert.match(html, /Open execution trace/);
+  assert.match(html, /noopener noreferrer/);
+  assert.doesNotMatch(html, /javascript|Open LLM trace/);
+});

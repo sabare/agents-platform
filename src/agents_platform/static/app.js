@@ -45,7 +45,7 @@ const names = {
 };
 const agent = (t) => t.task_type === "client.monthly_schedule"
   ? '<span class="agent-cell"><span class="agent-initial">S</span>Supervisor / monthly calendar</span>'
-  : `<span class="agent-cell"><span class="agent-initial" aria-hidden="true">${t.task_type === "case.coordination" ? "S" : t.agent_key === "client_check_in" ? "CI" : "MR"}</span>${e(names[t.agent_key] || (t.task_type === "case.coordination" ? "Case supervisor" : t.agent_key))} <small>v${e(t.agent_version || 1)}</small></span>`;
+  : `<span class="agent-cell"><span class="agent-initial" aria-hidden="true">${t.task_type === "case.coordination" ? "S" : t.agent_key === "client_check_in" ? "CI" : "MR"}</span>${e(names[t.agent_key] || (t.task_type === "case.coordination" ? "Case supervisor" : t.agent_key))} <small>v${e(t.agent_version || (t.task_type === "case.coordination" ? state.overview?.supervisors?.find(s => s.group_task_id === t.id)?.agent_version : null) || 1)}</small></span>`;
 const state = {
   key: sessionStorage.getItem("operatorKey") || "local-development-only",
   firm: null,
@@ -163,7 +163,7 @@ async function refresh(reset = false) {
     const [overview, page, activity, humanPage, incidentPage, operations] = await Promise.all([
       api(`${root()}/overview`),
       api(
-        `${root()}/tasks?${query({ case_id: state.case, status: $("#status").value })}`,
+        `${root()}/tasks?${query({ case_id: state.case, status: $("#status").value, include_parents: true })}`,
       ),
       api(`${root()}/activity?${query({ case_id: state.case })}`),
       api(`/v1/firms/${state.firm}/human-requests`),
@@ -207,7 +207,7 @@ function selectedCase() {
 }
 function render() {
   $("#nav-count").textContent = number(
-    Object.values(state.overview.counts).reduce((a, b) => a + b, 0),
+    Object.values(state.overview.counts).reduce((a, b) => a + b, 0) + (state.overview.parent_count || 0),
   );
   $("#case-count").textContent = state.overview.cases.length;
   $("#case-nav").innerHTML = state.overview.cases
@@ -260,9 +260,20 @@ function caseName(t) {
 function taskSub(t) {
   return `<span class="task-sub"><code>${short(t.id)}</code><span class="meta-separator" aria-hidden="true">/</span><span>${e(caseName(t))}</span>${t.parent_task_id ? '<span class="meta-separator" aria-hidden="true">/</span><span>Subtask</span>' : ""}</span>`;
 }
+function pendingAssignmentsHTML() {
+  const supervisors = (state.overview?.supervisors || []).filter(s =>
+    (!state.case || s.case_id === state.case) && s.status !== "SATISFIED");
+  if (!supervisors.length || $("#search").value.trim() || $("#status").value) return "";
+  return supervisors.map(s=>`<div class="empty"><strong>${s.status === "NEEDS_REVIEW" ? "Assignment needs review" : "Assignment saved"}</strong><p>${s.status === "NEEDS_REVIEW" ? "The supervisor stopped before creating a specialist task. Open the assignment to review what happened." : "The supervisor is preparing specialist work. You can inspect the saved assignment while it runs."}</p><button class="primary" data-task="${e(s.group_task_id)}">Open supervisor assignment</button></div>`).join("");
+}
+function subtasksHTML(task) {
+  return (task.subtasks || []).length
+    ? task.subtasks.map(child => `<button class="subtask-link" data-task="${e(child.id)}" aria-label="Open subtask: ${e(taskTitle(child))}">↳ ${e(taskTitle(child))}</button>`).join("")
+    : '<span class="no-subtasks">—</span>';
+}
 function renderTasks(tasks) {
   if (!tasks.length) {
-    $("#content").innerHTML =
+    $("#content").innerHTML = (!state.tasks.length && pendingAssignmentsHTML()) ||
       `<div class="empty"><strong>${state.tasks.length ? "No matching tasks" : "No tasks yet"}</strong>${state.tasks.length ? "Try another search or status filter." : "Create a task to assign work to an agent."}${!state.tasks.length ? '<br><button class="primary" data-create>Create a task</button>' : ""}</div>`;
     return;
   }
@@ -283,12 +294,12 @@ function renderTasks(tasks) {
   }
   const statuses = ["RUNNING", "WAITING", "BLOCKED", "PENDING", "FAILED", "COMPLETED", "CANCELLED"];
   $("#content").innerHTML = `<div class="task-groups">${statuses.map((status) => {
-    const items = tasks.filter((t) => t.status === status);
+    const items = tasks.filter((t) => t.status === status).sort((a, b) => Number(b.kind === "GROUP") - Number(a.kind === "GROUP"));
     if (!items.length) return "";
     return `<section class="task-group" aria-label="${e(statusName(status))} tasks">
       <div class="group-heading">${badge(status)}<span class="group-count">${items.length}</span></div>
-      <table class="task-table"><thead><tr><th scope="col">Name</th><th scope="col">Assignee</th><th scope="col">Case</th><th scope="col">Created</th></tr></thead>
-      <tbody>${items.map((t) => `<tr><td><button class="task-name" data-task="${e(t.id)}"><span class="task-check ${t.status === "COMPLETED" ? "done" : ""}" aria-hidden="true">${t.status === "COMPLETED" ? "✓" : ""}</span><span class="task-title">${e(taskTitle(t))}</span>${t.parent_task_id ? '<span class="subtask-mark" title="Subtask" aria-label="Subtask">↳</span>' : ""}</button></td><td>${agent(t)}</td><td><span class="case-tag">${e(caseName(t))}</span></td><td>${e(date(t.created_at))}</td></tr>`).join("")}</tbody></table>
+      <table class="task-table"><thead><tr><th scope="col">Name</th><th scope="col">Assignee</th><th scope="col">Case</th><th scope="col">Created</th><th scope="col">Subtasks</th></tr></thead>
+      <tbody>${items.map((t) => `<tr><td><button class="task-name" data-task="${e(t.id)}"><span class="task-check ${t.status === "COMPLETED" ? "done" : ""}" aria-hidden="true">${t.status === "COMPLETED" ? "✓" : ""}</span><span class="task-title">${e(taskTitle(t))}</span>${t.kind === "GROUP" ? '<span class="parent-mark">Parent</span>' : ""}${t.parent_task_id ? '<span class="subtask-mark" title="Subtask" aria-label="Subtask">↳</span>' : ""}</button></td><td>${agent(t)}</td><td><span class="case-tag">${e(caseName(t))}</span></td><td>${e(date(t.created_at))}</td><td class="subtasks-cell">${subtasksHTML(t)}</td></tr>`).join("")}</tbody></table>
     </section>`;
   }).join("")}<button class="add-task-row" data-create><span aria-hidden="true">＋</span> Add task</button></div>`;
 }
@@ -331,11 +342,18 @@ const eventTitles = {
   "task.created": "Task assigned",
   "task.plan_rejected": "Agent plan needs correction",
   "task.comment_added": "Comment added",
+  "communication.received": "Simulated communication received",
   "provider.response_received": "Provider update received",
+  "provider.response_ingested": "Provider response saved",
+  "provider.response_extracted": "Provider response reviewed",
+  "human.request_created": "Review requested",
+  "human.request_decided": "Review decision recorded",
+  "human.decision_recorded": "Review decision recorded",
+  "incident.resolved": "Execution recovered",
   "agent.execution_completed": "Execution completed",
   "task.activation_completed": "Agent reported back",
   "task.failed": "Task failed",
-  "task.waiting": "Follow-up scheduled",
+  "task.waiting": "Next check scheduled",
   "task.completed": "Task completed",
   "task.blocked": "Human review needed",
   "task.running": "Agent started",
@@ -344,11 +362,13 @@ function eventHTML(ev) {
   const type = ev.type || ev.event_type,
     payload = ev.payload || {};
   const title =
-    eventTitles[type] || type.replaceAll(".", " / ").replaceAll("_", " ");
+    (type === "task.waiting" && payload.outcome?.wait_for_event ? "Waiting for update" : eventTitles[type]) || type.replaceAll(".", " / ").replaceAll("_", " ");
   const decision = payload.decision;
   const text =
     payload.text ||
     payload.summary ||
+    (type === "provider.response_extracted" ? `${payload.received_requirement_ids?.length || 0} requirements received; ${payload.outstanding_requirement_ids?.length || 0} still outstanding.${payload.authorization_required ? " Updated authorization required." : payload.needs_review ? " Human review required." : ""}` : "") ||
+    (type === "provider.response_ingested" ? "Original response saved. The agent will review the message and any attached documents." : "") ||
     decision?.summary ||
     payload.reason ||
     payload.assignment?.objective ||
@@ -356,7 +376,7 @@ function eventHTML(ev) {
   const attribution = ev.source_actor
     ? `${e(ev.source_actor.name)}${ev.simulated ? " · Simulated update" : ""}${ev.recorded_by ? ` · Recorded by ${e(ev.recorded_by)}` : ""}`
     : e(ev.actor || ev.actor_ref || "platform");
-  return `<article class="feed-item"><div class="feed-body"><div class="feed-meta"><span class="feed-title">${e(title)}</span><time>${e(date(ev.created_at, true))}</time></div><div class="task-sub">${attribution}${ev.task_id ? `<span class="meta-separator" aria-hidden="true">/</span><button class="task-link" data-task="${e(ev.task_id)}">${short(ev.task_id)}</button>` : ""}</div>${text ? `<p class="feed-text">${e(text)}</p>` : ""}${payload.message ? `<p class="feed-text">${e(payload.message)}</p>` : ""}${payload.mentions?.length ? `<div class="feed-tags">${payload.mentions.map((m) => `<span class="mention">@${e(m)}</span>`).join("")}${payload.woke_agent ? '<span class="mention">Wake requested</span>' : ""}</div>` : ""}<details><summary>Event payload / ${e(ev.id?.slice(0, 8))}</summary><pre>${pretty(payload)}</pre></details></div></article>`;
+  return `<article class="feed-item"><div class="feed-body"><div class="feed-meta"><span class="feed-title">${e(title)}</span><time>${e(date(ev.created_at, true))}</time></div><div class="task-sub">${attribution}${ev.task_id ? `<span class="meta-separator" aria-hidden="true">/</span><button class="task-link" data-task="${e(ev.task_id)}">${short(ev.task_id)}</button>` : ""}</div>${text ? `<p class="feed-text">${e(text)}</p>` : ""}${payload.message ? `<p class="feed-text">${e(payload.message)}</p>` : ""}${payload.communication_source_id ? `<details><summary>Original communication</summary><button class="text-button" data-memory-source="${e(payload.communication_source_id)}">Read transcript</button><div></div></details>` : ""}${payload.mentions?.length ? `<div class="feed-tags">${payload.mentions.map((m) => `<span class="mention">@${e(m)}</span>`).join("")}${payload.woke_agent ? '<span class="mention">Wake requested</span>' : ""}</div>` : ""}<details><summary>Event payload / ${e(ev.id?.slice(0, 8))}</summary><pre>${pretty(payload)}</pre></details></div></article>`;
 }
 async function openTask(id) {
   if (state.selected !== id) {
@@ -410,6 +430,8 @@ async function refreshDetail(force = false) {
     return;
   const hash = JSON.stringify([task, events, runs, memory, humanPage, incidentPage, contactPage]);
   if (!force && hash === state.detailHash) return;
+  // A background refresh must not discard a document the reviewer just selected.
+  if (!force && (document.querySelector('[name="authorization_file"]')?.files?.length || document.activeElement?.closest("[data-demo-call], [data-human-response], [data-human-assignment]"))) return;
   state.detailHash = hash;
   state.detail = task;
   state.runs = runs;
@@ -424,12 +446,26 @@ async function refreshDetail(force = false) {
   if (!retaining) state.eventsNext = events.next_cursor;
   renderDetail();
 }
+function pendingUpdateHTML() {
+  const events = state.events || [];
+  const interpreted = new Set(events.flatMap(ev=>[
+    ev.payload?.raw_source_id, ev.payload?.communication_source_id
+  ]).filter(Boolean));
+  const pending = events.some(ev=>["provider.response_ingested", "communication.received"].includes(ev.type || ev.event_type)
+    && ev.payload?.source_id && !interpreted.has(ev.payload.source_id));
+  return pending ? '<p class="pending-update" role="status"><strong>Update received</strong>Saved and queued for agent review. Document status and the next step will update after review.</p>' : "";
+}
 function renderDetail() {
   const t = state.detail,
     latest = state.runs.at(-1),
     outcome = latest?.outcome;
+  const continuationWake = (state.humanRequests || []).flatMap(r => r.continuations || []).find(c => c.status === "PENDING")?.ready_at;
+  const scheduledWake = t.status === "WAITING" && !t.records_request?.callback_at
+    ? continuationWake || t.records_request?.next_reminder_at || outcome?.wake_at : null;
   const group = state.overview.groups.find((g) => g.id === t.parent_task_id);
   const reason =
+    (t.client_check_in && !t.client_check_in.sent_at && new Date(t.client_check_in.scheduled_at) > new Date()
+      ? `Scheduled for ${date(t.client_check_in.scheduled_at, true)}. No check-in will be sent before then.` : "") ||
     (t.records_request?.callback_at ? "Waiting until the provider’s agreed callback time." : "") ||
     t.progress_json.last_reason ||
     outcome?.reason ||
@@ -439,8 +475,8 @@ function renderDetail() {
     "";
   $("#detail-id").textContent = short(t.id);
   $("#detail-heading").innerHTML =
-    `${badge(t.task_type === "case.coordination" ? state.overview.supervisors?.find((s) => s.group_task_id === t.id)?.status || t.status : t.status)}<h2>${e(taskTitle(t))}</h2><dl class="detail-props"><dt>Assigned to</dt><dd>${agent(t)}</dd><dt>Case</dt><dd>${e(caseName(t))}</dd><dt>Part of</dt><dd>${e(group ? taskTitle(group) : "Standalone task")}</dd><dt>Next step</dt><dd>${e(reason || "Agent will assess the task.")}</dd>${outcome?.wake_at && !t.records_request?.callback_at ? `<dt>Scheduled wake</dt><dd>${e(date(outcome.wake_at, true))}</dd>` : ""}</dl>${t.records_request ? `<div class="requirements">${t.records_request.requirements.map((r) => `<span>${e(statusName(r.record_type))} / ${e(statusName(r.status))} / ${r.all_dates ? "all dates" : `${e(r.from_date)} ${e(r.through_date)}`}</span>`).join("")}<span>${e(statusName(t.records_request.status))}</span></div>${!closed(t) ? '<button class="text-button" data-provider>Simulate provider response</button>' : ""}` : ""}`;
-  $("#detail-heading").insertAdjacentHTML("beforeend", recoveryHTML(t) + manualContactsHTML(t) + humanRequestsHTML(t) + seriesHTML(t) + monthlyHTML(t));
+    `${badge(t.task_type === "case.coordination" ? state.overview.supervisors?.find((s) => s.group_task_id === t.id)?.status || t.status : t.status)}<h2>${e(taskTitle(t))}</h2><dl class="detail-props"><dt>Assigned to</dt><dd>${agent(t)}</dd><dt>Case</dt><dd>${e(caseName(t))}</dd><dt>Part of</dt><dd>${group ? `<button class="task-link" data-task="${e(group.id)}">${e(taskTitle(group))}</button>` : "Standalone task"}</dd><dt>Next step</dt><dd>${e(reason || "Agent will assess the task.")}</dd>${scheduledWake ? `<dt>Scheduled wake</dt><dd>${e(date(scheduledWake, true))}</dd>` : ""}</dl>${t.records_request ? `<div class="requirements">${t.records_request.requirements.map((r) => `<span>${e(statusName(r.record_type))} / ${e(statusName(r.status))} / ${r.all_dates ? "all dates" : `${e(r.from_date)} ${e(r.through_date)}`}</span>`).join("")}<span>${e(statusName(t.records_request.status))}</span></div>${!closed(t) ? '<button class="text-button" data-provider>Simulate provider response</button>' : ""}` : ""}`;
+  $("#detail-heading").insertAdjacentHTML("beforeend", pendingUpdateHTML() + checkInHTML() + humanRequestsHTML(t) + recoveryHTML(t) + communicationHTML(t) + manualContactsHTML(t) + seriesHTML(t) + monthlyHTML(t));
   if (t.records_request?.callback_at) {
     const r = t.records_request;
     const when = new Date(r.callback_at).toLocaleString(undefined, {dateStyle: "medium", timeStyle: "short", timeZone: r.callback_timezone});
@@ -475,8 +511,16 @@ function updateWake() {
     ? "Wake queues a durable activation with this comment as new context."
     : closed(t)
       ? "Task is closed. You can still add an audit comment."
-      : "Tag the assigned medical-records agent to enable wake. @supervisor wakes the case coordinator when configured.";
+      : "Tag the assigned agent to enable wake. @supervisor wakes the case coordinator when configured.";
 }
+function executionTraceLinks(run) {
+  const traces = run.observability || run.context?.observability || {};
+  return [["jaeger_url", "Open execution trace"], ["langfuse_url", "Open LLM trace"]]
+    .filter(([key]) => /^https?:\/\//.test(traces[key] || ""))
+    .map(([key, label]) => `<a href="${e(traces[key])}" target="_blank" rel="noopener noreferrer">${label}</a>`)
+    .join(" · ");
+}
+
 function renderDetailTab() {
   const target = $("#detail-content");
   if (state.tab === "activity")
@@ -484,14 +528,14 @@ function renderDetailTab() {
       ? `${state.events.map(eventHTML).join("")}${state.eventsNext ? '<button class="text-button" data-older-events>Load older events</button>' : ""}`
       : '<div class="empty">No activity yet.</div>';
   if (state.tab === "executions")
-    target.innerHTML = `<p class="inline-note">Latest 20 activations. Context, decisions, tool results, and actual token usage are saved per execution. Provider tools are simulated.</p>${state.runs.map((run, i) => `<details class="run" ${i === state.runs.length - 1 ? "open" : ""}><summary><span>Activation ${run.cycle + 1} / ${e(run.mode)}</span>${badge(run.status)}</summary><div class="run-meta">${e(date(run.created_at, true))} / ${e(run.id)} / attempt ${run.attempt} / ${number(run.usage?.total_tokens)} tokens / ${number(run.usage?.requests)} model calls</div><p>${e(run.decision?.summary || run.error_type || "Execution is in progress.")}</p>${run.decision?.next_action ? `<p><strong>${e(run.decision.next_action.type)}</strong> / ${e(run.decision.next_action.reason)}</p>` : ""}${run.outcome?.reason && run.outcome.reason !== run.decision?.next_action?.reason ? `<p class="inline-note">Backend: ${e(run.outcome.reason)}</p>` : ""}${(run.usage?.tool_rejections || []).map(r => `<p class="inline-note">Action postponed: ${e(statusName(r.tool))}. Due ${e(date(r.ready_at, true))}. No action was taken.</p>`).join("")}<h4>Tool calls (${run.tools.length})</h4>${run.tools.map((tool) => `<details class="run-tools"><summary>${e(tool.name)}<span class="mode">Simulated</span></summary><p>Idempotency key: <code>${e(tool.logical_key)}</code></p><pre>${pretty(tool.result)}</pre></details>`).join("")}<details><summary>Saved decision & committed outcome</summary><pre>${pretty({ decision: run.decision, outcome: run.outcome, usage: run.usage })}</pre></details></details>`).join("") || '<div class="empty">No executions yet. The worker will pick up the task.</div>'}`;
+    target.innerHTML = `<p class="inline-note">Latest 20 activations. Context, decisions, tool results, and actual token usage are saved per execution. Provider tools are simulated.</p>${state.runs.map((run, i) => `<details class="run" ${i === state.runs.length - 1 ? "open" : ""}><summary><span>Activation ${run.cycle + 1} / ${e(run.mode)}</span>${badge(run.status)}</summary><div class="run-meta">${e(date(run.created_at, true))} / ${e(run.id)} / attempt ${run.attempt} / ${number(run.usage?.total_tokens)} tokens / ${number(run.usage?.requests)} model calls</div><p>${executionTraceLinks(run)}</p><p>${e(run.decision?.summary || run.error_type || "Execution is in progress.")}</p>${run.decision?.next_action ? `<p><strong>${e(run.decision.next_action.type)}</strong> / ${e(run.decision.next_action.reason)}</p>` : ""}${run.outcome?.reason && run.outcome.reason !== run.decision?.next_action?.reason ? `<p class="inline-note">Backend: ${e(run.outcome.reason)}</p>` : ""}${(run.usage?.tool_rejections || []).map(r => `<p class="inline-note">Action postponed: ${e(statusName(r.tool))}. Due ${e(date(r.ready_at, true))}. No action was taken.</p>`).join("")}<h4>Tool calls (${run.tools.length})</h4>${run.tools.map((tool) => `<details class="run-tools"><summary>${e(tool.name)}<span class="mode">Simulated</span></summary><p>Idempotency key: <code>${e(tool.logical_key)}</code></p><pre>${pretty(tool.result)}</pre></details>`).join("")}<details><summary>Saved decision & committed outcome</summary><pre>${pretty({ decision: run.decision, outcome: run.outcome, usage: run.usage })}</pre></details></details>`).join("") || '<div class="empty">No executions yet. The worker will pick up the task.</div>'}`;
   if (state.tab === "context") {
     const run = state.runs.at(-1),
       ctx = run?.context;
     const snapshot = ctx
       ? `<p class="inline-note">Saved context for activation ${run.cycle + 1}. Includes scoped instructions and source-backed task history. Historical passages and a source-linked digest are saved when available; current restrictions remain separate.</p><div class="mini-label">Instructions</div>${(ctx.instructions || []).map((i) => `<div class="instructions"><strong>${e(statusName(i.scope))} / Revision ${i.revision}</strong><p>${e(i.text)}</p><code>${e(i.id)}</code></div>`).join("")}<div class="mini-label">Context sources / ${(ctx.sources || []).length}</div>${(ctx.sources || []).map((s) => `<details class="run"><summary>Source / ${e(s.id.slice(0, 8))}</summary><pre>${pretty(s)}</pre></details>`).join("") || '<p class="inline-note">No incoming message sources at the start of this activation. Sources returned by tools appear under Executions.</p>'}<details class="run"><summary>Full context snapshot</summary><pre>${pretty(ctx)}</pre></details><details class="run"><summary>Current task progress & completion criteria</summary><pre>${pretty({ progress: state.detail.progress_json, completion: state.detail.completion_json })}</pre></details>`
       : '<div class="empty">Context is assembled when the agent first runs.</div>';
-    target.innerHTML = checkInHTML() + memoryHTML() + historyHTML() + snapshot;
+    target.innerHTML = memoryHTML() + historyHTML() + snapshot;
   }
 }
 
@@ -709,7 +753,7 @@ async function loadMore() {
     }
     const isTask = state.view === "tasks";
     const page = await api(
-      `${root()}/${isTask ? "tasks" : "activity"}?${query({ case_id: state.case, status: isTask ? $("#status").value : null, before: isTask ? state.next : state.activityNext })}`,
+      `${root()}/${isTask ? "tasks" : "activity"}?${query({ case_id: state.case, include_parents: isTask ? true : null, status: isTask ? $("#status").value : null, before: isTask ? state.next : state.activityNext })}`,
     );
     if (isTask) {
       state.tasks = mergeRows(state.tasks, page.items);
@@ -1114,7 +1158,6 @@ $("#create-form").addEventListener("submit", async (ev) => {
         parent_task_id: $("#create-parent").value || null,
         patient_contact_id: $("#create-patient").value,
         provider_contact_id: $("#create-provider").value,
-        agent_version: 3,
         objective: $("#create-objective").value,
         requirements,
       }),
@@ -1186,9 +1229,13 @@ providerDialog.id = "provider-modal";
 providerDialog.innerHTML = `
   <form id="provider-form">
     <div class="modal-heading"><h2>Simulate provider response</h2><button type="button" data-close="provider-modal" class="icon-button" aria-label="Close">✕</button></div>
-    <label>Response status<select id="provider-status"><option value="PENDING">Still processing</option><option value="PARTIAL">Receive selected items</option><option value="RECEIVED">Receive all outstanding items</option></select></label>
+    <label>Intake method<select id="provider-intake"><option value="document">Read response and attached documents</option><option value="manual">Manually record a simulated receipt</option></select></label>
+    <label data-manual-receipt>Response status<select id="provider-status"><option value="PENDING">Still processing</option><option value="PARTIAL">Receive selected items</option><option value="RECEIVED">Receive all outstanding items</option></select></label>
     <fieldset id="provider-receipt-fields" hidden><legend>Items included in this delivery</legend><div id="provider-receipt-items"></div><p class="muted">Select only items actually received. Other requirements remain outstanding.</p></fieldset>
     <label>Message<textarea id="provider-message" rows="3" required maxlength="2000" placeholder="Please call back Friday at 2pm."></textarea></label>
+    <label id="provider-documents">Documents (PDF or text, up to three files, 2 MB each)<input id="provider-files" type="file" accept="application/pdf,text/plain,.pdf,.txt" multiple /></label>
+    <p id="provider-file-summary" class="inline-note" role="status">No documents selected. A message alone does not prove receipt.</p>
+    <p id="provider-document-note" class="muted">The worker reads the response and files. A page count alone does not prove an item arrived. Scanned PDFs need human review.</p>
     <details id="provider-callback-fields"><summary>Callback schedule (optional)</summary>
       <label>Hospital timezone<input id="provider-callback-zone" placeholder="America/New_York" maxlength="100" /></label>
       <div class="form-row"><label>Exact date (optional)<input id="provider-callback-date" type="date" /></label><label>Time if not in message<input id="provider-callback-time" type="time" value="09:00" /></label></div>
@@ -1205,6 +1252,20 @@ $("#provider-form").addEventListener("submit", async (ev) => {
   button.disabled = true;
   $("#provider-error").hidden = true;
   try {
+    if ($("#provider-intake").value === "document") {
+      const target = `${taskRoot(state.selected)}/provider-responses`;
+      const files = Array.from($("#provider-files").files);
+      if (files.length > 3) throw new Error("Attach at most three files.");
+      const message = $("#provider-message").value;
+      const attachments = await Promise.all(files.map(providerAttachment));
+      await api(target, {method:"POST", headers:{"Idempotency-Key":(state.providerKey ||= crypto.randomUUID())},
+        body:JSON.stringify({message,attachments})});
+      state.providerKey = null;
+      providerDialog.close();
+      toast("Original response saved. Document extraction and agent wake queued.");
+      await refreshDetail(true); await refresh();
+      return;
+    }
     const pending = $("#provider-status").value !== "RECEIVED";
     const receipt = $("#provider-status").value !== "PENDING";
     const received = $$('#provider-receipt-items input:checked').map((el) => el.value);
@@ -1240,10 +1301,31 @@ $("#provider-form").addEventListener("submit", async (ev) => {
   }
 });
 $("#provider-form").addEventListener("input", () => (state.providerKey = null));
+$("#provider-files").addEventListener("change", () => {
+  const files = Array.from($("#provider-files").files);
+  $("#provider-file-summary").textContent = files.length
+    ? files.map(file=>`${file.name} (${Math.ceil(file.size/1024)} KB)`).join(" · ")
+    : "No documents selected. A message alone does not prove receipt.";
+  state.providerKey = null;
+});
+async function providerAttachment(file) {
+  if (!file.size || file.size > 2000000) throw new Error("Each document must be between 1 byte and 2 MB.");
+  const content_base64 = await new Promise((resolve,reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",")[1]);
+    reader.onerror = () => reject(new Error("Could not read document."));
+    reader.readAsDataURL(file);
+  });
+  return {filename:file.name, content_type:file.name.toLowerCase().endsWith(".pdf") ? "application/pdf" : "text/plain",content_base64};
+}
+$("#provider-intake").onchange = updateProviderReceipt;
 function updateProviderReceipt() {
   const status = $("#provider-status").value;
-  $("#provider-callback-fields").hidden = status === "RECEIVED";
-  $("#provider-receipt-fields").hidden = status === "PENDING";
+  const documentMode = $("#provider-intake").value === "document";
+  $("[data-manual-receipt]").hidden = documentMode;
+  $("#provider-documents").hidden = $("#provider-document-note").hidden = !documentMode;
+  $("#provider-callback-fields").hidden = documentMode || status === "RECEIVED";
+  $("#provider-receipt-fields").hidden = documentMode || status === "PENDING";
   $$('#provider-receipt-items input').forEach((el) => {
     el.disabled = status !== "PARTIAL";
     el.checked = status === "RECEIVED";
@@ -1413,27 +1495,35 @@ function renderHumanQueue() {
   $("#result-count").textContent = `${rows.length} open requests loaded`;
 }
 function humanRequestsHTML(task) {
-  return (state.humanRequests || []).map((r) => {
+  const renderRequest = (r) => {
     const draft = state.humanDrafts?.[r.id] || {};
     const selected = draft.action || r.allowed_actions[0]?.action;
     const choice = r.allowed_actions.find((a) => a.action === selected);
+    const authorization = selected === "PROVIDE_UPDATED_AUTHORIZATION" || (selected === "RESOLVE_COMMUNICATION" && choice?.payload_schema?.required?.includes("authorization_source_id"));
     const scheduled = selected === "SCHEDULE_FOLLOW_UP";
     return `<section class="task-memory" aria-label="Human request">
       <h3>${e(statusName(r.kind))} / ${e(statusName(r.status))}</h3>
-      <p><strong>${e(r.question)}</strong></p><p>${e(r.context_summary)}</p>
+      <p><strong>${e(r.question)}</strong></p><details class="review-assessment"><summary>Agent assessment</summary><p>${e(r.context_summary)}</p></details>
       <p>Owner: ${e(r.assignee || "Unassigned")}${r.due_at ? ` / Due ${e(date(r.due_at,true))}` : ""}${r.overdue ? " / Overdue" : ""}</p>
-      ${(r.evidence_source_ids || []).slice(-20).map((id) => `<details><summary>Supporting evidence</summary><button class="text-button" data-memory-source="${e(id)}">Read evidence ${e(id.slice(0,8))}</button><div></div></details>`).join("")}
+      ${(r.evidence_source_ids || []).slice(-20).map((id, index) => `<details><summary>${index === 0 && ["provider_response.v1", "communication_review.v1"].includes(r.handler) ? "Original response" : "Supporting evidence"}</summary><button class="text-button" data-memory-source="${e(id)}">Read evidence ${e(id.slice(0,8))}</button><div></div></details>`).join("")}
       ${r.decisions.map((d) => `<div class="instructions"><strong>${e(statusName(d.action))}</strong><p>${e(d.reason)}</p><small>${e(d.actor)} / ${e(date(d.created_at,true))}</small></div>`).join("")}
       ${r.continuations.map((c) => `<p class="inline-note">Authorized follow-up: ${e(statusName(c.status))} / Scheduled ${e(date(c.ready_at,true))} / Response deadline ${e(date(c.response_due_at,true))}. Contact remains simulated.</p>`).join("")}
       ${r.actionable && !closed(task) ? `<form data-human-response="${e(r.id)}" data-request-version="${r.version}" data-task-version="${task.version}">
         <label>Next step<select name="action">${r.allowed_actions.map((a) => `<option value="${e(a.action)}" ${selected === a.action ? "selected" : ""}>${e(a.label)}</option>`).join("")}</select></label>
         <p data-human-consequence class="inline-note">${e(choice?.consequence)}</p>
         <div data-human-schedule ${scheduled ? "" : "hidden"}>
-          <label>Follow-up time (${e(Intl.DateTimeFormat().resolvedOptions().timeZone)})<input type="datetime-local" name="follow_up_at" value="${e(draft.follow_up_at || "")}" ${scheduled ? "required" : ""}></label>
+          <label>Follow-up time (${e(Intl.DateTimeFormat().resolvedOptions().timeZone)})<input type="datetime-local" name="follow_up_at" min="${e(localInput(new Date(Date.now()+60000).toISOString()))}" value="${e(draft.follow_up_at || "")}" ${scheduled ? "required" : ""}></label>
           <label>Wait for provider response until<input type="datetime-local" name="response_due_at" value="${e(draft.response_due_at || "")}" ${scheduled ? "required" : ""}></label>
         </div>
+        <div data-human-authorization ${authorization ? "" : "hidden"}>
+          <label>Updated authorization document<input name="authorization_file" type="file" accept="application/pdf,text/plain,.pdf,.txt" ${authorization ? "required" : ""}></label>
+          <label ${selected === "RESOLVE_COMMUNICATION" ? "hidden" : ""}>Wait for provider response until<input name="authorization_response_due_at" type="datetime-local" value="${e(draft.authorization_response_due_at || "")}" min="${e(localInput(new Date(Date.now()+60000).toISOString()))}" ${selected === "PROVIDE_UPDATED_AUTHORIZATION" ? "required" : ""}></label>
+          <label><input name="confirmed_valid" type="checkbox" ${draft.confirmed_valid ? "checked" : ""} ${authorization ? "required" : ""}> I reviewed this document and confirm it is valid for this request.</label>
+        </div>
+        ${selected === "RESOLVE_COMMUNICATION" ? '<label><input name="confirmed_reviewed" type="checkbox" required> I reviewed the original communication and its interpretation.</label><label><input name="restrictions_resolved" type="checkbox" required> I confirm the reported restrictions and prerequisites have been resolved for this task. This does not change firm policy.</label>' : ""}
         <label>Reason / guidance<textarea name="reason" rows="3" required maxlength="2000">${e(draft.reason || "")}</textarea></label>
         <p class="inline-note">Decisions are attributed to the User. Existing restrictions remain enforced.</p>
+        <p class="error" role="alert" data-human-error ${state.humanErrors?.[r.id] ? "" : "hidden"}>${e(state.humanErrors?.[r.id] || "")}</p>
         <button type="submit" class="primary">${selected === "REVISE_OBJECTIVE" ? "Continue to objective form" : "Record decision"}</button>
       </form>` : r.status === "OPEN" ? '<p class="inline-note">Wait for the agent to stop for review, then refresh.</p>' : '<p class="inline-note">Decision recorded. Check the task timeline for the continuation outcome.</p>'}
       ${r.status === "OPEN" && !closed(task) ? `<details><summary>Assign owner or deadline</summary><form data-human-assignment="${e(r.id)}" data-request-version="${r.version}">
@@ -1442,7 +1532,12 @@ function humanRequestsHTML(task) {
         <p class="inline-note">Owner labels organize work in this local prototype; they do not grant account permissions.</p>
         <button type="submit" class="text-button">Save assignment</button></form></details>` : ""}
     </section>`;
-  }).join("");
+  };
+  const rows = state.humanRequests || [];
+  const active = rows.filter(r => r.status === "OPEN");
+  const past = rows.filter(r => r.status !== "OPEN");
+  return active.map(renderRequest).join("") + (past.length
+    ? `<details class="task-memory review-history"><summary>Previous reviews (${past.length})</summary>${past.map(renderRequest).join("")}</details>` : "");
 }
 function localInput(value) {
   if (!value) return "";
@@ -1464,6 +1559,9 @@ document.addEventListener("change", (event) => {
   form.querySelector("[data-human-consequence]").textContent = request.allowed_actions.find((a) => a.action === selected).consequence;
   form.querySelector("[data-human-schedule]").hidden = selected !== "SCHEDULE_FOLLOW_UP";
   form.elements.follow_up_at.required = form.elements.response_due_at.required = selected === "SCHEDULE_FOLLOW_UP";
+  const authorization = selected === "PROVIDE_UPDATED_AUTHORIZATION";
+  form.querySelector("[data-human-authorization]").hidden = !authorization;
+  form.elements.authorization_file.required = form.elements.authorization_response_due_at.required = form.elements.confirmed_valid.required = authorization;
   form.querySelector("button[type=submit]").textContent = selected === "REVISE_OBJECTIVE" ? "Continue to objective form" : "Record decision";
 });
 document.addEventListener("submit", async (event) => {
@@ -1498,17 +1596,35 @@ document.addEventListener("submit", async (event) => {
         action:data.action, reason:data.reason.trim(), payload:data.action === "SCHEDULE_FOLLOW_UP"
           ? {follow_up_at:new Date(data.follow_up_at).toISOString(),response_due_at:new Date(data.response_due_at).toISOString()} : {}};
     }
+    if (form.dataset.humanResponse && data.action === "RESOLVE_COMMUNICATION") {
+      if (!form.elements.confirmed_reviewed.checked || !form.elements.restrictions_resolved.checked) throw new Error("Review the communication and resolve its blockers first.");
+      body.payload = {confirmed_reviewed:true, restrictions_resolved:true};
+    }
+    if (form.dataset.humanResponse && (data.action === "PROVIDE_UPDATED_AUTHORIZATION" || (data.action === "RESOLVE_COMMUNICATION" && request.allowed_actions.find(a=>a.action===data.action)?.payload_schema?.required?.includes("authorization_source_id")))) {
+      const file = form.elements.authorization_file.files[0];
+      if (!file || !form.elements.confirmed_valid.checked) throw new Error("Provide and review the updated authorization document.");
+      const attachment = await providerAttachment(file);
+      const digest = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",await file.arrayBuffer()))).map(n=>n.toString(16).padStart(2,"0")).join("");
+      const uploaded = await api(`/v1/firms/${state.firm}/tasks/${request.task_id}/records-authorizations`, {
+        method:"POST",headers:{"Idempotency-Key":`auth-${id}-${digest}`},body:JSON.stringify(attachment)});
+      body.payload = {...body.payload, authorization_source_id:uploaded.source_id,confirmed_valid:true};
+      if (data.action === "PROVIDE_UPDATED_AUTHORIZATION") body.payload.response_due_at = new Date(data.authorization_response_due_at).toISOString();
+    }
     const target = `/v1/firms/${state.firm}/human-requests/${id}/${operation}`;
     const intent = JSON.stringify(body);
     state.humanWrites ||= {};
     if (state.humanWrites[target]?.intent !== intent) state.humanWrites[target] = {intent,key:crypto.randomUUID()};
     await api(target, {method:"POST",headers:{"Idempotency-Key":state.humanWrites[target].key},body:intent});
     delete state.humanWrites[target];
+    if (state.humanErrors) delete state.humanErrors[id];
     if (state.humanDrafts) delete state.humanDrafts[id];
     toast(operation === "assignment" ? "Assignment saved." : "Decision saved. Continuation queued; other blockers still apply.");
     await refreshDetail(true); await refresh();
   } catch (err) {
+    (state.humanErrors ||= {})[id] = err.message;
     if (err.status === 409) { state.humanWrites = {}; await refreshDetail(true); }
+    const error = document.querySelector(`[data-human-response="${CSS.escape(id)}"] [data-human-error]`);
+    if (error) { error.hidden = false; error.textContent = err.message; }
     toast(err.message);
   } finally { button.disabled = false; }
 });
@@ -1601,7 +1717,7 @@ function contactFields(task, draft = {}) {
     <p class="inline-note">Attributed to User. Notes remain unverified statements, not document receipt or a completed client check-in.</p>`;
 }
 function recoveryHTML(task) {
-  return (state.taskIncidents || []).map((i) => {
+  const renderIncident = (i) => {
     const draft = state.recoveryDrafts?.[i.id] || {};
     return `<section class="task-memory"><h3>Execution incident / ${e(statusName(i.status))}</h3><p>${e(i.error_type)} / ${e(statusName(i.category))}</p><p>Failed cycle ${i.failed_cycle}. Recovery attempts used: ${i.generation} / 3.</p><p>${e(i.delivery_note)}</p><details><summary>Saved actions (${i.saved_actions.length}${i.saved_actions_truncated ? "+" : ""})</summary><pre>${pretty(i.saved_actions)}</pre></details>
     ${i.resolution ? `<p>${e(i.resolution.action)}: ${e(i.resolution.reason)}</p><small>${e(i.resolution.actor)}</small>` : ""}
@@ -1611,13 +1727,18 @@ function recoveryHTML(task) {
       <label class="wake-label"><input type="checkbox" name="include_contact" ${draft.include_contact ? "checked" : ""}> Record manual contact with this decision</label>
       <fieldset data-recovery-contact ${draft.include_contact ? "" : "hidden disabled"}><legend>Manual contact</legend>${contactFields(task,draft)}</fieldset>
       <p class="inline-note">Retry starts a new execution on the same assignment with current facts and policy. Saved actions remain deduplicated. Cancel stops future work.</p><button type="submit" class="primary">Save recovery decision</button></form>` : ""}</section>`;
-  }).join("");
+  };
+  const rows = state.taskIncidents || [];
+  const open = rows.filter(i=>i.status === "OPEN");
+  const resolved = rows.filter(i=>i.status !== "OPEN");
+  return open.map(renderIncident).join("") + (resolved.length
+    ? `<details class="task-memory review-history"><summary>Resolved execution incidents (${resolved.length})</summary>${resolved.map(renderIncident).join("")}</details>` : "");
 }
 function manualContactsHTML(task) {
   if (task.kind !== "AGENT") return "";
   const draft = state.contactDrafts?.[task.id] || {};
-  return `<section class="task-memory"><h3>Manual contact</h3>${(state.manualContacts || []).map((c) => `<div class="instructions"><strong>${e(statusName(c.outcome))} / ${e(statusName(c.channel))}</strong><p>${e(c.notes)}</p><small>Contact ${e(date(c.occurred_at,true))}; recorded ${e(date(c.recorded_at,true))} by ${e(c.actor)}</small></div>`).join("")}
-    ${!["COMPLETED","CANCELLED"].includes(task.status) ? `<details><summary>Record a call or other contact</summary><form data-record-contact="${e(task.id)}" data-task-version="${task.version}">${contactFields(task,draft)}<button type="submit" class="text-button">Save contact</button></form></details>` : ""}</section>`;
+  return `<details class="task-memory"><summary>Manual contact (optional)</summary>${(state.manualContacts || []).map((c) => `<div class="instructions"><strong>${e(statusName(c.outcome))} / ${e(statusName(c.channel))}</strong><p>${e(c.notes)}</p><small>Contact ${e(date(c.occurred_at,true))}; recorded ${e(date(c.recorded_at,true))} by ${e(c.actor)}</small></div>`).join("")}
+    ${!["COMPLETED","CANCELLED"].includes(task.status) ? `<details><summary>Record a call or other contact</summary><form data-record-contact="${e(task.id)}" data-task-version="${task.version}">${contactFields(task,draft)}<button type="submit" class="text-button">Save contact</button></form></details>` : ""}</details>`;
 }
 function contactPayload(form) {
   const f = form.elements;
@@ -1689,3 +1810,28 @@ function renderOperations() {
   };
   $("#content").innerHTML = `<div class="operations"><div class="ops-summary"><span>${data.alert_count ? `${data.alert_count} active alert conditions` : "No active alerts"}</span><small>Checked ${e(date(data.as_of, true))} · Firm-wide</small></div>${data.signals.map(s => `<section class="ops-signal ${s.alert ? "ops-alert" : ""}"><div class="ops-heading"><h3>${e(s.label)}</h3><span class="ops-state">${s.alert ? "Needs attention" : "Within threshold"}</span></div><div class="ops-value">${number(s.count)}${s.age_seconds !== undefined ? `<small>Oldest ${duration(s.age_seconds)}</small>` : ""}${s.overdue_count ? `<small>${s.overdue_count} past due</small>` : ""}</div><p>${e(descriptions[s.key])}${s.threshold_seconds !== undefined ? ` Threshold: ${duration(s.threshold_seconds)}.` : ""}</p>${s.items.length ? `<details data-ops-key="${e(s.key)}" ${expanded.has(s.key) ? "open" : ""}><summary>Inspect oldest ${s.items.length} items</summary><div class="ops-items">${s.items.map(i => `<div><button class="task-link" data-task="${e(i.task_id)}">${e(short(i.task_id))}</button><span>${i.age_seconds !== undefined ? duration(i.age_seconds) : e(statusName(i.status || "OPEN"))}${i.attempts !== undefined ? ` · ${i.attempts} delivery retries` : ""}</span><code>${e(i.workflow_id || i.request_id || "")}</code></div>`).join("")}</div></details>` : ""}</section>`).join("")}</div>`;
 }
+
+
+function communicationHTML(task) {
+  if (closed(task) || task.kind !== "AGENT" || task.task_type === "case.coordination") return "";
+  const contacts = state.overview.contacts.filter(c=>c.case_id === task.case_id);
+  const draft = state.communicationDraft?.task === task.id ? state.communicationDraft : {};
+  return `<details class="task-memory"><summary>Simulate call</summary><p>No phone call is placed. Paste reported speech to test classification, memory and human review.</p><form data-demo-call="${e(task.id)}"><label>Speaker<select name="contact_id" required><option value="" disabled ${draft.contact_id ? "" : "selected"}>Select who spoke</option>${contacts.map(c=>`<option value="${e(c.id)}" ${draft.contact_id === c.id ? "selected" : ""}>${e(c.name)}</option>`).join("")}</select></label><label>Transcript<textarea name="transcript" rows="5" maxlength="10000" required placeholder="We found the records. Please do not call again until we receive an updated authorization.">${e(draft.transcript || "")}</textarea></label><p class="inline-note">Use a full date with a year, or a clear delay such as “call back in 3 days”. A date-only commitment schedules follow-up at 09:00 in ${e(Intl.DateTimeFormat().resolvedOptions().timeZone)}. A promise does not count as received records.</p><button class="primary" type="submit">Save simulated call</button></form></details>`;
+}
+document.addEventListener("input",event=>{
+  const form=event.target.closest("[data-demo-call]");
+  if(form)state.communicationDraft={task:form.dataset.demoCall,...Object.fromEntries(new FormData(form))};
+});
+document.addEventListener("submit",async event=>{
+  const form=event.target.closest("[data-demo-call]");if(!form)return;
+  event.preventDefault();const button=form.querySelector("button");button.disabled=true;
+  const body={...Object.fromEntries(new FormData(form)),timezone:Intl.DateTimeFormat().resolvedOptions().timeZone};
+  const intent=JSON.stringify(body),target=`${taskRoot(form.dataset.demoCall)}/demo-call`;
+  if(state.communicationWrite?.intent!==intent || state.communicationWrite?.target!==target)state.communicationWrite={intent,target,key:crypto.randomUUID()};
+  try{
+    await api(target,{method:"POST",headers:{"Idempotency-Key":state.communicationWrite.key},body:intent});
+    state.communicationWrite=null;state.communicationDraft=null;
+    toast("Simulated call saved. Interpretation queued; watch Activity and memory.");
+    await refreshDetail(true);await refresh();
+  }catch(err){toast(err.message);}finally{button.disabled=false;}
+});
