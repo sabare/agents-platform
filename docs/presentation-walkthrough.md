@@ -65,7 +65,7 @@ On a completed child, open **Executions**:
 
 - **Open LLM trace** → **llm.call → Preview**: input, output, model, tokens.
 - **Open execution trace**: context, model, tools, database, result and timing.
-- [Temporal](http://localhost:8233): search the task UUID; show timer and signal history.
+- **Open in Temporal** beside **Copy ID**: show timer and signal history directly.
 - **Activity & comments**: show the saved source summary, review decision and completion.
 - **Operations**: show pending work and failures.
 - **Agents**: explain that a new agent adds a contract and adapter, then the supervisor discovers it.

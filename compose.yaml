@@ -7,6 +7,7 @@ x-app: &app
     DATABASE_URL: postgresql+psycopg://${DATABASE_APP_USER:-agents_app}:${DATABASE_APP_PASSWORD:-local-app-only}@postgres:5432/agents
     TEMPORAL_ADDRESS: temporal:7233
     TEMPORAL_NAMESPACE: default
+    TEMPORAL_UI_URL: ${TEMPORAL_UI_URL:-http://localhost:8233}
     TEMPORAL_TASK_QUEUE: agents-platform
     LOG_LEVEL: ${LOG_LEVEL:-INFO}
     OTEL_ENABLED: ${OTEL_ENABLED:-false}

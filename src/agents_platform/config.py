@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     migration_database_url: str | None = None
     temporal_address: str = "localhost:7233"
     temporal_namespace: str = "default"
+    temporal_ui_url: str = "http://localhost:8233"
     temporal_task_queue: str = "agents-platform"
     log_level: str = "INFO"
     otel_enabled: bool = False

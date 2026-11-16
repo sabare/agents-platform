@@ -48,6 +48,10 @@ async def workspace(session: Session, request: Request):
     return {
         "firms": [{"id": f.id, "name": f.name} for f in firms],
         "mode": request.app.state.settings.agent_mode,
+        "temporal": {
+            "ui_url": request.app.state.settings.temporal_ui_url,
+            "namespace": request.app.state.settings.temporal_namespace,
+        },
         "agents": [
             {
                 "key": "supervisor",

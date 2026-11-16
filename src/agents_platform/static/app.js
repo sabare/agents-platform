@@ -394,6 +394,8 @@ async function openTask(id) {
   $("#drawer-backdrop").hidden = false;
   document.body.style.overflow = "hidden";
   $("#detail-id").textContent = short(id);
+  $("#open-temporal").hidden = true;
+  $("#open-temporal").removeAttribute("href");
   $("#detail-heading").innerHTML =
     '<div class="inline-note">Loading task…</div>';
   history.replaceState(
@@ -455,6 +457,19 @@ function pendingUpdateHTML() {
     && ev.payload?.source_id && !interpreted.has(ev.payload.source_id));
   return pending ? '<p class="pending-update" role="status"><strong>Update received</strong>Saved and queued for agent review. Document status and the next step will update after review.</p>' : "";
 }
+function temporalTaskURL(task) {
+  const config = state.workspace?.temporal;
+  const coordinator = state.overview?.supervisors?.find(s => s.group_task_id === task.id);
+  const workflow = coordinator?.workflow_id || task.workflow_id;
+  if (!config?.ui_url || !workflow) return null;
+  try {
+    const url = new URL(config.ui_url);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) return null;
+    url.search = url.hash = "";
+    url.pathname = url.pathname.replace(/\/$/, "") + `/namespaces/${encodeURIComponent(config.namespace)}/workflows/${encodeURIComponent(workflow)}`;
+    return url.href;
+  } catch { return null; }
+}
 function renderDetail() {
   const t = state.detail,
     latest = state.runs.at(-1),
@@ -474,6 +489,10 @@ function renderDetail() {
     t.progress_json.last_summary ||
     "";
   $("#detail-id").textContent = short(t.id);
+  const temporalURL = temporalTaskURL(t);
+  $("#open-temporal").hidden = !temporalURL;
+  if (temporalURL) $("#open-temporal").href = temporalURL;
+  else $("#open-temporal").removeAttribute("href");
   $("#detail-heading").innerHTML =
     `${badge(t.task_type === "case.coordination" ? state.overview.supervisors?.find((s) => s.group_task_id === t.id)?.status || t.status : t.status)}<h2>${e(taskTitle(t))}</h2><dl class="detail-props"><dt>Assigned to</dt><dd>${agent(t)}</dd><dt>Case</dt><dd>${e(caseName(t))}</dd><dt>Part of</dt><dd>${group ? `<button class="task-link" data-task="${e(group.id)}">${e(taskTitle(group))}</button>` : "Standalone task"}</dd><dt>Next step</dt><dd>${e(reason || "Agent will assess the task.")}</dd>${scheduledWake ? `<dt>Scheduled wake</dt><dd>${e(date(scheduledWake, true))}</dd>` : ""}</dl>${t.records_request ? `<div class="requirements">${t.records_request.requirements.map((r) => `<span>${e(statusName(r.record_type))} / ${e(statusName(r.status))} / ${r.all_dates ? "all dates" : `${e(r.from_date)} ${e(r.through_date)}`}</span>`).join("")}<span>${e(statusName(t.records_request.status))}</span></div>${!closed(t) ? '<button class="text-button" data-provider>Simulate provider response</button>' : ""}` : ""}`;
   $("#detail-heading").insertAdjacentHTML("beforeend", pendingUpdateHTML() + checkInHTML() + humanRequestsHTML(t) + recoveryHTML(t) + communicationHTML(t) + manualContactsHTML(t) + seriesHTML(t) + monthlyHTML(t));
