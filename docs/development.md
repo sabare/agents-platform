@@ -17,7 +17,7 @@ repeatable and never overwrites an already published definition.
 | Generated API reference | http://localhost:8000/docs |
 | Liveness / readiness | http://localhost:8000/health/live · http://localhost:8000/health/ready |
 | Temporal UI | http://localhost:8233 |
-| Local PostgreSQL | localhost:5432; database/user/password `agents` |
+| Local PostgreSQL | localhost:5432; owner database/user/password `agents`; application uses restricted `agents_app` |
 
 Enter the operator credential through the dashboard connection settings or Swagger
 **Authorize**. It defaults to `local-development-only`. This credential grants local
@@ -57,8 +57,9 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -c constraints-runtime.txt -e '.[dev]'
 docker compose up -d postgres temporal
-make migrate seed
-make api
+make migrate
+python scripts/setup_audit.py
+make seed api
 # Another activated terminal:
 make worker
 ```

@@ -9,6 +9,9 @@ scripted responses or real OpenAI model calls; outreach stays simulated in both 
 
 ## Start here
 
+[Interview design note](docs/INTERVIEW-NOTE.md): design choices, platform primitives,
+working scope, limitations and next steps.
+
 | Question | Guide |
 |---|---|
 | How do I assign work and follow it? | [Task assignment](docs/task-assignment.md) |
@@ -41,8 +44,8 @@ scripted responses or real OpenAI model calls; outreach stays simulated in both 
 Monthly calendars keep their date and skip a slot when recent or pending contact
 already covers it. The default minimum gap is 28 local calendar days. See
 [monthly check-ins](docs/monthly-check-ins.md) for settings and covered cases.
-General free-text check-in planning, recorded off-platform contact, broader manual
-intervention and real integrations remain in the [roadmap](docs/roadmap.md).
+Description-first planning and recorded manual contact are implemented. Real communication
+integrations and production controls remain in the [roadmap](docs/roadmap.md).
 
 ## Run locally
 
@@ -65,3 +68,13 @@ See [the interviewer walkthrough review](docs/acceptance-review.md) for live-mod
 observed failures, fixes and remaining gaps.
 
 Developer guide: [Adding agents and automatic supervisor discovery](docs/adding-agents.md).
+
+Local tracing: [OpenTelemetry, Jaeger and Langfuse](docs/observability.md).
+
+Audit journal: [Common events, permissions, retention and verification](docs/audit.md).
+
+Behavior demonstration: [Hospital partial records and updated authorization](docs/hospital-response.md).
+
+Conversation demo: [Reported facts, commitments and restrictions from simulated calls](docs/communications.md).
+
+Manual presentation: [Fresh demo workspace, prompts, upload steps and dashboard guide](docs/presentation-walkthrough.md).
