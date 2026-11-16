@@ -970,3 +970,17 @@ the full agent catalog plus differing intake schemas. Check-in summaries include
 the resolved message, client, time and one-off cadence. Pydantic/domain code owns
 technical field validation; the reviewer checks business omissions. This fixes a
 false clarification claiming `message` was absent even though it was already saved.
+
+### Built-in workspace reporting in assignment coverage
+
+The intake coverage reviewer previously saw only a collection step and could treat
+“tell me about missing items or anything that needs my help” as uncovered extra work.
+The coverage packet now explicitly includes the runtime's automatic progress,
+missing-item and blocker reporting through task Activity and the human review queue.
+Records work summaries also include that reporting. Planner v4 / coverage reviewer v5
+(router v6) count this behavior without adding a reporting assignment or asking for
+confirmation. Surgical notes are explicitly listed among supported record types.
+External delivery remains separate and unsupported unless a registered capability
+actually provides it. Three live runs of the reported typo-containing request and
+the exact walkthrough prompt returned ready plans; external PDF email delivery
+still required clarification. The affected intake regression suite passed 26 tests.

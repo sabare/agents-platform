@@ -140,8 +140,13 @@ Ask the user only for missing business intent, never for code/schema/field corre
 This is an independent coverage check, not a request to agree with the planner.
 Supported capabilities include the supplied registered agent catalog plus records collection,
 one-off client check-ins, monthly calendars and interval check-in series, using simulated outreach.
-Reporting updates in the firm's workspace is supported. Actual external email/PDF delivery
-or real phone integrations are not.
+The included_platform_behavior is guaranteed by the runtime for every assignment, not
+an optional step the planner must add. Progress, missing items, blockers and requests for
+teammate help are reported in the firm's workspace through task Activity and human reviews.
+Count this built-in reporting as covered even when a step only names the collection work.
+Never ask whether to include ordinary workspace reporting or create a separate reporting
+assignment. 'Tell me about missing items or anything that needs my help' uses this default.
+Actual external email/PDF delivery or real phone integrations are not supported.
 If any requested work is missing, unsupported, assigned to the wrong named person/hospital,
 or has dates/cadence that conflict with the request, fully_covered=false. Explain the gap and
 ask a concise question. A summary saying 'manual handling required' DOES NOT fulfill a
@@ -163,7 +168,7 @@ Produce a reviewable assignment plan using supplied registered capabilities and 
   a focused objective and assignment_json matching its assignment_schema. Use this for new
   registered domains; no unlisted agent is available. Do not include platform scope fields.
   For the existing records/check-in/calendar use cases, prefer the specialized step types below.
-- records: collect RECORDS, BILLS and/or IMAGING from one or more case medical providers;
+- records: collect RECORDS, SURGICAL_NOTES, BILLS and/or IMAGING from case medical providers;
   combine all hospitals in one records step with separate approved targets.
 - check_in: one scheduled client check-in; default now if not specified.
 - monthly: a calendar client check-in schedule, with explicit timezone/day/time/count.
@@ -171,7 +176,11 @@ Produce a reviewable assignment plan using supplied registered capabilities and 
 You can combine these capabilities in one plan. Preserve every requested part. Unsupported
 work (including sending actual documents to an external email recipient) requires clarification;
 never silently drop a clause or claim real delivery. This demo reports progress in the firm's
-workspace; outreach and receipts are simulated. Do not invent agents or capabilities.
+workspace; outreach and receipts are simulated. Every assignment already reports progress,
+missing items and blockers in task Activity, with human reviews when needed. Requests such
+as 'tell me about missing items or anything that needs my help' need no extra assignment,
+reporting parameter or clarification. Keep that reporting intent in the plan summary.
+Do not invent agents or capabilities.
 Use only supplied case/contact UUIDs. Match named people and hospitals against case contacts.
 Never substitute an unknown hospital, guess ambiguous names, or choose all providers unless
 requested. A sole eligible patient may be inferred; disclose that assumption. 'These hospitals'
@@ -216,7 +225,10 @@ def coverage_packet(context, plan):
             for target in step.targets:
                 work.append(
                     {
-                        "work": "Collect records",
+                        "work": (
+                            "Collect records and report missing items or blockers "
+                            "in the firm workspace"
+                        ),
                         "patient": contacts.get(
                             str(target.patient_contact_id), str(target.patient_contact_id)
                         ),
@@ -236,6 +248,16 @@ def coverage_packet(context, plan):
         "timezone": context.get("timezone"),
         "case_contacts": context.get("contacts", []),
         "validated_work": work,
+        "included_platform_behavior": {
+            "reporting_destination": "Firm workspace: task Activity and human review queue",
+            "automatic_updates": [
+                "Progress and completion",
+                "Missing or outstanding items",
+                "Blockers and items needing teammate help",
+            ],
+            "separate_reporting_assignment_required": False,
+            "external_delivery_included": False,
+        },
         "stated_assumptions": plan.assumptions,
         "technical_schema_validation": "PASSED",
     }
@@ -262,7 +284,7 @@ async def interpret_description(settings, context):
             json.dumps(context, default=str),
             definition={
                 "agent_key": "assignment_planner",
-                "version": 3,
+                "version": 4,
                 "instructions": model_instructions(INSTRUCTIONS, settings),
                 "model": settings.openai_model,
             },
@@ -288,7 +310,7 @@ async def interpret_description(settings, context):
                 json.dumps(coverage_packet(context, plan), default=str),
                 definition={
                     "agent_key": "plan_coverage_reviewer",
-                    "version": 4,
+                    "version": 5,
                     "instructions": model_instructions(COVERAGE_INSTRUCTIONS, settings),
                     "model": settings.openai_model,
                 },
@@ -567,7 +589,7 @@ async def propose_assignment(
                 "plan": plan.model_dump(mode="json"),
                 "expected_revision": expected_revision,
                 "usage": usage,
-                "router_version": 5,
+                "router_version": 6,
                 "demo_assumptions_enabled": request.app.state.settings.demo_assume_routine_updates,
                 "capabilities": cards,
                 "instructions_hash": digest(
