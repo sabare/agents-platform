@@ -16,8 +16,12 @@ dependencies = [
     "psycopg[binary]>=3.2,<4",
     "alembic>=1.14,<2",
     "pydantic-settings>=2.6,<3",
-    "temporalio>=1.9,<2",
+    "temporalio[opentelemetry]>=1.9,<2",
+    "opentelemetry-sdk>=1.45,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.45,<2",
+    "langfuse>=5,<6",
     "pgvector>=0.3,<1",
+    "pypdf>=7,<8",
     "tiktoken>=0.8,<1",
     "tzdata>=2025.2",
 ]
@@ -43,6 +47,8 @@ asyncio_default_fixture_loop_scope = "function"
 markers = ["integration: requires running PostgreSQL and Temporal services"]
 
 [tool.ruff]
+# Installed developer skills are external tooling, not application source.
+extend-exclude = [".agents"]
 target-version = "py311"
 line-length = 100
 

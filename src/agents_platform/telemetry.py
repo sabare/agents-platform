@@ -18,7 +18,12 @@ LOG = logging.getLogger("agents_platform.telemetry")
 
 class JsonFormatter(logging.Formatter):
     def format(self, record):
+        from agents_platform.observability import trace_reference
+
         fields = {**dict.fromkeys(IDS), **_CONTEXT.get(), **getattr(record, "fields", {})}
+        reference = trace_reference()
+        if reference:
+            fields.update(trace_id=reference["trace_id"], span_id=reference["span_id"])
         return json.dumps(
             {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -52,6 +57,25 @@ def log_context(**fields):
 
 
 def bind_context(**fields):
+    from agents_platform.observability import bind_identity
+
+    names = {
+        "firm_id": "tenant.id",
+        "case_id": "case.id",
+        "task_id": "task.id",
+        "execution_id": "execution.id",
+        "workflow_id": "temporal.workflow.id",
+    }
+    bind_identity(**{names[k]: v for k, v in fields.items() if k in names})
+    from agents_platform.audit import bind_audit
+
+    bind_audit(
+        **{
+            ("tenant_id" if k == "firm_id" else k): v
+            for k, v in fields.items()
+            if k in ("firm_id", "case_id", "task_id", "execution_id")
+        }
+    )
     _CONTEXT.set({**_CONTEXT.get(), **{k: v for k, v in fields.items() if v is not None}})
 
 
@@ -64,6 +88,10 @@ def emit(name, level=logging.INFO, **fields):
 
 
 def observed_activity(function):
+    from agents_platform.audit import audited_activity
+
+    function = audited_activity(function)
+
     @functools.wraps(function)
     async def wrapped(self, activation):
         from temporalio import activity
@@ -80,6 +108,9 @@ def observed_activity(function):
             info = activity.info()
             fields.update(
                 workflow_id=info.workflow_id,
+                run_id=info.workflow_run_id,
+                activity_id=info.activity_id,
+                activity_type=info.activity_type,
                 attempt=info.attempt,
                 schedule_to_start_ms=max(
                     0,
@@ -87,11 +118,19 @@ def observed_activity(function):
                     * 1000,
                 ),
             )
-        with log_context(**fields):
+        from agents_platform.observability import activity_trace
+
+        with log_context(**fields), activity_trace(fields) as span:
             started = time.monotonic()
             emit("activity.started")
             try:
                 result = await function(self, activation)
+                if isinstance(result, dict):
+                    span.set_attribute("execution.status", result.get("status", "unknown"))
+                    if result.get("status") == "FAILED":
+                        from opentelemetry.trace import Status, StatusCode
+
+                        span.set_status(Status(StatusCode.ERROR))
                 emit(
                     "activity.finished",
                     status=result.get("status") if isinstance(result, dict) else None,

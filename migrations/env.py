@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 from alembic import context
 from sqlalchemy import pool
@@ -9,6 +10,10 @@ from agents_platform.config import get_settings
 from agents_platform.db import Base
 
 target_metadata = Base.metadata
+settings = get_settings()
+migration_url = (
+    os.getenv("DATABASE_URL") or settings.migration_database_url or settings.database_url
+)
 
 
 def run_migrations(connection):
@@ -18,7 +23,7 @@ def run_migrations(connection):
 
 
 async def run_online():
-    engine = create_async_engine(get_settings().database_url, poolclass=pool.NullPool)
+    engine = create_async_engine(migration_url, poolclass=pool.NullPool)
     try:
         async with engine.connect() as connection:
             await connection.run_sync(run_migrations)
@@ -28,7 +33,7 @@ async def run_online():
 
 if context.is_offline_mode():
     context.configure(
-        url=get_settings().database_url,
+        url=migration_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},

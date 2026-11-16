@@ -650,10 +650,12 @@ def test_dashboard_activity_pagination_and_firm_scope(setup):
     assert len({e["id"] for e in events}) == 4
     assert cursor is None
     other_base = base.replace(first["firm_id"], second["firm_id"])
-    assert (
-        client.get(other_base + f"/activity?task_id={task['id']}", headers=AUTH).json()["items"]
-        == []
-    )
+    # A task filter is a scoped resource lookup. Foreign and unknown IDs both
+    # return 404, consistent with task detail reads, without exposing activity.
+    foreign = client.get(other_base + f"/activity?task_id={task['id']}", headers=AUTH)
+    missing = client.get(other_base + f"/activity?task_id={uuid4()}", headers=AUTH)
+    assert foreign.status_code == missing.status_code == 404
+    assert foreign.json() == missing.json() == {"detail": "Task not found"}
     assert (
         client.get(other_base + f"/activity?before={events[0]['id']}", headers=AUTH).status_code
         == 404

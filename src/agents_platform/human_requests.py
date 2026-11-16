@@ -112,6 +112,9 @@ async def ensure_request(
             .limit(1)
         )
         dedupe_key = f"{handler}/{task.id}/{subject_fingerprint}/{latest or 'initial'}"
+        generation = task.progress_json.get("recovery_generation", 0)
+        if generation:
+            dedupe_key += f"/recovery/{generation}"
     existing = await session.scalar(
         select(HumanRequest).where(
             HumanRequest.tenant_id == task.tenant_id, HumanRequest.dedupe_key == dedupe_key
@@ -364,6 +367,14 @@ async def decide_request(session, tenant_id, request_id, body, key):
             body_hash=body_hash,
         )
         await apply_response(session, task, row, decision)
+        if task.kind == "AGENT" and task.status not in ("CANCELLED", "COMPLETED"):
+            task.progress_json = {
+                **task.progress_json,
+                "last_reason": (
+                    "Human decision recorded; the agent will recheck "
+                    "current requirements and restrictions."
+                ),
+            }
         row.status, row.resolved_at, row.version = "RESOLVED", now(), row.version + 1
         event = ActivityEvent(
             id=uuid4(),

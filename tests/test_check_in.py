@@ -154,8 +154,12 @@ async def test_future_task_waits_without_model_or_send_then_sends_once(setup, da
                 == 0
             )
         await asyncio.sleep(max(0, (due - datetime.now(timezone.utc)).total_seconds()) + 0.1)
-        assert (await worker.execute_task(activation(task, 1)))["status"] == "WAITING"
-        assert (await worker.execute_task(activation(task, 2)))["status"] == "WAITING"
+        sent = await worker.execute_task(activation(task, 1))
+        assert sent["status"] == "WAITING" and sent["wait_for_event"]
+        assert "wake_at" not in sent  # No model polling while waiting for an incoming reply.
+        worker.settings.demo_max_activations = 1
+        repeated = await worker.execute_task(activation(task, 2))
+        assert repeated["status"] == "WAITING" and repeated["wait_for_event"]
         async with db.sessions() as session:
             assert (
                 await session.scalar(
@@ -318,7 +322,10 @@ async def test_schedule_and_reply_survive_temporal_worker_restart(setup, databas
         await asyncio.sleep(4)
         async with task_worker(db, worker.settings, temporal, queue):
             async with asyncio.timeout(20):
-                while not client.get(path(task), headers=AUTH).json()["client_check_in"]["sent_at"]:
+                while True:
+                    response = await asyncio.to_thread(client.get, path(task), headers=AUTH)
+                    if response.json()["client_check_in"]["sent_at"]:
+                        break
                     await asyncio.sleep(0.1)
         reply_response = reply(client, task)
         assert reply_response.status_code == 201, reply_response.text

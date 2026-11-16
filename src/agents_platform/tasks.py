@@ -24,6 +24,7 @@ from agents_platform.models import (
     Task,
     TaskInbox,
 )
+from agents_platform.observability import outbox_payload
 from agents_platform.provider_callbacks import resolve_callback
 from agents_platform.task_contracts import (
     CreateRecordsTask,
@@ -297,6 +298,7 @@ async def create_records_task_in_transaction(
             patient_contact_id=body.patient_contact_id,
             provider_contact_id=body.provider_contact_id,
             status="DRAFT",
+            reminder_interval_seconds=body.reminder_interval_seconds,
         )
     )
     await session.execute(
@@ -331,11 +333,13 @@ async def create_records_task_in_transaction(
             event_id=event_id,
             destination="temporal.start_task",
             destination_key=workflow_id,
-            payload={
-                "schema": "start_task.v1",
-                "tenant_id": str(tenant_id),
-                "task_id": str(task_id),
-            },
+            payload=outbox_payload(
+                {
+                    "schema": "start_task.v1",
+                    "tenant_id": str(tenant_id),
+                    "task_id": str(task_id),
+                }
+            ),
         )
     )
     view = await read_task(session, tenant_id, task_id)

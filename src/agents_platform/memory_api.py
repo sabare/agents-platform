@@ -235,6 +235,21 @@ async def change_memory(
             )
             if not previous_item:
                 raise HTTPException(404, "Memory item not found on this task")
+            origin = await session.get(Source, previous_item.source_id)
+            if (
+                origin
+                and (
+                    origin.kind == "PROVIDER_RESPONSE_ANALYSIS"
+                    or (
+                        origin.kind == "COMMUNICATION_ANALYSIS"
+                        and previous_item.kind in ("STOP_CONTACT", "OBLIGATION")
+                    )
+                )
+                and body.operation != "REVIEW"
+            ):
+                raise HTTPException(
+                    409, "Resolve this sourced memory through its typed human request"
+                )
             if previous_item.status != "OPEN" or (
                 previous_item.expires_at and previous_item.expires_at <= now()
             ):

@@ -84,8 +84,8 @@ async def assemble_memory(session, tenant_id, provider_ids, tasks, case_id):
     items.sort(key=lambda i: i["id"])
     selected = {
         "instructions": instructions,
-        "operational_items": [i for i in items if i["kind"] != "NOTE"],
-        "optional_notes": [i for i in items if i["kind"] == "NOTE"],
+        "operational_items": [i for i in items if i["kind"] != "NOTE" or i.get("due_at")],
+        "optional_notes": [i for i in items if i["kind"] == "NOTE" and not i.get("due_at")],
     }
     fingerprint = hashlib.sha256(json.dumps(selected, sort_keys=True).encode()).hexdigest()
     return {

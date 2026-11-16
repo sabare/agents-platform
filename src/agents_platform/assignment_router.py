@@ -6,19 +6,23 @@ permission. Approval reuses domain intake and its existing checks/outbox deliver
 
 import asyncio
 import json
+import re
+import unicodedata
 from datetime import datetime, timezone
 from typing import Literal
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from agents import Agent, ModelSettings, RunConfig, Runner
+from agents import Agent, RunConfig
+from agents.exceptions import ModelBehaviorError
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import Field, model_validator
+from pydantic import Field, ValidationError, model_validator
 from sqlalchemy import select
 
 from agents_platform.capabilities import discover_capabilities
 from agents_platform.check_in_api import CreateCheckIn, create_check_in_in_transaction
 from agents_platform.check_in_series import CreateSeries, create_series_in_transaction
+from agents_platform.config import agent_model_settings
 from agents_platform.coordination import (
     ApprovedAssignment,
     CaseObjective,
@@ -26,6 +30,7 @@ from agents_platform.coordination import (
     digest,
     submit_objective_in_transaction,
 )
+from agents_platform.demo_policy import model_instructions
 from agents_platform.memory import policy_lock
 from agents_platform.models import (
     ActivityEvent,
@@ -37,9 +42,11 @@ from agents_platform.models import (
     Task,
 )
 from agents_platform.monthly_check_ins import CreateMonthly, create_monthly_in_transaction
+from agents_platform.observability import run_agent
 from agents_platform.task_api import Session, require_operator
 from agents_platform.task_contracts import Contract
 from agents_platform.tasks import TaskError
+from agents_platform.telemetry import emit
 
 router = APIRouter(
     prefix="/v1/firms/{tenant_id}/cases/{case_id}/assignments",
@@ -124,7 +131,12 @@ class PlanCoverage(Contract):
         return self
 
 
-COVERAGE_INSTRUCTIONS = """Review the proposed plan against EVERY part of the original request.
+COVERAGE_INSTRUCTIONS = """Review the validated work summary against the entire original request.
+Review business coverage only: requested person/provider, work, dates, timing and recurrence.
+The backend has already validated technical schemas and supplied defaults. Do not invent
+missing API fields or compare specialized built-in steps with generic agent contracts.
+The work summary's message is the actual saved message, distinct from its task title.
+Ask the user only for missing business intent, never for code/schema/field corrections.
 This is an independent coverage check, not a request to agree with the planner.
 Supported capabilities include the supplied registered agent catalog plus records collection,
 one-off client check-ins, monthly calendars and interval check-in series, using simulated outreach.
@@ -181,6 +193,54 @@ This is planning only. No task is created and no outreach occurs until an operat
 """
 
 
+def coverage_packet(context, plan):
+    """Review business intent, not the differing internal schemas of intake and agents."""
+    contacts = {c["id"]: c["name"] for c in context.get("contacts", [])}
+    work = []
+    for step in plan.steps:
+        if step.kind == "check_in":
+            item = step.assignment
+            work.append(
+                {
+                    "work": "One client check-in",
+                    "client": contacts.get(
+                        str(item.client_contact_id), str(item.client_contact_id)
+                    ),
+                    "send_at": item.scheduled_at.isoformat(),
+                    "message_to_client": item.message,
+                    "task_title": item.objective,
+                    "recurring": False,
+                }
+            )
+        elif step.kind == "records":
+            for target in step.targets:
+                work.append(
+                    {
+                        "work": "Collect records",
+                        "patient": contacts.get(
+                            str(target.patient_contact_id), str(target.patient_contact_id)
+                        ),
+                        "provider": contacts.get(
+                            str(target.provider_contact_id), str(target.provider_contact_id)
+                        ),
+                        "documents_and_dates": [
+                            r.model_dump(mode="json") for r in target.requirements
+                        ],
+                    }
+                )
+        else:
+            work.append(step.model_dump(mode="json"))
+    return {
+        "request": context["description"],
+        "now": context.get("now"),
+        "timezone": context.get("timezone"),
+        "case_contacts": context.get("contacts", []),
+        "validated_work": work,
+        "stated_assumptions": plan.assumptions,
+        "technical_schema_validation": "PASSED",
+    }
+
+
 async def interpret_description(settings, context):
     """A replaceable model boundary; tests use typed proposals, never keyword routing."""
     if settings.agent_mode != "openai":
@@ -191,15 +251,22 @@ async def interpret_description(settings, context):
         ), {}
     agent = Agent(
         name="Supervisor assignment planner",
-        instructions=INSTRUCTIONS,
-        model="gpt-4.1-mini",
-        model_settings=ModelSettings(max_tokens=3500, temperature=0),
+        instructions=model_instructions(INSTRUCTIONS, settings),
+        model=settings.openai_model,
+        model_settings=agent_model_settings(settings.openai_model, 3500, temperature=0),
         output_type=AssignmentPlan,
     )
     async with asyncio.timeout(60):
-        result = await Runner.run(
+        result = await run_agent(
             agent,
             json.dumps(context, default=str),
+            definition={
+                "agent_key": "assignment_planner",
+                "version": 3,
+                "instructions": model_instructions(INSTRUCTIONS, settings),
+                "model": settings.openai_model,
+            },
+            mode=settings.agent_mode,
             max_turns=1,
             run_config=RunConfig(tracing_disabled=True),
         )
@@ -211,14 +278,21 @@ async def interpret_description(settings, context):
         if plan.status == "ready":
             verifier = Agent(
                 name="Supervisor plan coverage reviewer",
-                model="gpt-4.1-mini",
-                instructions=COVERAGE_INSTRUCTIONS,
+                model=settings.openai_model,
+                instructions=model_instructions(COVERAGE_INSTRUCTIONS, settings),
                 output_type=PlanCoverage,
-                model_settings=ModelSettings(max_tokens=1000, temperature=0),
+                model_settings=agent_model_settings(settings.openai_model, 1000, temperature=0),
             )
-            reviewed = await Runner.run(
+            reviewed = await run_agent(
                 verifier,
-                json.dumps({**context, "proposed_plan": plan.model_dump(mode="json")}, default=str),
+                json.dumps(coverage_packet(context, plan), default=str),
+                definition={
+                    "agent_key": "plan_coverage_reviewer",
+                    "version": 4,
+                    "instructions": model_instructions(COVERAGE_INSTRUCTIONS, settings),
+                    "model": settings.openai_model,
+                },
+                mode=settings.agent_mode,
                 max_turns=1,
                 run_config=RunConfig(tracing_disabled=True),
             )
@@ -335,6 +409,86 @@ def validate_scope(plan, contacts, case_id, catalog=None, cards=()):
                 raise HTTPException(422, "Planner selected a different case")
 
 
+def provider_identity_questions(plan, contacts, description):
+    """Bind provider choices to names actually supplied by the operator.
+
+    This intentionally asks for the full listed name rather than guessing aliases.
+    The coverage reviewer still checks omissions, negation and the rest of the scope.
+    """
+    if plan.status != "ready":
+        return []
+
+    def normalized(text):
+        return " ".join(re.findall(r"\w+", unicodedata.normalize("NFKC", text).casefold()))
+
+    text = normalized(description)
+    all_providers = re.search(
+        r"\b(?:all|every|each)(?: (?:case|medical|listed|known))? (?:providers?|hospitals?)\b",
+        text,
+    )
+    if all_providers:
+        return []
+    providers = {c["id"]: c["name"] for c in contacts if "MEDICAL_PROVIDER" in c["roles"]}
+    selected = set()
+
+    def collect(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key.endswith("contact_id") and str(item) in providers:
+                    selected.add(str(item))
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    for step in plan.steps:
+        if step.kind == "records":
+            selected.update(str(t.provider_contact_id) for t in step.targets)
+        elif step.kind == "agent":
+            collect(json.loads(step.assignment_json))
+    return [
+        f"Which listed provider do you mean? Confirm the full name '{providers[identity]}' "
+        "in your request, or add the intended provider to this case."
+        for identity in sorted(selected)
+        if f" {normalized(providers[identity])} " not in f" {text} "
+    ]
+
+
+def destination_questions(plan, description):
+    """Literal destinations must be represented by a registered operational input.
+
+    Built-in records/check-in steps have no external delivery operation. Prose in
+    a summary or objective cannot stand in for an executable delivery assignment.
+    Registered extensions still pass their schema and domain checks separately.
+    """
+    if plan.status != "ready":
+        return []
+    destinations = set(
+        re.findall(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|https?://[^\s<>\"']+", description)
+    )
+    represented = set()
+
+    def collect(value):
+        if isinstance(value, str):
+            represented.add(value.casefold().rstrip(".,;!?"))
+        elif isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    for step in plan.steps:
+        if step.kind == "agent":
+            collect(json.loads(step.assignment_json))
+    return [
+        f"This plan has no supported delivery action for '{destination}'. "
+        "Should we assign only the supported work, with delivery handled separately?"
+        for destination in sorted(destinations)
+        if destination.casefold().rstrip(".,;!?") not in represented
+    ]
+
+
 @router.post("/plan")
 async def propose_assignment(
     tenant_id: UUID, case_id: UUID, body: DescribeAssignment, session: Session, request: Request
@@ -354,9 +508,36 @@ async def propose_assignment(
     }
     await session.rollback()  # No transaction or lock spans the model call.
     try:
-        plan, usage = await interpret_description(request.app.state.settings, context)
-        plan = AssignmentPlan.model_validate(plan.model_dump())
+        async with asyncio.timeout(60):
+            for attempt in range(2):
+                try:
+                    plan, usage = await interpret_description(request.app.state.settings, context)
+                    plan = AssignmentPlan.model_validate(plan.model_dump())
+                    usage["planning_retries"] = attempt
+                    if attempt:
+                        usage["earlier_attempt_usage_included"] = False
+                    break
+                except (ModelBehaviorError, ValidationError) as exc:
+                    emit("assignment.plan_rejected", error_type=type(exc).__name__, attempt=attempt)
+                    if attempt == 0:
+                        context["correction_feedback"] = (
+                            "The previous response did not satisfy the output contract. "
+                            "A ready plan must have steps and no questions. An incomplete plan "
+                            "must have questions and no steps. Do not start partial work. "
+                            "The coverage result must also have consistent coverage and gaps."
+                        )
+                        continue
+                    plan = AssignmentPlan(
+                        status="needs_clarification",
+                        summary="The planner could not produce a valid plan. No work was started.",
+                        questions=[
+                            "Please restate the supported work you want assigned, "
+                            "or use manual assignment."
+                        ],
+                    )
+                    usage = {"planning_retries": attempt, "planning_error_type": type(exc).__name__}
     except Exception as exc:
+        emit("assignment.planning_failed", error_type=type(exc).__name__)
         raise HTTPException(
             502, "Could not interpret this description; try again or use manual assignment"
         ) from exc
@@ -364,6 +545,17 @@ async def propose_assignment(
         current_contacts, _ = await case_context(session, tenant_id, case_id)
         current_cards = await catalog.available(session)
         validate_scope(plan, current_contacts, case_id, catalog, current_cards)
+        scope_questions = provider_identity_questions(plan, current_contacts, body.description)
+        scope_questions += destination_questions(plan, body.description)
+        if scope_questions:
+            usage["unapproved_scope_proposal"] = plan.model_dump(mode="json")
+            plan = AssignmentPlan(
+                title=plan.title,
+                status="needs_clarification",
+                summary="The proposed plan needs clarification before any work can start.",
+                assumptions=plan.assumptions,
+                questions=scope_questions,
+            )
         source = Source(
             id=uuid4(),
             tenant_id=tenant_id,
@@ -375,7 +567,8 @@ async def propose_assignment(
                 "plan": plan.model_dump(mode="json"),
                 "expected_revision": expected_revision,
                 "usage": usage,
-                "router_version": 3,
+                "router_version": 5,
+                "demo_assumptions_enabled": request.app.state.settings.demo_assume_routine_updates,
                 "capabilities": cards,
                 "instructions_hash": digest(
                     {"planner": INSTRUCTIONS, "coverage": COVERAGE_INSTRUCTIONS}
@@ -438,6 +631,13 @@ async def approve_assignment(tenant_id: UUID, case_id: UUID, plan_id: UUID, sess
         catalog = discover_capabilities()
         cards = await catalog.available(session)
         validate_scope(plan, contacts, case_id, catalog, cards)
+        description = saved.content["input"]["description"]
+        if provider_identity_questions(plan, contacts, description) or destination_questions(
+            plan, description
+        ):
+            raise HTTPException(
+                409, "Clarify the provider identity or delivery scope and review a new plan"
+            )
         for step in plan.steps:
             if step.kind == "agent" and not any(
                 c["agent_key"] == step.agent_key

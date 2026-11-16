@@ -7,6 +7,7 @@ from agents.strict_schema import ensure_strict_json_schema
 from pydantic import Field, create_model
 
 from agents_platform.capabilities import DelegationScope, delegate_task
+from agents_platform.observability import observed_tool
 from agents_platform.task_contracts import Contract
 
 
@@ -56,7 +57,9 @@ def delegation_tools(catalog, cards, proposals, action_type):
                 name=f"delegate_{card['agent_key']}",
                 description=card["description"],
                 params_json_schema=ensure_strict_json_schema(arguments_type.model_json_schema()),
-                on_invoke_tool=bind(card, arguments_type),
+                on_invoke_tool=observed_tool(
+                    f"delegate_{card['agent_key']}", bind(card, arguments_type)
+                ),
             )
         )
     return tools
@@ -102,3 +105,15 @@ async def apply_delegation(session, catalog, coord, action, card, assignment):
         actor_ref=f"agent/case_supervisor/{coord.agent_version}",
     )
     return await delegate_task(session, catalog, card, scope, assignment)
+
+
+def supervisor_delegation_cards(context):
+    """Offer only callable choices; legacy target actions are not generic tool calls."""
+    cards = context.get("capabilities", [])
+    approved = context.get("objective", {}).get("approved_assignments", [])
+    if approved:
+        allowed = {(a["agent_key"], a["agent_version"]) for a in approved}
+        return [card for card in cards if (card["agent_key"], card["version"]) in allowed]
+    if context.get("objective", {}).get("targets"):
+        return []
+    return cards

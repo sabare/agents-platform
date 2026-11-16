@@ -7,20 +7,23 @@ from datetime import datetime, timedelta
 from typing import Literal
 from uuid import UUID, uuid4, uuid5
 
-from agents import Agent, Model, ModelResponse, ModelSettings, RunConfig, Runner, Usage
+from agents import Agent, Model, ModelResponse, RunConfig, Usage
 from openai.types.responses import ResponseOutputMessage, ResponseOutputText
 from pydantic import Field, model_validator
 from sqlalchemy import select
 from temporalio import activity
 
+from agents_platform.audit import append_event, bind_audit, make_event
 from agents_platform.capabilities import discover_capabilities
 from agents_platform.client_reviews import review_view
+from agents_platform.config import agent_model_settings
 from agents_platform.context import (
     PLATFORM_INSTRUCTIONS,
     ContextBudgetExceeded,
     ExecutionRetrieval,
     ModelBudget,
 )
+from agents_platform.demo_policy import model_instructions
 from agents_platform.execution import now
 from agents_platform.memory import instructions_for, memory_for_case, policy_lock
 from agents_platform.memory_history import historical_context
@@ -33,6 +36,7 @@ from agents_platform.models import (
     ClientReview,
     Contact,
     Execution,
+    HumanRequest,
     OutboxMessage,
     RecordEvidence,
     Source,
@@ -40,6 +44,15 @@ from agents_platform.models import (
     TaskInbox,
     ToolInvocation,
 )
+from agents_platform.observability import (
+    bind_identity,
+    evaluation_scores,
+    phase,
+    record_context,
+    run_agent,
+    trace_reference,
+)
+from agents_platform.source_content import model_source_content
 from agents_platform.task_contracts import Contract, CreateRecordsTask, RecordRequirementInput
 from agents_platform.tasks import TaskError, create_records_task_in_transaction, read_task
 from agents_platform.telemetry import bind_context, observed_activity
@@ -82,16 +95,49 @@ class SupervisorAction(Contract):
     agent_version: int | None = None
     task_objective: str | None = Field(default=None, min_length=1, max_length=2000)
     assignment_json: str | None = Field(default=None, max_length=20000)
+    review_task_id: UUID | None = Field(
+        default=None,
+        description=(
+            "For request_human_review about a specialist, use that existing child task ID. "
+            "Use null only for case-objective clarification. Reuse existing typed human requests."
+        ),
+    )
     target_index: int | None
     question: str | None
 
 
 class SupervisorDecision(Contract):
     summary: str = Field(min_length=1, max_length=4000)
-    evidence_event_ids: list[UUID]
+    evidence_event_ids: list[UUID] = Field(
+        description=(
+            "Only new_events[*].id or retrieved event_ids. "
+            "Never source_id, task_id or payload IDs; use [] if none."
+        )
+    )
     actions: list[SupervisorAction] = Field(max_length=3)
     objective_satisfied: bool
     next_review_at: datetime | None
+
+
+class TargetSupervisorAction(SupervisorAction):
+    """Approved records targets only permit indexed creation, never generic delegation."""
+
+    type: Literal["create_task", "request_human_review"]
+    agent_key: None = None
+    agent_version: None = None
+    task_objective: None = None
+    assignment_json: None = None
+
+
+class TargetSupervisorDecision(SupervisorDecision):
+    actions: list[TargetSupervisorAction] = Field(max_length=3)
+
+
+def supervisor_decision_type(context):
+    objective = context["objective"]
+    if objective.get("targets") and not objective.get("approved_assignments"):
+        return TargetSupervisorDecision
+    return SupervisorDecision
 
 
 def digest(value):
@@ -273,7 +319,7 @@ async def submit_objective_in_transaction(session, tenant_id, case_id, body, key
         raise TaskError(409, "Objective revision changed; reload and explicitly replace it")
     if not coord and body.expected_revision is not None:
         raise TaskError(409, "There is no objective to replace")
-    if await session.get(AgentVersion, ("case_supervisor", 3)) is None:
+    if await session.get(AgentVersion, ("case_supervisor", 5)) is None:
         raise TaskError(422, "Publish the supervisor definition with agents-seed first")
     for target in body.targets:
         for contact, roles in (
@@ -314,7 +360,7 @@ async def submit_objective_in_transaction(session, tenant_id, case_id, body, key
             group_task_id=group.id,
             workflow_id=f"firm/{tenant_id}/case/{case_id}/supervisor",
             objective_json={},
-            agent_version=3,
+            agent_version=5,
         )
         session.add(coord)
         await session.flush()
@@ -347,7 +393,7 @@ async def submit_objective_in_transaction(session, tenant_id, case_id, body, key
             )
         except ValueError as exc:
             raise TaskError(422, str(exc)) from exc
-    coord.agent_version = 3
+    coord.agent_version = 5
     coord.objective_json = body.model_dump(mode="json", exclude={"expected_revision"})
     coord.objective_json = {
         **coord.objective_json,
@@ -399,6 +445,8 @@ class SupervisorActivities:
         if isinstance(prepared, dict):
             return prepared
         run, definition = prepared
+        bind_audit(actor_ref=f"agent/{definition['agent_key']}/{definition['version']}")
+        bind_identity(**{"execution.attempt": run.attempt, "runtime.mode": run.mode})
         try:
             decision, usage = await self._decide(run, definition)
         except Exception as exc:
@@ -407,8 +455,11 @@ class SupervisorActivities:
                 if saved and saved.attempt == run.attempt and saved.outcome_json is None:
                     saved.error_type = type(exc).__name__
             raise
-        return await self._commit(run, decision, usage)
+        outcome = await self._commit(run, decision, usage)
+        evaluation_scores(outcome, usage)
+        return outcome
 
+    @phase("context.assemble")
     async def _prepare(self, activation):
         tenant, case_id = UUID(activation["tenant_id"]), UUID(activation["case_id"])
         async with self.database.sessions.begin() as session:
@@ -450,6 +501,16 @@ class SupervisorActivities:
                         "STALE",
                         now(),
                         {"status": "CONTINUE"},
+                    )
+                    return run.outcome_json
+                if datetime.fromisoformat(run.context_json["deadline"]) <= now():
+                    run.status, run.finished_at, run.outcome_json = (
+                        "STALE",
+                        now(),
+                        {
+                            "status": "CONTINUE",
+                            "reason": "Previous turn timed out; prepare a fresh bounded turn.",
+                        },
                     )
                     return run.outcome_json
                 run.attempt += 1
@@ -497,6 +558,7 @@ class SupervisorActivities:
             memory = await memory_for_case(session, coord)
             definition = await session.get(AgentVersion, ("case_supervisor", coord.agent_version))
             context = {
+                "observability": trace_reference(),
                 "objective": coord.objective_json,
                 "plan": coord.plan_json,
                 "revision": coord.revision,
@@ -507,7 +569,28 @@ class SupervisorActivities:
                     {"id": str(e.id), "type": e.event_type, "payload": e.payload} for e in events
                 ],
                 "sources": [
-                    {"id": str(s.id), "kind": s.kind, "content": s.content} for s in sources
+                    {"id": str(s.id), "kind": s.kind, "content": model_source_content(s)}
+                    for s in sources
+                ],
+                "human_requests": [
+                    {
+                        "id": str(h.id),
+                        "task_id": str(h.task_id),
+                        "handler": h.handler,
+                        "question": h.question,
+                        "status": h.status,
+                    }
+                    for h in (
+                        await session.scalars(
+                            select(HumanRequest)
+                            .where(
+                                HumanRequest.tenant_id == tenant,
+                                HumanRequest.case_id == case_id,
+                                HumanRequest.status == "OPEN",
+                            )
+                            .limit(100)
+                        )
+                    ).all()
                 ],
                 "instructions": memory["instructions"],
                 "memory": memory,
@@ -535,6 +618,7 @@ class SupervisorActivities:
                 "inbox_ids": [str(i.id) for i in inbox],
                 "deadline": (now() + timedelta(minutes=2)).isoformat(),
             }
+            record_context(context)
             run = Execution(
                 id=run_id,
                 tenant_id=tenant,
@@ -566,7 +650,7 @@ class SupervisorActivities:
                 objective_satisfied=False,
                 next_review_at=None,
             ), {}
-        if context["plan"].get("decision_count", 0) >= 30:
+        if context["plan"].get("automatic_decisions", 0) >= 30 and not context["new_events"]:
             return SupervisorDecision(
                 summary="Automatic decision budget reached.",
                 evidence_event_ids=[],
@@ -583,12 +667,12 @@ class SupervisorActivities:
         model = SupervisorScriptedModel(context) if run.mode == "scripted" else definition["model"]
         retrieval = ExecutionRetrieval(self.database, self.settings, run, context)
         budget = ModelBudget(context, self.settings)
-        from agents_platform.delegation import delegation_tools
+        from agents_platform.delegation import delegation_tools, supervisor_delegation_cards
 
         proposals = []
         specialist_tools = (
             delegation_tools(
-                self.catalog, context.get("capabilities", []), proposals, SupervisorAction
+                self.catalog, supervisor_delegation_cards(context), proposals, SupervisorAction
             )
             if definition["version"] >= 3
             else []
@@ -596,17 +680,21 @@ class SupervisorActivities:
         agent = Agent(
             name=definition["name"],
             model=model,
-            instructions=definition["instructions"] + PLATFORM_INSTRUCTIONS,
+            instructions=model_instructions(
+                definition["instructions"] + PLATFORM_INSTRUCTIONS, self.settings
+            ),
             tools=[*retrieval.tools(), *specialist_tools],
-            model_settings=ModelSettings(max_tokens=self.settings.context_output_tokens),
-            output_type=SupervisorDecision,
+            model_settings=agent_model_settings(model, self.settings.context_output_tokens),
+            output_type=supervisor_decision_type(context),
         )
         seconds = max(0.1, (datetime.fromisoformat(context["deadline"]) - now()).total_seconds())
         try:
             async with asyncio.timeout(seconds):
-                result = await Runner.run(
+                result = await run_agent(
                     agent,
                     json.dumps(context, default=str),
+                    definition=definition,
+                    mode=run.mode,
                     max_turns=8,
                     run_config=RunConfig(
                         tracing_disabled=True, call_model_input_filter=budget.filter
@@ -639,6 +727,7 @@ class SupervisorActivities:
             "context_budget": budget.report(),
         }
 
+    @phase("result.commit")
     async def _commit(self, prepared, decision, usage):
         context = prepared.context_json
         async with self.database.sessions.begin() as session:
@@ -703,6 +792,9 @@ class SupervisorActivities:
                 )
             ]
             applied, rejected = [], []
+            if usage.get("context_budget_exceeded"):
+                decision.actions = []
+                rejected.append("Required supervisor context exceeds its budget")
             event_ids = {e["id"] for e in context["new_events"]}
             retrieval_calls = await session.scalars(
                 select(ToolInvocation).where(
@@ -717,9 +809,13 @@ class SupervisorActivities:
             if not {str(i) for i in decision.evidence_event_ids} <= event_ids:
                 rejected.append("Decision cites an event outside its saved context")
 
-            def review(question, task_id=None):
+            def review(question, task_id=None, *, kind="UNRESOLVED"):
                 key = digest(
-                    {"case": str(coord.case_id), "task": task_id, "kind": "unresolved_review"}
+                    {
+                        "case": str(coord.case_id),
+                        "task": task_id,
+                        "kind": "unresolved_review" if kind == "UNRESOLVED" else kind,
+                    }
                 )
                 if not any(r["key"] == key for r in reviews):
                     reviews.append(
@@ -727,6 +823,7 @@ class SupervisorActivities:
                             "key": key,
                             "task_id": task_id,
                             "question": question,
+                            "kind": kind,
                             "status": "UNRESOLVED",
                         }
                     )
@@ -825,6 +922,13 @@ class SupervisorActivities:
                         rejected.append(
                             "Approved participant roles changed; operator review required"
                         )
+            for action in decision.actions:
+                if (
+                    action.type == "request_human_review"
+                    and action.review_task_id
+                    and not any(t["id"] == str(action.review_task_id) for t in tasks)
+                ):
+                    rejected.append("Review refers to a task outside this case")
             if not rejected and not truncated:
                 for index, action in enumerate(decision.actions):
                     if action.type == "delegate_task":
@@ -853,7 +957,8 @@ class SupervisorActivities:
                             review(str(getattr(exc, "detail", exc)))
                         continue
                     if action.type == "request_human_review":
-                        review(action.question or "Clarify the next permitted step.")
+                        linked = str(action.review_task_id) if action.review_task_id else None
+                        review(action.question or "Clarify the next permitted step.", linked)
                         continue
                     if action.target_index is None or not 0 <= action.target_index < len(targets):
                         rejected.append("Assignment refers to an unapproved target")
@@ -899,7 +1004,13 @@ class SupervisorActivities:
                     assignment = CreateRecordsTask(
                         case_id=coord.case_id,
                         parent_task_id=coord.group_task_id,
-                        agent_version=3 if coord.agent_version >= 2 else 2,
+                        agent_version=5
+                        if coord.agent_version >= 5
+                        else 4
+                        if coord.agent_version >= 4
+                        else 3
+                        if coord.agent_version >= 2
+                        else 2,
                         objective=f"Collect {record_names} from {provider.display_name}",
                         **{k: v for k, v in target.items() if k != "task_title"},
                     )
@@ -941,9 +1052,77 @@ class SupervisorActivities:
                     review(
                         "A completed task lacks verified evidence for this scope.", matches[0]["id"]
                     )
+            await append_event(
+                session,
+                make_event(
+                    event_type="authorization.decision",
+                    action="supervisor.apply_proposals",
+                    outcome="DENIED" if rejected else "ALLOWED",
+                    reason_code="PROPOSAL_REJECTED" if rejected else "POLICY_PASSED",
+                    policy_version="supervisor-proposals.v1",
+                    details={
+                        "rejection_count": len(rejected),
+                        "objective_revision": coord.revision,
+                        "memory_fingerprint": memory["manifest"]["fingerprint"],
+                    },
+                ),
+            )
+            technical_failure = bool(usage.get("context_budget_exceeded"))
+            citation_rejected = rejected == ["Decision cites an event outside its saved context"]
+            citation_replans = coord.plan_json.get("citation_replans", 0) + 1
+            if citation_rejected:
+                usage = {**usage, "decision_validation_error": rejected[0]}
+                if citation_replans <= 2:
+                    coord.plan_json = {
+                        **coord.plan_json,
+                        "citation_replans": citation_replans,
+                        "correction_feedback": "The previous proposal was rejected; no actions "
+                        "were applied. evidence_event_ids must use ONLY new_events[*].id or "
+                        "event_ids explicitly returned by retrieval tools. Never use source, "
+                        "task or requirement IDs. Use [] if no valid event citation is needed. "
+                        "Recheck current state and submit a corrected proposal.",
+                        "rejected": rejected,
+                        "decision_count": coord.plan_json.get("decision_count", 0) + 1,
+                        "automatic_decisions": coord.plan_json.get("automatic_decisions", 0) + 1,
+                        "last_execution_id": str(run.id),
+                    }
+                    coord.status, coord.revision = "PENDING", coord.revision + 1
+                    run.status, run.finished_at = "SUCCEEDED", now()
+                    run.decision_json, run.usage_json = decision.model_dump(mode="json"), usage
+                    run.outcome_json = {
+                        "status": "CONTINUE",
+                        "reason": "Correcting an invalid citation",
+                    }
+                    session.add(
+                        ActivityEvent(
+                            tenant_id=coord.tenant_id,
+                            case_id=coord.case_id,
+                            task_id=coord.group_task_id,
+                            event_type="task.plan_rejected",
+                            producer="supervisor",
+                            dedupe_key=f"correction/{run.id}",
+                            actor_ref="platform",
+                            payload={
+                                "execution_id": str(run.id),
+                                "summary": "The supervisor is correcting an unsupported citation. "
+                                "No rejected actions were applied.",
+                                "attempt": citation_replans,
+                            },
+                        )
+                    )
+                    return run.outcome_json
+                technical_failure = True
             if rejected:
-                coord.stall_count += 1
-                review("Supervisor proposal rejected: " + "; ".join(rejected))
+                if technical_failure:
+                    review(
+                        "The supervisor needs technical recovery: required context did not fit."
+                        if usage.get("context_budget_exceeded")
+                        else "The supervisor could not correct its citations after two retries.",
+                        kind="TECHNICAL",
+                    )
+                else:
+                    coord.stall_count += 1
+                    review("Supervisor proposal rejected: " + "; ".join(rejected))
             all_covered = (
                 bool(targets)
                 and not truncated
@@ -1008,8 +1187,18 @@ class SupervisorActivities:
                     review(
                         "No specialist assignment covers the objective; clarify required inputs."
                     )
+            if all_covered:
+                # This review describes a missing fact, not a human authorization.
+                # Verified current coverage resolves it; consent reviews stay separate.
+                reviews = [r for r in reviews if r.get("kind") != "EVIDENCE_PENDING"]
             if decision.objective_satisfied and not all_covered:
-                review("Completion proposed without verified evidence for every approved target.")
+                unfinished = any(
+                    t["status"] != "COMPLETED" for t in (delegated if generic_mode else tasks)
+                )
+                review(
+                    "Completion proposed without verified evidence for every approved target.",
+                    kind="EVIDENCE_PENDING" if unfinished else "UNRESOLVED",
+                )
             if coord.stall_count >= 2:
                 review("Repeated invalid decisions; explicit operator revision is required.")
             uncovered = (
@@ -1019,7 +1208,12 @@ class SupervisorActivities:
             )
             if not reviews and uncovered and not applied:
                 review("No assignment covers the approved scope; clarify the next action.")
-            if all_covered and not decision.objective_satisfied and not decision.actions:
+            if (
+                all_covered
+                and not technical_failure
+                and not decision.objective_satisfied
+                and not decision.actions
+            ):
                 review(
                     "Scope is verified but the objective is not confirmed. Clarify remaining work."
                 )
@@ -1047,6 +1241,10 @@ class SupervisorActivities:
                     for r in client_reviews[-20:]
                 ],
                 "decision_count": coord.plan_json.get("decision_count", 0) + 1,
+                "automatic_decisions": 0
+                if context["new_events"]
+                else coord.plan_json.get("automatic_decisions", 0) + 1,
+                "citation_replans": citation_replans if citation_rejected else 0,
                 "next_review_at": outcome.get("wake_at"),
                 "summary": decision.summary,
                 "reviews": reviews,
@@ -1070,6 +1268,13 @@ class SupervisorActivities:
                 usage,
                 now(),
             )
+            if technical_failure:
+                run.status = "FAILED"
+                run.error_type = (
+                    "ContextBudgetExceeded"
+                    if usage.get("context_budget_exceeded")
+                    else "DecisionValidationError"
+                )
             for inbox_id in context["inbox_ids"]:
                 entry = await session.get(TaskInbox, UUID(inbox_id))
                 entry.consumed_by_execution_id = run.id

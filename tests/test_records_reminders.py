@@ -200,7 +200,7 @@ async def test_new_supervisor_delegates_v3_without_upgrading_existing_v1(setup, 
             assigned = await session.scalar(
                 select(Task).where(Task.tenant_id == UUID(fixture["firm_id"]), Task.kind == "AGENT")
             )
-            assert assigned.agent_version == 3
+            assert assigned.agent_version == 5
         assert submit(client, foreign).status_code == 201
         async with database.sessions.begin() as session:
             coord = await session.scalar(

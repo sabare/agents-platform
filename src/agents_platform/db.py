@@ -2,7 +2,8 @@ from collections.abc import AsyncIterator
 
 from fastapi import Request
 from sqlalchemy import MetaData, text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext import asyncio as sa_asyncio
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 
 
@@ -21,9 +22,15 @@ class Base(DeclarativeBase):
 
 class Database:
     def __init__(self, url: str) -> None:
-        self.engine = create_async_engine(
+        self.engine = sa_asyncio.create_async_engine(
             url, pool_pre_ping=True, connect_args={"connect_timeout": 3}
         )
+        from agents_platform.observability import instrument_database
+
+        instrument_database(self.engine)
+        from agents_platform.audit import instrument_database as instrument_audit
+
+        instrument_audit(self.engine)
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
 
     async def check(self) -> str:

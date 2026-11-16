@@ -13,18 +13,28 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import UUID, uuid4, uuid5
 
-from agents import Agent, FunctionTool, ModelSettings, RunConfig, Runner
+from agents import Agent, FunctionTool, RunConfig
 from sqlalchemy import select
 from temporalio import activity
 
-from agents_platform.config import Settings
+from agents_platform.audit import (
+    append_event,
+    authorize_tool,
+    bind_audit,
+    cached_result,
+    make_event,
+    reject,
+)
+from agents_platform.config import Settings, agent_model_settings
 from agents_platform.context import (
     PLATFORM_INSTRUCTIONS,
     ContextBudgetExceeded,
     ExecutionRetrieval,
     ModelBudget,
+    model_source_content,
 )
 from agents_platform.db import Database
+from agents_platform.demo_policy import model_instructions
 from agents_platform.domains import (
     ActionNotDue,
     ActionStateChanged,
@@ -44,6 +54,15 @@ from agents_platform.models import (
     Task,
     TaskInbox,
     ToolInvocation,
+)
+from agents_platform.observability import (
+    bind_identity,
+    evaluation_scores,
+    observed_tool,
+    phase,
+    record_context,
+    run_agent,
+    trace_reference,
 )
 from agents_platform.task_contracts import NextAction, TaskSnapshot
 from agents_platform.telemetry import bind_context, observed_activity
@@ -84,12 +103,43 @@ class TaskActivities:
     @observed_activity
     async def execute_task(self, activation: dict) -> dict:
         """The complete activation in three steps, with no database lock during model calls."""
+        async with self.database.sessions() as session:
+            task = await session.scalar(
+                select(Task).where(
+                    Task.tenant_id == UUID(activation["tenant_id"]),
+                    Task.id == UUID(activation["task_id"]),
+                )
+            )
+            adapter = None
+            if task and task.agent_key:
+                published = await session.get(AgentVersion, (task.agent_key, task.agent_version))
+                if published:
+                    adapter = self.adapters.for_execution(task, published.definition_snapshot)
+        from agents_platform.communications import process_pending
+
+        await process_pending(
+            self.database,
+            self.settings,
+            UUID(activation["tenant_id"]),
+            UUID(activation["task_id"]),
+            adapter,
+        )
+        ingest = getattr(adapter, "ingest_updates", None)
+        if ingest:
+            await ingest(self.database, self.settings, task.tenant_id, task.id)
         run = await self._prepare(activation)
         if isinstance(run, dict):
             return run  # Previously committed result, closed task, or duplicate signal.
+        bind_identity(**{"execution.attempt": run.attempt, "runtime.mode": run.mode})
+        bind_audit(actor_ref=f"agent/{run.definition['agent_key']}/{run.definition['version']}")
         decision, usage = await self._decide(run, self._tools(run))
+        if decision is not None and usage.get("requests", 0):
+            # Preserve the model's choice before backend validation can change it.
+            usage["agent_proposed_action"] = decision.next_action.type
         try:
-            return await self._commit(run, activation, decision, usage)
+            outcome = await self._commit(run, activation, decision, usage)
+            evaluation_scores(outcome, usage)
+            return outcome
         except DecisionValidationError as exc:
             # Keep successful logical actions. A fresh activation sees saved state and
             # correction feedback; repeated bad proposals eventually reach human review.
@@ -103,8 +153,11 @@ class TaskActivities:
             review.next_action = NextAction(
                 type="needs_human", follow_up_seconds=None, reason=feedback
             )
-            return await self._commit(run, activation, review, usage, feedback)
+            outcome = await self._commit(run, activation, review, usage, feedback)
+            evaluation_scores(outcome, usage)
+            return outcome
 
+    @phase("context.assemble")
     async def _prepare(self, activation: dict):
         tenant_id, task_id = UUID(activation["tenant_id"]), UUID(activation["task_id"])
         execution_id = uuid5(task_id, f"execution/{activation['cycle']}")
@@ -167,6 +220,9 @@ class TaskActivities:
                     return human_outcome
             if execution is None:
                 domain = await adapter.load(session, task)
+                from agents_platform.communications import blocking_reason
+
+                communication_blocker = await blocking_reason(session, task)
                 if domain.evidence_source_ids:
                     scoped_ids = set(
                         await session.scalars(
@@ -183,6 +239,7 @@ class TaskActivities:
                     domain.ready_at
                     and domain.ready_at > now()
                     and not task.progress_json.get("decision_validation_feedback")
+                    and not communication_blocker
                 ):
                     if task.status != "WAITING":
                         task.status, task.version = "WAITING", task.version + 1
@@ -238,6 +295,7 @@ class TaskActivities:
                     )
                 ).all()
                 context = {
+                    "observability": trace_reference(),
                     "task": view,
                     "instructions": memory["instructions"],
                     "memory": memory,
@@ -250,6 +308,7 @@ class TaskActivities:
                     "action_requirements": {
                         **domain.action_requirements,
                         "current_memory_is_authoritative": True,
+                        "communication_blocker": communication_blocker,
                         "resolved_items_are_history": True,
                         "decision_validation_feedback": task.progress_json.get(
                             "decision_validation_feedback"
@@ -265,12 +324,15 @@ class TaskActivities:
                         event.producer not in {"execution", "domain-tool"}
                         for event in unread_events
                     ),
-                    "sources": [{"id": str(s.id), "content": s.content} for s in sources],
+                    "sources": [
+                        {"id": str(s.id), "content": model_source_content(s)} for s in sources
+                    ],
                     "inbox_ids": [str(i.id) for i in inbox],
                     "expected_version": task.version,
                     "agent_definition_hash": agent.definition_hash,
                     "deadline": (now() + timedelta(minutes=5)).isoformat(),
                 }
+                record_context(context)
                 execution = Execution(
                     id=execution_id,
                     tenant_id=tenant_id,
@@ -318,11 +380,13 @@ class TaskActivities:
             arguments = spec.arguments.model_validate_json(raw_arguments)
             arguments_json = arguments.model_dump(mode="json")
             if name not in definition["tools"]:
+                reject("TOOL_NOT_ALLOWED")
                 raise ValueError("Tool is not permitted by this agent version")
             if (
                 len(tools_used) + len(run_context.tool_rejections)
                 >= definition["limits"]["max_tool_calls"]
             ):
+                reject("TOOL_BUDGET_EXCEEDED")
                 raise ValueError("Tool budget exceeded")
             async with self.database.sessions.begin() as session:
                 await policy_lock(session, tenant_id)
@@ -333,6 +397,7 @@ class TaskActivities:
                 )
                 run = await session.get(Execution, execution_id)
                 if run.attempt != attempt or current.version != context["expected_version"]:
+                    reject("STALE_EXECUTION")
                     raise StaleExecution()
                 self.adapters.for_execution(current, definition, context["domain"]["adapter"])
                 memory = await memory_for_task(session, current, adapter=run_adapter)
@@ -340,10 +405,23 @@ class TaskActivities:
                     memory["manifest"]["fingerprint"]
                     != context["memory"]["manifest"]["fingerprint"]
                 ):
+                    reject("STALE_EXECUTION")
                     raise StaleExecution()
+                if spec.effect == "contact":
+                    from agents_platform.communications import blocking_reason, commitment_due
+
+                    if await blocking_reason(session, current):
+                        reject("COMMUNICATION_BLOCKER")
+                        raise StaleExecution()
+                    promised = await commitment_due(session, current)
+                    if promised:
+                        reject("COMMITMENT_NOT_DUE")
+                        raise ActionNotDue(promised)
                 if spec.effect == "contact" and stop_contact(memory):
+                    reject("CONTACT_HOLD")
                     raise StaleExecution()
                 if current.status != "RUNNING":
+                    reject("STALE_EXECUTION")
                     raise StaleExecution()
                 argument_hash = hashlib.sha256(
                     json.dumps(arguments_json, sort_keys=True).encode()
@@ -361,8 +439,23 @@ class TaskActivities:
                         ToolInvocation.logical_key == key,
                     )
                 )
+                await authorize_tool(
+                    session,
+                    policy_version="agent-tool.v1",
+                    agent_key=current.agent_key,
+                    agent_version=current.agent_version,
+                    task_version=current.version,
+                    memory_fingerprint=memory["manifest"]["fingerprint"],
+                    effect=spec.effect,
+                    cached=bool(cached),
+                )
                 if cached:
+                    cached_result()
+                    from opentelemetry import trace
+
+                    trace.get_current_span().set_attribute("tool.cached", True)
                     if cached.tool_name != name or cached.arguments_json != arguments_json:
+                        reject("IDEMPOTENCY_CONFLICT")
                         raise ValueError(
                             "Logical tool action was already used with different arguments"
                         )
@@ -376,6 +469,7 @@ class TaskActivities:
                     except ActionNotDue as exc:
                         # Roll back this attempt, not successful tools from earlier
                         # transactions. Do not consume the contact's logical action key.
+                        reject("ACTION_NOT_DUE")
                         await session.rollback()
                         rejected = {
                             "tool": name,
@@ -417,6 +511,19 @@ class TaskActivities:
                         "source_id": str(source.id),
                         "_evidence_source_ids": evidence_ids,
                     }
+                    if spec.effect == "contact":
+                        await append_event(
+                            session,
+                            make_event(
+                                event_type="external_effect.result",
+                                action=name,
+                                outcome="SUCCEEDED",
+                                reason_code="EFFECT_COMMITTED",
+                                resource_type="sources",
+                                resource_id=str(source.id),
+                                details={"simulated": result.get("simulated", False)},
+                            ),
+                        )
                     session.add(
                         ToolInvocation(
                             tenant_id=tenant_id,
@@ -441,7 +548,7 @@ class TaskActivities:
                 name=spec.name,
                 description=spec.description,
                 params_json_schema=spec.arguments.model_json_schema(),
-                on_invoke_tool=invoke,
+                on_invoke_tool=observed_tool(spec.name, invoke),
             )
 
         execution_ref = SimpleNamespace(
@@ -466,7 +573,11 @@ class TaskActivities:
         budget = ModelBudget(context, self.settings)
         try:
             holds = stop_contact(context["memory"])
-            if holds:
+            if context["action_requirements"].get("communication_blocker"):
+                decision = run.adapter.review(
+                    context["action_requirements"]["communication_blocker"]
+                )
+            elif holds:
                 decision = run.adapter.review("; ".join(i["text"] for i in holds))
             elif context["action_requirements"].get("suspension_reason"):
                 decision = run.adapter.review(context["action_requirements"]["suspension_reason"])
@@ -484,17 +595,21 @@ class TaskActivities:
                 )
                 agent = Agent(
                     name=definition["name"],
-                    instructions=definition["instructions"] + PLATFORM_INSTRUCTIONS,
+                    instructions=model_instructions(
+                        definition["instructions"] + PLATFORM_INSTRUCTIONS, self.settings
+                    ),
                     model=model,
-                    model_settings=ModelSettings(max_tokens=self.settings.context_output_tokens),
+                    model_settings=agent_model_settings(model, self.settings.context_output_tokens),
                     tools=tools,
                     output_type=run.adapter.decision_type,
                 )
                 seconds = (datetime.fromisoformat(context["deadline"]) - now()).total_seconds()
                 async with asyncio.timeout(max(0, seconds)):
-                    result = await Runner.run(
+                    result = await run_agent(
                         agent,
                         json.dumps(context),
+                        definition=definition,
+                        mode=mode,
                         max_turns=definition["limits"]["max_model_turns"],
                         run_config=RunConfig(
                             tracing_disabled=True, call_model_input_filter=budget.filter
@@ -505,8 +620,8 @@ class TaskActivities:
                     name: getattr(result.context_wrapper.usage, name)
                     for name in ("requests", "input_tokens", "output_tokens", "total_tokens")
                 }
-        except ContextBudgetExceeded as exc:
-            decision = run.adapter.review(str(exc))
+        except ContextBudgetExceeded:
+            decision = None
             usage["context_budget_exceeded"] = True
         except StaleExecution:
             decision = None
@@ -539,6 +654,7 @@ class TaskActivities:
             usage["tool_rejections"] = run.tool_rejections
         return decision, usage
 
+    @phase("result.commit")
     async def _commit(self, run, activation, decision, usage, validation_failure=None):
         tenant_id, task_id, execution_id = run.tenant_id, run.task_id, run.execution_id
         context, attempt = run.context, run.attempt
@@ -556,7 +672,7 @@ class TaskActivities:
             self.adapters.for_execution(task, run.definition, context["domain"]["adapter"])
             memory = await memory_for_task(session, task, adapter=run.adapter)
             if (
-                decision is None
+                (decision is None and not usage.get("context_budget_exceeded"))
                 or task.version != context["expected_version"]
                 or memory["manifest"]["fingerprint"] != context["memory"]["manifest"]["fingerprint"]
             ):
@@ -564,6 +680,10 @@ class TaskActivities:
                 execution.outcome_json = {"status": "CONTINUE"}
                 execution.finished_at = now()
                 return execution.outcome_json
+            if usage.get("context_budget_exceeded"):
+                from agents_platform.recovery import record_context_failure
+
+                return await record_context_failure(session, task, execution, usage)
             decision = run.adapter.decision_type.model_validate(decision.model_dump())
             known = (
                 {str(r["source_id"]) for r in tools_used}
@@ -589,6 +709,14 @@ class TaskActivities:
                     "context or tool results. Task and requirement IDs are not source IDs."
                 )
             step = decision.next_action
+            from agents_platform.communications import blocking_reason, commitment_due
+
+            communication_blocker = await blocking_reason(session, task)
+            if communication_blocker:
+                step = NextAction(
+                    type="needs_human", follow_up_seconds=None, reason=communication_blocker
+                )
+                decision.next_action = step
             if step.type == "complete" and any(
                 i["kind"] == "OBLIGATION" for i in memory["operational_items"]
             ):
@@ -656,13 +784,19 @@ class TaskActivities:
                 if context.get("has_new_business_information", bool(context["inbox_ids"]))
                 else task.progress_json.get("automatic_activations", 0) + 1
             )
-            if status == "WAITING" and automatic_activations >= self.settings.demo_max_activations:
+            if (
+                status == "WAITING"
+                and not validation.wait_for_event
+                and automatic_activations >= self.settings.demo_max_activations
+            ):
                 status, reason = (
                     "BLOCKED",
                     "Automatic polling limit reached; waiting for a user/provider update.",
                 )
             outcome = {"status": status, "reason": reason}
-            if status == "WAITING":
+            if status == "WAITING" and validation.wait_for_event:
+                outcome["wait_for_event"] = True
+            elif status == "WAITING":
                 delay = max(
                     1,
                     min(
@@ -670,7 +804,8 @@ class TaskActivities:
                         self.settings.demo_follow_up_seconds,
                     ),
                 )
-                outcome["wake_at"] = (now() + timedelta(seconds=delay)).isoformat()
+                promised = await commitment_due(session, task)
+                outcome["wake_at"] = (promised or (now() + timedelta(seconds=delay))).isoformat()
             if validation.replan_reason:
                 status = "PENDING"
                 outcome = {"status": "CONTINUE", "reason": validation.replan_reason}
@@ -692,8 +827,12 @@ class TaskActivities:
             from agents_platform.human_requests import retire_requests
 
             request_human_help = getattr(run.adapter, "request_human_help", None)
-            if status == "BLOCKED" and request_human_help:
-                await request_human_help(session, task, reason)
+            if status == "BLOCKED":
+                from agents_platform.communications import ensure_review
+
+                communication_review = await ensure_review(session, task)
+                if not communication_review and request_human_help:
+                    await request_human_help(session, task, reason)
             elif status in TERMINAL:
                 await retire_requests(
                     session, task, "CANCELLED" if status == "CANCELLED" else "SUPERSEDED"

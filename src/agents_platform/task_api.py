@@ -12,18 +12,46 @@ from agents_platform.models import ActivityEvent, Execution, ToolInvocation
 from agents_platform.task_contracts import CreateRecordsTask, EventView, ProviderUpdate, TaskView
 from agents_platform.tasks import TaskError, create_records_task, read_task, receive_provider_update
 
-bearer = HTTPBearer()
+bearer = HTTPBearer(auto_error=False)
 
 
-def require_operator(
+async def require_operator(
     request: Request,
-    credentials: Annotated[HTTPAuthorizationCredentials, Depends(bearer)],
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
 ) -> None:
     """Local operator credential grants all-firm access; not firm-user authentication."""
+    from agents_platform.audit import bind_audit, make_event, persist
+
     expected = request.app.state.settings.operator_api_key.get_secret_value()
-    if not compare_digest(credentials.credentials.encode(), expected.encode()):
+    allowed = bool(credentials) and compare_digest(
+        credentials.credentials.encode(), expected.encode()
+    )
+    actor = "local-operator" if allowed else "anonymous"
+    request.state.audit_actor = actor
+    identity = {}
+    for name in ("tenant_id", "case_id", "task_id"):
+        try:
+            identity[name] = UUID(str(request.path_params[name]))
+        except (KeyError, ValueError):
+            pass
+    bind_audit(actor_ref=actor, **identity)
+    route = getattr(request.scope.get("route"), "path", "unmatched")
+    await persist(
+        request.app.state.database,
+        make_event(
+            event_type="authorization.decision",
+            action=f"{request.method} {route}",
+            actor_ref=actor,
+            outcome="ALLOWED" if allowed else "DENIED",
+            reason_code="OPERATOR_KEY_MATCH" if allowed else "INVALID_OPERATOR_CREDENTIAL",
+            policy_version="local-operator.v1",
+        ),
+    )
+    if not allowed:
         raise HTTPException(
-            401, "Invalid operator credential", headers={"WWW-Authenticate": "Bearer"}
+            401,
+            "Invalid operator credential",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
 
@@ -137,6 +165,7 @@ async def executions(tenant_id: UUID, task_id: UUID, session: Session):
                 "mode": run.mode,
                 "attempt": run.attempt,
                 "context": run.context_json,
+                "observability": run.context_json.get("observability", {}),
                 "decision": run.decision_json,
                 "outcome": run.outcome_json,
                 "usage": run.usage_json,

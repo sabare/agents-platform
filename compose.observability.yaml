@@ -1,0 +1,126 @@
+name: agents-observability
+
+x-langfuse-env: &langfuse-env
+  DATABASE_URL: postgresql://langfuse:${OBS_POSTGRES_PASSWORD:?Run scripts/setup_observability.py}@postgres:5432/langfuse
+  NEXTAUTH_URL: http://localhost:3000
+  NEXTAUTH_SECRET: ${OBS_NEXTAUTH_SECRET:?Run setup}
+  SALT: ${OBS_SALT:?Run setup}
+  ENCRYPTION_KEY: ${OBS_ENCRYPTION_KEY:?Run setup}
+  TELEMETRY_ENABLED: "false"
+  CLICKHOUSE_URL: http://clickhouse:8123
+  CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+  CLICKHOUSE_USER: langfuse
+  CLICKHOUSE_PASSWORD: ${OBS_CLICKHOUSE_PASSWORD:?Run setup}
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_AUTH: ${OBS_REDIS_PASSWORD:?Run setup}
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${OBS_MINIO_PASSWORD:?Run setup}
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: langfuse
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${OBS_MINIO_PASSWORD:?Run setup}
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+
+services:
+  jaeger:
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.23.0
+    restart: unless-stopped
+    ports: ["127.0.0.1:16686:16686", "127.0.0.1:4318:4318"]
+
+  langfuse-web:
+    image: docker.langfuse.com/langfuse/langfuse:${OBS_LANGFUSE_IMAGE_TAG:-4.80.0}
+    restart: unless-stopped
+    depends_on: &langfuse-dependencies
+      postgres: {condition: service_healthy}
+      clickhouse: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+    ports: ["127.0.0.1:3000:3000"]
+    environment:
+      <<: *langfuse-env
+      LANGFUSE_INIT_ORG_ID: hellocounsel
+      LANGFUSE_INIT_ORG_NAME: HelloCounsel Local
+      LANGFUSE_INIT_PROJECT_ID: hellocounsel-agents
+      LANGFUSE_INIT_PROJECT_NAME: Agents Platform
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:?Run setup}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:?Run setup}
+      LANGFUSE_INIT_USER_EMAIL: ${OBS_USER_EMAIL:-admin@hellocounsel.local}
+      LANGFUSE_INIT_USER_NAME: Local developer
+      LANGFUSE_INIT_USER_PASSWORD: ${OBS_USER_PASSWORD:?Run setup}
+
+  langfuse-worker:
+    image: docker.langfuse.com/langfuse/langfuse-worker:${OBS_LANGFUSE_IMAGE_TAG:-4.80.0}
+    restart: unless-stopped
+    depends_on: *langfuse-dependencies
+    environment: *langfuse-env
+
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: ${OBS_POSTGRES_PASSWORD:?Run setup}
+      POSTGRES_DB: langfuse
+    volumes: ["langfuse-postgres:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse -d langfuse"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.3.62.3
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: langfuse
+      CLICKHOUSE_PASSWORD: ${OBS_CLICKHOUSE_PASSWORD:?Run setup}
+    volumes: ["langfuse-clickhouse:/var/lib/clickhouse"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  minio:
+    image: cgr.dev/chainguard/minio@sha256:634c989a2f1029162fc2676c263caa181213b9410449968532f750a6fb77532d
+    restart: unless-stopped
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" /data'
+    environment:
+      MINIO_ROOT_USER: langfuse
+      MINIO_ROOT_PASSWORD: ${OBS_MINIO_PASSWORD:?Run setup}
+    volumes: ["langfuse-minio:/data"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${OBS_REDIS_PASSWORD:?Run setup}", "--maxmemory-policy", "noeviction"]
+    environment:
+      REDISCLI_AUTH: ${OBS_REDIS_PASSWORD:?Run setup}
+    volumes: ["langfuse-redis:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  langfuse-postgres:
+  langfuse-clickhouse:
+  langfuse-minio:
+  langfuse-redis:

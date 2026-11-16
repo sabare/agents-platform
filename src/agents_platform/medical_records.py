@@ -86,6 +86,56 @@ async def contact_scope_reason(session, task, request):
 
 
 class MedicalRecordsAdapter:
+    async def on_communication_commitment(self, session, task, due_at, source_id):
+        request = await session.scalar(
+            select(RecordsRequest).where(
+                RecordsRequest.tenant_id == task.tenant_id, RecordsRequest.task_id == task.id
+            )
+        )
+        if request and request.status != "RECEIVED":
+            request.next_reminder_at = max(
+                [due_at] + [d for d in (request.next_reminder_at, request.callback_at) if d]
+            )
+
+    def communication_review_contract(self, analysis):
+        from agents_platform.communications import (
+            ResolveAuthorizedCommunication,
+            ResolveCommunication,
+        )
+
+        return (
+            ResolveAuthorizedCommunication
+            if analysis.content.get("requires_authorization")
+            else ResolveCommunication
+        )
+
+    async def validate_communication_resolution(self, session, task, analysis, payload):
+        if not analysis.content.get("requires_authorization"):
+            return
+        from agents_platform.models import Source
+        from agents_platform.tasks import TaskError
+
+        document = await session.scalar(
+            select(Source).where(
+                Source.tenant_id == task.tenant_id,
+                Source.case_id == task.case_id,
+                Source.id == payload.authorization_source_id,
+                Source.kind == "UPDATED_RECORDS_AUTHORIZATION",
+                Source.content["task_id"].astext == str(task.id),
+            )
+        )
+        if not document:
+            raise TaskError(422, "Supply a reviewed updated authorization document for this task")
+        task.progress_json = {
+            **task.progress_json,
+            "communication_authorization_source_id": str(document.id),
+        }
+
+    async def ingest_updates(self, database, settings, tenant_id, task_id):
+        from agents_platform.provider_responses import ingest_pending
+
+        await ingest_pending(database, settings, tenant_id, task_id)
+
     key = "medical_records"
     version = 1
     task_type = "medical_records.collect"
@@ -120,8 +170,11 @@ class MedicalRecordsAdapter:
 
     async def request_human_help(self, session, task, reason):
         from agents_platform.human_request_handlers import ensure_records_request
+        from agents_platform.provider_responses import ensure_review
 
-        return await ensure_records_request(session, task, reason)
+        return await ensure_review(session, task) or await ensure_records_request(
+            session, task, reason
+        )
 
     async def load(self, session, task):
         assignment = RecordsInput.model_validate(task.input_json)
@@ -137,6 +190,9 @@ class MedicalRecordsAdapter:
             raise ValueError("Records assignment has no matching request")
         view = (await read_task(session, task.tenant_id, task.id)).model_dump(mode="json")
         scope_reason = await contact_scope_reason(session, task, request)
+        from agents_platform.provider_responses import action_blocker
+
+        provider_blocker = await action_blocker(session, task)
         reminder = {
             "enabled": task.agent_version >= 3,
             "count": request.reminder_count,
@@ -147,7 +203,8 @@ class MedicalRecordsAdapter:
             if request.next_reminder_at
             else None,
             "is_due": bool(
-                task.agent_version >= 3
+                not provider_blocker
+                and task.agent_version >= 3
                 and request.next_reminder_at
                 and request.next_reminder_at <= datetime.now(timezone.utc)
                 and request.status in ("SENT", "PENDING", "PARTIAL")
@@ -155,20 +212,29 @@ class MedicalRecordsAdapter:
             ),
         }
         return DomainSnapshot(
-            state={"records_request": view["records_request"], "reminder": reminder},
+            state={
+                "records_request": view["records_request"],
+                "reminder": reminder,
+                "provider_blocker": provider_blocker,
+            },
             evidence_source_ids=tuple(
                 UUID(source_id)
                 for requirement in view["records_request"]["requirements"]
                 for source_id in requirement["evidence_source_ids"]
             ),
             ready_at=(request.callback_at or request.next_reminder_at)
-            if request.status != "RECEIVED" and not scope_reason
+            if request.status != "RECEIVED" and not scope_reason and not provider_blocker
             else None,
             instruction_provider_ids=(request.provider_contact_id,),
             task_fields={"records_request": view["records_request"]},
             action_requirements={
                 "suspension_reason": scope_reason,
                 "request_state": request.status,
+                "provider_blocker": provider_blocker,
+                "authorization_policy": (
+                    "An open provider blocker requires human review. Do not send, wait past it, "
+                    "or complete. Approval does not prove missing records arrived."
+                ),
                 "before_waiting": "If DRAFT, send the initial request once before waiting. "
                 "A prior resolved hold does not forbid contact. Open holds still block it.",
                 "last_validation_feedback": task.progress_json.get("validation_feedback"),
@@ -188,6 +254,9 @@ class MedicalRecordsAdapter:
         evidence_ids = ()
         if name in ("send_records_request", "send_records_reminder"):
             reason = await contact_scope_reason(session, task, request)
+            from agents_platform.provider_responses import action_blocker
+
+            reason = reason or await action_blocker(session, task)
             if reason:
                 raise ActionStateChanged(reason)
         if name == "get_provider_details":
@@ -207,6 +276,9 @@ class MedicalRecordsAdapter:
             data = {
                 "request_ref": f"SIM-{request.id}",
                 "simulated": True,
+                "authorization_source_id": task.progress_json.get(
+                    "communication_authorization_source_id"
+                ),
                 **follow_up_content(await missing_requirements(session, task, request)),
             }
         elif name == "send_records_reminder":
@@ -250,6 +322,9 @@ class MedicalRecordsAdapter:
                     if request.next_reminder_at
                     else None,
                     "simulated": True,
+                    "authorization_source_id": task.progress_json.get(
+                        "communication_authorization_source_id"
+                    ),
                 },
                 source_kind="SIMULATED_RECORDS_REMINDER",
                 event_type="records.reminder_sent",
@@ -297,6 +372,13 @@ class MedicalRecordsAdapter:
         return ScriptedModel(context, follow_up_seconds)
 
     async def validate(self, session, task, context, decision, results, action):
+        from agents_platform.provider_responses import action_blocker
+
+        blocker = await action_blocker(session, task)
+        if blocker:
+            if action.type == "complete":
+                raise DecisionValidationError("Completion blocked: " + blocker)
+            return DomainValidation(action=self.review(blocker).next_action)
         documents = {x for r in results for x in r.get("received_source_ids", [])}
         documents.update(context.get("domain", {}).get("evidence_source_ids", []))
         requested = {str(i) for i in decision.received_source_ids}
@@ -398,6 +480,7 @@ class ScriptedModel(Model):
 
     def __init__(self, context, follow_up_seconds):
         self.follow_up_seconds = follow_up_seconds
+        self.blocker = context.get("domain", {}).get("state", {}).get("provider_blocker")
         self.plan = ["get_provider_details"]
         if context["task"]["records_request"]["status"] == "DRAFT":
             self.plan.append("send_records_request")
@@ -445,11 +528,14 @@ class ScriptedModel(Model):
                 ],
                 received_source_ids=state["received_source_ids"],
                 next_action=NextAction(
-                    type="complete" if complete else "wait",
-                    follow_up_seconds=None if complete else self.follow_up_seconds,
-                    reason="Saved simulated records are available."
-                    if complete
-                    else "Wait for provider response.",
+                    type="needs_human" if self.blocker else "complete" if complete else "wait",
+                    follow_up_seconds=None if complete or self.blocker else self.follow_up_seconds,
+                    reason=self.blocker
+                    or (
+                        "Saved simulated records are available."
+                        if complete
+                        else "Wait for provider response."
+                    ),
                 ),
             )
             output = [

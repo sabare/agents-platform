@@ -284,6 +284,7 @@ class ClientCheckInAdapter:
             },
             notify_supervisor=action.type != "complete"
             or bool(report and report.get("human_review")),
+            wait_for_event=action.type == "wait" and bool(view["sent_at"]) and report is None,
         )
 
     def scripted_model(self, context, follow_up_seconds):

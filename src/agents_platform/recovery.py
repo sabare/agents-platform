@@ -77,6 +77,8 @@ class RecoverTask(Contract):
 
 
 def failure_category(error_type):
+    if error_type == "ContextBudgetExceeded":
+        return "CONTEXT_BUDGET"
     if error_type == "DeliveryOutcomeUnknown":
         return "OUTCOME_UNKNOWN"
     if any(word in error_type for word in ("Timeout", "Connection", "RateLimit", "APIStatus")):
@@ -113,6 +115,53 @@ async def ensure_incident(session, task, cycle, error_type="ExecutionRetriesExha
     session.add(row)
     await session.flush()
     return row
+
+
+async def record_context_failure(session, task, execution, usage):
+    """Technical capacity failures never authorize contact or create provider reviews."""
+    from agents_platform.coordination import enqueue_supervisor
+    from agents_platform.human_requests import retire_requests
+
+    incident = await ensure_incident(session, task, execution.cycle, "ContextBudgetExceeded")
+    reason = "Required context exceeds its budget. Inspect the execution incident before retrying."
+    task.status, task.version = "FAILED", task.version + 1
+    task.progress_json = {
+        **task.progress_json,
+        "last_reason": reason,
+        "last_execution_id": str(execution.id),
+    }
+    outcome = {"status": "FAILED", "reason": reason, "incident_id": str(incident.id)}
+    execution.status, execution.error_type = "FAILED", "ContextBudgetExceeded"
+    execution.finished_at = now()
+    execution.usage_json, execution.outcome_json = usage, outcome
+    # Retire only the generic provider review that the old technical-failure path
+    # could create. Source-based authorization/communication controls remain intact.
+    await retire_requests(session, task, handler="records_follow_up.v1")
+    for inbox_id in execution.context_json.get("inbox_ids", []):
+        from agents_platform.models import TaskInbox
+
+        entry = await session.get(TaskInbox, UUID(inbox_id))
+        if entry and entry.consumed_by_execution_id is None:
+            entry.consumed_by_execution_id = execution.id
+    event = ActivityEvent(
+        id=uuid4(),
+        tenant_id=task.tenant_id,
+        case_id=task.case_id,
+        task_id=task.id,
+        event_type="task.failed",
+        producer="context-budget",
+        dedupe_key=f"context-budget/{execution.id}",
+        actor_ref="platform",
+        payload={
+            "reason": reason,
+            "execution_id": str(execution.id),
+            "incident_id": str(incident.id),
+            "error_type": "ContextBudgetExceeded",
+        },
+    )
+    session.add(event)
+    await enqueue_supervisor(session, event)
+    return outcome
 
 
 async def incident_view(session, row):
@@ -154,8 +203,14 @@ async def incident_view(session, row):
             for t in effects[:100]
         ],
         "saved_actions_truncated": len(effects) > 100,
-        "delivery_note": "Current outreach is simulated. Saved logical actions are reused. "
-        "Unknown external delivery must be reconciled before retry.",
+        "delivery_note": (
+            "The required context could not fit. Inspect the execution's budget diagnostics "
+            "and fix context/configuration before retrying. This is not provider approval. "
+            "Saved logical actions are reused."
+            if row.category == "CONTEXT_BUDGET"
+            else "Current outreach is simulated. Saved logical actions are reused. "
+            "Unknown external delivery must be reconciled before retry."
+        ),
     }
 
 
@@ -450,9 +505,10 @@ async def resolve_incident(session, tenant_id, incident_id, body, key):
             "previous_workflow_id": old_workflow,
             "next_workflow_id": task.workflow_id if body.action == "RETRY" else None,
         }
-        await retire_requests(
-            session, task, "CANCELLED" if body.action == "CANCEL" else "SUPERSEDED"
-        )
+        if body.action == "CANCEL":
+            await retire_requests(session, task, "CANCELLED")
+        # A technical retry does not resolve business approvals. The runtime
+        # rechecks their current subject before reusing or replacing the review.
         coord = await session.scalar(
             select(CaseCoordination)
             .where(

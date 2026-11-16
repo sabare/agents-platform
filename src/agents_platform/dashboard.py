@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import Field
-from sqlalchemy import Integer, cast, func, select, tuple_
+from sqlalchemy import Integer, and_, case, cast, func, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents_platform.capabilities import discover_capabilities
@@ -142,6 +142,18 @@ async def overview(tenant_id: UUID, session: Session):
         "supervisors": [coordination_view(c) for c in coordinators],
         "monthly_schedules": [schedule_view(r) for r in monthly],
         "counts": dict(totals),
+        "parent_count": len(
+            {c.group_task_id for c in coordinators}
+            | set(
+                (
+                    await session.scalars(
+                        select(Task.parent_task_id).where(
+                            Task.tenant_id == tenant_id, Task.parent_task_id.is_not(None)
+                        )
+                    )
+                ).all()
+            )
+        ),
         "executions": usage[0],
         "tokens": usage[1],
         "cases": [
@@ -178,13 +190,44 @@ async def task_list(
     case_id: UUID | None = None,
     status: str | None = None,
     before: UUID | None = None,
+    include_parents: bool = False,
     limit: int = Query(default=100, ge=1, le=200),
 ):
-    query = select(Task).where(Task.tenant_id == tenant_id, Task.kind == "AGENT")
+    parent_ids = (
+        select(Task.parent_task_id)
+        .where(Task.tenant_id == tenant_id, Task.parent_task_id.is_not(None))
+        .correlate(None)
+    )
+    visible = (
+        or_(
+            Task.kind == "AGENT",
+            and_(
+                Task.kind == "GROUP",
+                or_(Task.task_type == "case.coordination", Task.id.in_(parent_ids)),
+            ),
+        )
+        if include_parents
+        else Task.kind == "AGENT"
+    )
+    coordination_status = (
+        select(CaseCoordination.status)
+        .where(CaseCoordination.tenant_id == tenant_id, CaseCoordination.group_task_id == Task.id)
+        .scalar_subquery()
+    )
+    status_map = {
+        "MONITORING": "WAITING",
+        "NEEDS_REVIEW": "BLOCKED",
+        "SATISFIED": "COMPLETED",
+        "PENDING": "PENDING",
+        "RUNNING": "RUNNING",
+        "FAILED": "FAILED",
+    }
+    effective_status = case(status_map, value=coordination_status, else_=Task.status)
+    query = select(Task).where(Task.tenant_id == tenant_id, visible)
     if case_id:
         query = query.where(Task.case_id == case_id)
     if status:
-        query = query.where(Task.status == status)
+        query = query.where(effective_status == status)
     if before:
         cursor = await session.scalar(
             select(Task).where(Task.id == before, Task.tenant_id == tenant_id)
@@ -197,6 +240,34 @@ async def task_list(
             query.order_by(Task.created_at.desc(), Task.id.desc()).limit(limit + 1)
         )
     ).all()
+    ids = [t.id for t in rows[:limit]]
+    coordinators = {
+        c.group_task_id: c
+        for c in (
+            await session.scalars(
+                select(CaseCoordination).where(
+                    CaseCoordination.tenant_id == tenant_id, CaseCoordination.group_task_id.in_(ids)
+                )
+            )
+        ).all()
+    }
+    children = (
+        await session.scalars(
+            select(Task)
+            .where(Task.tenant_id == tenant_id, Task.parent_task_id.in_(ids))
+            .order_by(Task.created_at, Task.id)
+        )
+    ).all()
+    subtasks = {}
+    for child in children:
+        subtasks.setdefault(child.parent_task_id, []).append(
+            {
+                "id": child.id,
+                "objective": child.objective,
+                "progress": child.progress_json,
+                "status": child.status,
+            }
+        )
     return {
         "items": [
             {
@@ -204,9 +275,16 @@ async def task_list(
                 "case_id": t.case_id,
                 "parent_task_id": t.parent_task_id,
                 "objective": t.objective,
-                "status": t.status,
-                "agent_key": t.agent_key,
-                "agent_version": t.agent_version,
+                "status": status_map.get(coordinators[t.id].status, t.status)
+                if t.id in coordinators
+                else t.status,
+                "kind": t.kind,
+                "task_type": t.task_type,
+                "subtasks": subtasks.get(t.id, []),
+                "agent_key": "supervisor" if t.id in coordinators else t.agent_key,
+                "agent_version": coordinators[t.id].agent_version
+                if t.id in coordinators
+                else t.agent_version,
                 "created_at": t.created_at,
                 "progress": t.progress_json,
             }
@@ -351,6 +429,11 @@ async def activity_feed(
         ActivityEvent.event_type != "task.title_assigned",
     )
     if task_id:
+        selected = await session.scalar(
+            select(Task).where(Task.id == task_id, Task.tenant_id == tenant_id)
+        )
+        if selected is None:
+            raise HTTPException(404, "Task not found")
         query = query.where(ActivityEvent.task_id == task_id)
     if case_id:
         query = query.where(ActivityEvent.case_id == case_id)

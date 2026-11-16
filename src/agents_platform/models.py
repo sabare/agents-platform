@@ -195,7 +195,9 @@ class RecordRequirement(TenantRow, Base):
             ["tenant_id", "case_id", "request_id"],
             ["records_requests.tenant_id", "records_requests.case_id", "records_requests.id"],
         ),
-        CheckConstraint("record_type IN ('RECORDS','BILLS','IMAGING')", name="record_type"),
+        CheckConstraint(
+            "record_type IN ('RECORDS','BILLS','IMAGING','SURGICAL_NOTES')", name="record_type"
+        ),
         CheckConstraint(
             "(all_dates AND from_date IS NULL AND through_date IS NULL) OR "
             "(NOT all_dates AND from_date IS NOT NULL AND through_date IS NOT NULL "

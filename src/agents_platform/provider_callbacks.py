@@ -92,3 +92,30 @@ def resolve_callback(update, at: datetime) -> tuple[datetime, str] | None:
     if instant <= at:
         raise ValueError("Callback must be in the future. " + CLARIFY)
     return instant, zone_name
+
+
+def routine_relative_callback(message, received_at):
+    """Only a plain timing update; additional conditions never bypass interpretation."""
+    match = re.fullmatch(
+        r"\s*(?:(?:I |we )?(?:don['’]t have(?: (?:it|them|the records))? (?:currently|yet)|"
+        r"(?:the )?records (?:are |aren['’]t )?(?:not ready|unavailable|ready yet))[,.; ]+)?"
+        r"(?:please )?(?:call(?: us| me)? back|follow[ -]up) in "
+        r"(?P<days>[1-9]|[12][0-9]|30|one|two|three|four|five|six|seven) days?[.! ]*",
+        message,
+        re.I,
+    )
+    if not match:
+        match = re.fullmatch(
+            r"\s*(?:(?:I|we) will |(?:I|we)['’]ll |will )send (?:you )?(?:the )?"
+            r"(?:docs|documents|records) in "
+            r"(?P<days>[1-9]|[12][0-9]|30|one|two|three|four|five|six|seven) days?"
+            r"[,.; ]+(?:please )?call(?: us| me)?(?: back)? (?:then|at that time|that time)[.!\s]*",
+            message,
+            re.I,
+        )
+    if not match:
+        return None
+    value = match["days"].lower()
+    words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7}
+    days = words[value] if value in words else int(value)
+    return received_at + timedelta(days=days)

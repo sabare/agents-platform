@@ -15,6 +15,7 @@ from agents_platform.execution import TaskActivities
 from agents_platform.human_request_handlers import backfill_blocked_requests
 from agents_platform.memory_history import MemoryActivities
 from agents_platform.monthly_check_ins import MonthlyActivities
+from agents_platform.observability import configure_observability
 from agents_platform.orchestration.activities import InfrastructureActivities
 from agents_platform.orchestration.client import connect_temporal
 from agents_platform.orchestration.workflows import (
@@ -33,6 +34,7 @@ from agents_platform.telemetry import configure_logging, emit
 async def run_worker() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
+    telemetry = configure_observability(settings, "worker")
     database = Database(settings.database_url)
     try:
         await database.check()
@@ -86,6 +88,7 @@ async def run_worker() -> None:
             group.create_task(dispatch_loop(database, client, settings.temporal_task_queue))
     finally:
         await database.close()
+        await asyncio.to_thread(telemetry.shutdown)
 
 
 def main() -> None:

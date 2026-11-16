@@ -70,11 +70,18 @@ async def seed_demo(session: AsyncSession, firm_id: UUID = DEMO_FIRM_ID) -> dict
             ),
             (
                 "PROVIDER",
-                "Example Hospital accepts simulated records requests; use the request reference.",
+                (
+                    "Example Hospital accepts simulated records requests. Start the first request "
+                    "when an approved task has none. After it is sent, use its saved reference "
+                    "for follow-ups."
+                ),
             ),
             (
                 "FIRM_PROVIDER",
-                "Use the existing request for follow-ups; do not create duplicate requests.",
+                (
+                    "Start a request if this approved task has none. For later follow-ups, reuse "
+                    "that request and its saved reference. Do not send the first request twice."
+                ),
             ),
         ):
             await session.execute(

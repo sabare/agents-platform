@@ -69,3 +69,38 @@ async def test_independent_coverage_review_gates_ready_plan_and_accounts_for_bot
     else:
         assert plan.status == "needs_clarification" and not plan.steps and plan.questions
         assert usage["unapproved_proposal"]["status"] == "ready"
+
+
+def test_checkin_coverage_uses_resolved_business_fields_instead_of_agent_contracts():
+    from datetime import datetime, timezone
+
+    from agents_platform.assignment_router import coverage_packet
+
+    plan = AssignmentPlan(
+        status="ready",
+        summary="Check in",
+        steps=[
+            {
+                "kind": "check_in",
+                "assignment": {
+                    "case_id": str(UUID(int=3)),
+                    "client_contact_id": str(UUID(int=1)),
+                    "scheduled_at": datetime.now(timezone.utc).isoformat(),
+                    "objective": "Check in with Jordan",
+                },
+            }
+        ],
+    )
+    packet = coverage_packet(
+        {
+            "description": "Check in with Jordan in two minutes",
+            "contacts": [{"id": str(UUID(int=1)), "name": "Jordan"}],
+            "capabilities": [{"assignment_schema": {"required": ["message"]}}],
+        },
+        plan,
+    )
+    work = packet["validated_work"][0]
+    assert work["message_to_client"] and work["client"] == "Jordan"
+    assert work["task_title"] == "Check in with Jordan" and work["recurring"] is False
+    assert "capabilities" not in packet and "assignment_schema" not in str(packet)
+    assert packet["technical_schema_validation"] == "PASSED"

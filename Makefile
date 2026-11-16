@@ -34,3 +34,22 @@ test:
 
 smoke:
 	RUN_INTEGRATION_TESTS=1 pytest -m integration
+
+.PHONY: observability-up observability-down trace-demo
+observability-up:
+	python scripts/setup_observability.py
+	docker compose --env-file .env.observability -f compose.observability.yaml up -d
+
+observability-down:
+	docker compose --env-file .env.observability -f compose.observability.yaml down
+
+trace-demo:
+	python examples/observability_demo.py
+
+.PHONY: hospital-demo
+hospital-demo:
+	python examples/hospital_response_demo.py
+
+.PHONY: communication-demo
+communication-demo:
+	python examples/communication_demo.py

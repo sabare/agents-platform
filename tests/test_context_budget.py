@@ -160,3 +160,64 @@ def test_retrieval_dates_require_timezone_order_and_unknown_scope_is_forbidden()
     ]:
         with pytest.raises(ValidationError):
             RetrievalRequest(question="Where is the MRI?", **extra)
+
+
+def test_boundary_packing_rechecks_the_wrapped_request_before_failing():
+    # UUID-heavy history has significant JSON message escaping overhead. The old
+    # single pass accepted the object size then rejected its larger message envelope.
+    from uuid import UUID
+
+    from pydantic import TypeAdapter
+
+    from agents_platform.context import dumps, pack_context, tokens
+
+    context = {
+        "task": {"id": "task", "objective": "Collect outstanding notes"},
+        "memory": {"operational_items": [{"kind": "OBLIGATION", "text": "Keep this rule"}]},
+        "history": {
+            "retrieval": {
+                "results": [
+                    {
+                        "source_id": str(UUID(int=i + 1)),
+                        "text": 'The note says "received" and "pending". ' * 5,
+                        "metadata": {"status": "WAITING", "record_type": "RECORDS"},
+                    }
+                    for i in range(90)
+                ]
+            }
+        },
+    }
+    value = data(context)
+    reserve = (
+        tokens(value.agent.instructions)
+        + tokens({"tools": [], "output": TypeAdapter(value.agent.output_type).json_schema()})
+        + 1024
+    )
+    limit = reserve + tokens(pack_context(context, 100000)) + 600
+    settings = Settings(_env_file=None, context_input_tokens=limit)
+    original = json.loads(json.dumps(context))
+    initial = pack_context(context, limit - reserve - 64 - 1 - 512)
+    old_estimate = reserve + tokens([{"role": "user", "content": dumps(initial)}]) + 64
+    assert old_estimate > limit  # The former single-pass filter rejected this input.
+    budget = ModelBudget(context, settings)
+    result = budget.filter(value)
+    packed = json.loads(result.input[0]["content"])
+    assert packed["memory"] == original["memory"]
+    assert packed["task"] == original["task"]
+    assert len(packed["history"]["retrieval"]["results"]) < 90
+    assert reserve + tokens(result.input) + 64 <= limit
+    assert context == original
+    assert budget.report()["failure"] is None
+    assert dumps(packed)
+
+
+def test_unfit_mandatory_context_reports_sizes_without_dumping_values():
+    context = {"task": {"objective": "Private required information " * 5000}}
+    budget = ModelBudget(context, Settings(_env_file=None))
+    with pytest.raises(ContextBudgetExceeded):
+        budget.filter(data(context))
+    failure = budget.report()["failure"]
+    assert failure["reason_code"] == "ESSENTIAL_INPUT_EXCEEDS_BUDGET"
+    assert failure["over_budget_tokens"] > 0
+    assert failure["snapshot_section_tokens"]["task"] > 12000
+    assert "Private" not in json.dumps(failure)

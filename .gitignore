@@ -12,3 +12,5 @@ dist/
 *.db-wal
 work/
 .hallmark/
+
+.env.observability

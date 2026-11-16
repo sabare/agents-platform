@@ -70,11 +70,13 @@ def mock_plan(monkeypatch, steps=None, status="ready"):
     monkeypatch.setattr(routing, "interpret_description", interpret)
 
 
-def propose(client, f):
+def propose(
+    client, f, description="Collect records from Example Hospital and check in with the client"
+):
     return client.post(
         base(f) + "/plan",
         headers=AUTH,
-        json={"description": "Collect records and check in with the client"},
+        json={"description": description},
     )
 
 
@@ -240,7 +242,7 @@ async def test_multi_hospital_plan_delegates_separate_specialists(setup, databas
         }
     )
     mock_plan(monkeypatch, [step])
-    draft = propose(client, f).json()
+    draft = propose(client, f, "Collect records from Example Hospital and Second Hospital").json()
     assert approve(client, f, draft).status_code == 200
     db, worker = runtime(database_url)
     try:
@@ -281,3 +283,138 @@ def test_old_unverified_plan_requires_new_review_before_approval(setup, database
     response = approve(client, f, draft)
     assert response.status_code == 409 and "Review the description again" in response.text
     assert count(database_url, "tasks", f) == 0
+
+
+def test_unknown_provider_cannot_be_substituted_even_when_both_models_accept(
+    setup, database_url, monkeypatch
+):
+    client, f, _ = setup
+    mock_plan(monkeypatch, [records(f)])
+    response = client.post(
+        base(f) + "/plan",
+        headers=AUTH,
+        json={"description": "Collect records from Never Listed Hospital."},
+    )
+    assert response.status_code == 200, response.text
+    draft = response.json()
+    assert draft["plan"]["status"] == "needs_clarification"
+    assert draft["plan"]["steps"] == []
+    assert "Example Hospital" in draft["plan"]["questions"][0]
+    assert approve(client, f, draft).status_code == 409
+    assert count(database_url, "outbox_messages", f) == 0
+
+
+def test_provider_name_matching_is_conservative_and_accepts_explicit_all_scope():
+    from uuid import UUID
+
+    contact = {"id": str(UUID(int=2)), "name": "St. Mary's Hospital", "roles": ["MEDICAL_PROVIDER"]}
+    plan = routing.AssignmentPlan(
+        status="ready",
+        summary="Collect",
+        steps=[
+            {
+                "kind": "records",
+                "targets": [
+                    {
+                        "patient_contact_id": str(UUID(int=1)),
+                        "provider_contact_id": contact["id"],
+                        "requirements": [{"record_type": "RECORDS", "all_dates": True}],
+                    }
+                ],
+            }
+        ],
+    )
+    assert not routing.provider_identity_questions(
+        plan, [contact], "Collect from ST MARY'S HOSPITAL"
+    )
+    assert not routing.provider_identity_questions(
+        plan, [contact], "Collect from all listed hospitals"
+    )
+    assert routing.provider_identity_questions(plan, [contact], "Collect from Another Hospital")
+
+
+def test_provider_identity_is_rechecked_before_approval(setup, database_url, monkeypatch):
+    client, f, _ = setup
+    mock_plan(monkeypatch, [records(f)])
+    draft = propose(client, f).json()
+    with connect(database_url) as connection:
+        connection.execute(
+            "UPDATE contacts SET display_name='Different Hospital' WHERE id=%s",
+            (UUID(f["assignment"]["provider_contact_id"]),),
+        )
+    response = approve(client, f, draft)
+    assert response.status_code == 409 and "provider identity" in response.text
+    assert count(database_url, "tasks", f) == 0
+    assert count(database_url, "outbox_messages", f) == 0
+
+
+@pytest.mark.parametrize("recover", [False, True])
+def test_invalid_model_output_has_bounded_correction_and_never_starts_partial_work(
+    setup, database_url, monkeypatch, recover
+):
+    from agents.exceptions import ModelBehaviorError
+
+    client, f, _ = setup
+    calls = []
+
+    async def invalid(settings, context):
+        calls.append(dict(context))
+        if not recover or len(calls) == 1:
+            raise ModelBehaviorError("Invalid plan contract")
+        return routing.AssignmentPlan(
+            status="ready", summary="Collect records", steps=[records(f)]
+        ), {}
+
+    monkeypatch.setattr(routing, "interpret_description", invalid)
+    response = propose(client, f)
+    assert response.status_code == 200, response.text
+    draft = response.json()
+    assert len(calls) == 2 and calls[1]["correction_feedback"]
+    assert draft["plan"]["status"] == ("ready" if recover else "needs_clarification")
+    assert count(database_url, "tasks", f) == 0
+    assert count(database_url, "outbox_messages", f) == 0
+    if not recover:
+        assert draft["plan"]["steps"] == [] and draft["plan"]["questions"]
+        assert approve(client, f, draft).status_code == 409
+
+
+@pytest.mark.parametrize("destination", ["outside@example.com", "https://outside.example/upload"])
+def test_unbound_delivery_cannot_be_approved_even_if_model_summary_disclaims_it(
+    setup, database_url, monkeypatch, destination
+):
+    client, f, _ = setup
+    mock_plan(monkeypatch, [records(f)])
+    response = propose(
+        client, f, f"Collect records from Example Hospital and deliver PDFs to {destination}."
+    )
+    assert response.status_code == 200, response.text
+    draft = response.json()
+    assert draft["plan"]["status"] == "needs_clarification"
+    assert not draft["plan"]["steps"]
+    assert destination in draft["plan"]["questions"][0]
+    assert approve(client, f, draft).status_code == 409
+    assert count(database_url, "tasks", f) == 0
+    assert count(database_url, "outbox_messages", f) == 0
+
+
+def test_destination_can_be_represented_by_a_registered_typed_assignment():
+    import json
+
+    plan = routing.AssignmentPlan(
+        status="ready",
+        summary="Delegate delivery",
+        steps=[
+            {
+                "kind": "agent",
+                "agent_key": "example_delivery",
+                "agent_version": 1,
+                "objective": "Deliver to the approved recipient",
+                "assignment_json": json.dumps({"recipient_email": "outside@example.com"}),
+            }
+        ],
+    )
+    assert not routing.destination_questions(plan, "Deliver to outside@example.com")
+    assert routing.destination_questions(plan, "Deliver to other@example.com")
+    # Putting a destination only in prose does not count as a delivery assignment.
+    plan.steps[0].objective = "Deliver to other@example.com"
+    assert routing.destination_questions(plan, "Deliver to other@example.com")

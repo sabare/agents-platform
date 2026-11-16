@@ -18,6 +18,7 @@ from agents.strict_schema import ensure_strict_json_schema
 from pydantic import AwareDatetime, Field, TypeAdapter, model_validator
 from sqlalchemy import String, exists, func, select
 
+from agents_platform.audit import authorize_tool, cached_result, reject
 from agents_platform.memory_history import (
     MemoryPassage,
     history_filters,
@@ -34,6 +35,8 @@ from agents_platform.models import (
     Task,
     ToolInvocation,
 )
+from agents_platform.observability import observed_tool
+from agents_platform.source_content import model_source_content
 from agents_platform.task_contracts import Contract
 
 
@@ -61,6 +64,28 @@ def clip(text, limit):
 
 
 PLATFORM_INSTRUCTIONS = """
+A disclosed routine timing assumption is not an approval blocker. Keep waiting until
+its saved due time instead of asking the user to confirm it again.
+A routine callback date is scheduling, not a new permission request. Once a source's
+review is resolved, do not reopen it from its historical needs_review flag. Use
+current domain blockers and current memory. Sensitive consent, authorization and
+contact restrictions still apply. A future callback means wait until that time.
+Write operator-facing summaries and questions in plain English. Use short sentences,
+usually two or three at most. Say what happened and what the person needs to do.
+Ask one clear question when blocked. Avoid jargon such as initiate, prerequisite,
+objective revision, approved targets, or provide or identify. Use familiar words.
+The supervisor parent/group task is only the assignment container. It is not a
+medical-records specialist and cannot contact a provider. In supervisor context,
+tasks contains the actual specialist tasks; tasks=[] means none has been created.
+A historical event saying an objective or parent was created is not proof a
+specialist exists. If approved targets are uncovered, propose create_task for
+those target indexes, unless a current rule actually blocks that first request.
+A saved request reference is generated when the specialist sends the first request.
+For approved collection work, if current instructions allow a first request and no
+matching task/request exists, delegate the work. Do not ask the operator for a
+platform-generated reference before creating that task. Reuse matching current work.
+A routine instruction to reuse a request for follow-ups does not itself prove that
+an earlier external request exists. If actual evidence says one exists, respect it.
 The operator-approved task.objective defines the work to accomplish, subject to current
 rules and restrictions. Address its information requests as well as the domain workflow.
 If a requested historical detail is absent from the starting context, use retrieve_context
@@ -150,6 +175,7 @@ class ModelBudget:
         self.calls = []
         self.compacted = 0
         self.selections = []
+        self.failure = None
 
     def filter(self, data):
         # Count instructions, messages, function schemas and structured-output schema,
@@ -164,6 +190,7 @@ class ModelBudget:
         reserve = tokens(data.model_data.instructions or "") + tokens(schema) + 1024
         items = copy.deepcopy(data.model_data.input)
         if reserve >= self.limit:
+            self.failure = {"reason_code": "SCHEMAS_EXCEED_BUDGET", "reserve_tokens": reserve}
             raise ContextBudgetExceeded("Instructions and schemas exceed the model-input budget")
         # Locate read-only results without changing call/output pairing.
         retrieval_calls = {
@@ -186,7 +213,20 @@ class ModelBudget:
                 other = tokens(items[1:]) + 64 * len(items)
                 available = max(0, self.limit - reserve - other - 512)
                 packed = pack_context(self.context, available)
-                items[0]["content"] = dumps(packed)
+                # Packing counts the context object; the final estimate also counts
+                # its message envelope and escaped JSON. Recheck that exact envelope
+                # and reclaim more optional history before declaring essential overflow.
+                while True:
+                    items[0]["content"] = dumps(packed)
+                    estimate = reserve + tokens(items) + 64 * len(items)
+                    if estimate <= self.limit:
+                        break
+                    if available == 0:
+                        break  # Only mandatory state remains; never truncate controls.
+                    available = max(
+                        0, min(available - 128, tokens(packed) - (estimate - self.limit) - 128)
+                    )
+                    packed = pack_context(self.context, available)
             estimate = reserve + tokens(items) + 64 * len(items)
             if estimate <= self.limit:
                 break
@@ -212,15 +252,24 @@ class ModelBudget:
                 }
             )
         if estimate > self.limit:
-            raise ContextBudgetExceeded(
-                "Essential state or tool history cannot fit; operator review required"
-            )
+            self.failure = {
+                "reason_code": "ESSENTIAL_INPUT_EXCEEDS_BUDGET",
+                "reserve_tokens": reserve,
+                "message_tokens": tokens(items),
+                "estimated_input_tokens": estimate,
+                "over_budget_tokens": estimate - self.limit,
+                "snapshot_section_tokens": {key: tokens(value) for key, value in packed.items()}
+                if has_snapshot
+                else {},
+            }
+            raise ContextBudgetExceeded("Required model input exceeds the configured token budget")
         self.calls.append(estimate)
         return ModelInputData(input=items, instructions=data.model_data.instructions)
 
     def report(self):
         return {
             "input_limit": self.limit,
+            "failure": self.failure,
             "estimated_input_tokens_per_call": self.calls,
             "compacted_retrieval_outputs": self.compacted,
             "selections_per_call": self.selections,
@@ -260,6 +309,7 @@ class RetrievalService:
             select(Case.id).where(Case.tenant_id == self.tenant_id, Case.id == self.case_id)
         )
         if not case:
+            reject("CASE_SCOPE_DENIED")
             raise ValueError("Case not found")
         if provider_id and not await session.scalar(
             select(CaseContact.id).where(
@@ -269,7 +319,9 @@ class RetrievalService:
                 CaseContact.roles.contains(["MEDICAL_PROVIDER"]),
             )
         ):
+            reject("PROVIDER_SCOPE_DENIED")
             raise ValueError("Provider is not a medical provider in this case")
+        await authorize_tool(session, policy_version="case-retrieval.v1", transactional=False)
 
     async def event_ids(self, session, source_id):
         return [
@@ -417,11 +469,12 @@ class RetrievalService:
                 else []
             )
         if not row:
+            reject("EVIDENCE_SCOPE_DENIED")
             return {"error": "Evidence not found in this case"}
         source, digest = row
         if request.expected_hash and request.expected_hash != digest:
             return {"error": "Evidence changed; retrieve it again", "source_id": str(source.id)}
-        text = dumps(source.content)
+        text = dumps(model_source_content(source))
         if request.offset > len(text):
             return {"error": "Offset is beyond this source"}
         packet = {
@@ -478,14 +531,17 @@ class ExecutionRetrieval:
             select(Task).where(Task.tenant_id == self.run.tenant_id, Task.id == self.run.task_id)
         )
         if not current or current.attempt != self.run.attempt or current.outcome_json is not None:
+            reject("STALE_EXECUTION")
             raise ValueError("Execution is no longer active")
         if "expected_version" in self.context and task.version != self.context["expected_version"]:
+            reject("STALE_EXECUTION")
             raise ValueError("Task changed; a fresh activation is required")
 
     async def invoke(self, name, raw):
         # SDK may invoke tools concurrently. One bounded stream per activation.
         async with self.lock:
             if self.calls >= self.settings.context_retrieval_calls:
+                reject("TOOL_BUDGET_EXCEEDED")
                 return dumps(
                     {
                         "error": "Context request limit reached; use existing evidence "
@@ -507,6 +563,7 @@ class ExecutionRetrieval:
                     )
                 )
             if saved:
+                cached_result()
                 result = saved.result_json
             else:
                 try:
@@ -563,7 +620,7 @@ class ExecutionRetrieval:
                     name=name,
                     description=description,
                     params_json_schema=ensure_strict_json_schema(contract.model_json_schema()),
-                    on_invoke_tool=invoke,
+                    on_invoke_tool=observed_tool(name, invoke),
                 )
             )
         return result

@@ -75,7 +75,7 @@ class TaskWorkflow:
             trigger = "event"
             if outcome["status"] == "CONTINUE" or self.woken:
                 pass
-            elif outcome["status"] == "WAITING":
+            elif outcome["status"] == "WAITING" and outcome.get("wake_at"):
                 seconds = max(
                     0, (datetime.fromisoformat(outcome["wake_at"]) - workflow.now()).total_seconds()
                 )

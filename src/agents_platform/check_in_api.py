@@ -153,7 +153,7 @@ async def ensure_monitor(session, tenant_id, case_id):
         tenant_id=tenant_id,
         case_id=case_id,
         group_task_id=group.id,
-        agent_version=3 if await session.get(AgentVersion, ("case_supervisor", 3)) else 2,
+        agent_version=5 if await session.get(AgentVersion, ("case_supervisor", 5)) else 3,
         workflow_id=f"firm/{tenant_id}/case/{case_id}/supervisor",
         objective_json={
             "objective": "Monitor client reports and surface meaningful changes for the firm.",
@@ -254,7 +254,7 @@ async def create_check_in_in_transaction(
         )
         if not parent:
             raise HTTPException(422, "Parent must be an open grouping task in this case")
-    if not await session.get(AgentVersion, ("client_check_in", 1)) or not await session.get(
+    if not await session.get(AgentVersion, ("client_check_in", 2)) or not await session.get(
         AgentVersion, ("case_supervisor", 1)
     ):
         raise HTTPException(
@@ -271,7 +271,7 @@ async def create_check_in_in_transaction(
         task_type="client.check_in",
         objective=body.objective,
         agent_key="client_check_in",
-        agent_version=1,
+        agent_version=2,
         input_schema="check_in_assignment.v1",
         input_json={"check_in_id": str(check_in_id)},
         progress_json={},

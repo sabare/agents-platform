@@ -445,12 +445,14 @@ async def test_essential_context_overflow_blocks_specialist_without_sending(setu
     worker.settings.context_input_tokens = 2048
     try:
         outcome = await worker.execute_task(activation(fixture, task))
-        assert outcome["status"] == "BLOCKED"
+        assert outcome["status"] == "FAILED"
         async with database.sessions() as session:
             run = await session.scalar(
                 select(Execution).where(Execution.task_id == UUID(task["id"]))
             )
             assert run.usage_json["context_budget_exceeded"]
+            assert run.error_type == "ContextBudgetExceeded"
+            assert run.status == "FAILED"
             assert not await session.scalar(
                 select(ToolInvocation.id).where(ToolInvocation.task_id == UUID(task["id"]))
             )

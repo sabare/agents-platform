@@ -31,6 +31,8 @@ from agents_platform.models import (
     Source,
     Task,
 )
+from agents_platform.observability import observation
+from agents_platform.source_content import text_source_content
 
 PROFILE = "text-embedding-3-small:1536:v1"
 LOG = logging.getLogger(__name__)
@@ -47,22 +49,44 @@ def source_hash():
 
 def passages(content):
     # Boundaries and overlap are explicit, reproducible and small enough for the demo.
-    text = json.dumps(content, ensure_ascii=False, sort_keys=True)
+    text = json.dumps(text_source_content(content), ensure_ascii=False, sort_keys=True)
     return [text[i : i + 1600] for i in range(0, len(text), 1400)]
 
 
 async def embed(texts, settings):
     if settings.agent_mode != "openai" or not os.getenv("OPENAI_API_KEY"):
         return None, 0
-    async with AsyncOpenAI(timeout=20, max_retries=0) as client:
-        result = await client.embeddings.create(
-            model="text-embedding-3-small",
-            dimensions=1536,
-            input=texts,
+    with observation(
+        "llm.embedding",
+        ai=True,
+        kind="embedding",
+        attributes={
+            "langfuse.observation.model.name": "text-embedding-3-small",
+            "gen_ai.request.model": "text-embedding-3-small",
+            "gen_ai.provider.name": "openai",
+            "context.item_count": len(texts),
+            "langfuse.observation.input": json.dumps({"text": "[REDACTED]"}),
+        },
+    ) as current:
+        async with AsyncOpenAI(timeout=20, max_retries=0) as client:
+            result = await client.embeddings.create(
+                model="text-embedding-3-small",
+                dimensions=1536,
+                input=texts,
+            )
+        current.set_attribute("gen_ai.usage.input_tokens", result.usage.total_tokens)
+        current.set_attribute(
+            "langfuse.observation.usage_details",
+            json.dumps(
+                {
+                    "input": result.usage.total_tokens,
+                    "total": result.usage.total_tokens,
+                }
+            ),
         )
-    return [
-        d.embedding for d in sorted(result.data, key=lambda d: d.index)
-    ], result.usage.total_tokens
+        return [
+            d.embedding for d in sorted(result.data, key=lambda d: d.index)
+        ], result.usage.total_tokens
 
 
 async def cached_query(session, tenant_id, case_id, query):
@@ -352,7 +376,9 @@ async def refresh_summary(session, tenant_id, case_id):
                 "source_hash": h,
                 "kind": s.kind,
                 "recorded_at": s.created_at.isoformat(),
-                "excerpt": json.dumps(s.content, ensure_ascii=False, sort_keys=True)[:280],
+                "excerpt": json.dumps(
+                    text_source_content(s.content), ensure_ascii=False, sort_keys=True
+                )[:280],
             }
             for s, h in reversed(rows)
         ],

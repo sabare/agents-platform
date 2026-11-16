@@ -453,8 +453,8 @@ async def test_builtin_factory_delegation_deduplicates_and_checks_contacts(setup
         case_id=UUID(fixture["assignment"]["case_id"]),
         parent_task_id=UUID(group),
         objective="Collect approved records",
-        agent_version=3,
-        actor_ref="agent/case_supervisor/3",
+        agent_version=5,
+        actor_ref="agent/case_supervisor/4",
     )
     payload = {
         key: fixture["assignment"][key]

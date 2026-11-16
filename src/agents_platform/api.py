@@ -16,8 +16,11 @@ from temporalio.client import WorkflowExecutionStatus
 from temporalio.service import RPCError, RPCStatusCode
 
 from agents_platform.assignment_router import router as assignment_router
+from agents_platform.audit import audit_scope, make_event, persist
+from agents_platform.audit_api import router as audit_router
 from agents_platform.check_in_api import router as check_in_router
 from agents_platform.check_in_series import router as series_router
+from agents_platform.communications import router as communications_router
 from agents_platform.config import Settings, get_settings
 from agents_platform.dashboard import router as dashboard_router
 from agents_platform.db import Database
@@ -25,11 +28,13 @@ from agents_platform.human_requests import router as human_router
 from agents_platform.memory_api import router as memory_router
 from agents_platform.models import Task
 from agents_platform.monthly_check_ins import router as monthly_router
+from agents_platform.observability import SpanKind, configure_observability, observation
 from agents_platform.operations import monitor_loop
 from agents_platform.operations import router as operations_router
 from agents_platform.orchestration.client import connect_temporal
 from agents_platform.orchestration.contracts import ProbeInput, ProbeResult
 from agents_platform.orchestration.workflows import InfrastructureProbe
+from agents_platform.provider_responses import router as provider_response_router
 from agents_platform.recovery import router as recovery_router
 from agents_platform.supervisor_api import router as supervisor_router
 from agents_platform.task_api import router as task_router
@@ -49,6 +54,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         configure_logging(settings.log_level)
         app.state.settings = settings
+        app.state.observability = configure_observability(settings, "api")
         app.state.database = Database(settings.database_url)
         app.state.temporal = None
         # Clients connect lazily so liveness/docs remain available during an outage.
@@ -61,12 +67,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             with suppress(asyncio.CancelledError):
                 await monitor
             await app.state.database.close()
+            await asyncio.to_thread(app.state.observability.shutdown)
 
     app = FastAPI(title="HelloCounsel Agents Platform", version="0.1.0", lifespan=lifespan)
+    app.include_router(audit_router)
     app.include_router(operations_router)
     app.include_router(task_router)
     app.include_router(assignment_router)
     app.include_router(recovery_router)
+    app.include_router(provider_response_router)
+    app.include_router(communications_router)
     app.include_router(human_router)
     app.include_router(check_in_router)
     app.include_router(series_router)
@@ -79,10 +89,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def correlated_request(request: Request, call_next):
         request_id = str(uuid4())
         started = time.monotonic()
-        with log_context(request_id=request_id):
+        with (
+            log_context(request_id=request_id),
+            audit_scope(request.app.state.database, request_id=request_id),
+            observation("http.request", span_kind=SpanKind.SERVER) as span,
+        ):
+            span.set_attribute("http.request.method", request.method)
             try:
                 response = await call_next(request)
             except Exception as exc:
+                if request.url.path.startswith("/v1/"):
+                    await persist(
+                        request.app.state.database,
+                        make_event(
+                            event_type="action.result",
+                            actor_ref=getattr(request.state, "audit_actor", "anonymous"),
+                            action=request.method
+                            + " "
+                            + getattr(request.scope.get("route"), "path", "unmatched"),
+                            outcome="FAILED",
+                            reason_code="REQUEST_ERROR",
+                            details={"error_type": type(exc).__name__},
+                        ),
+                    )
                 emit(
                     "http.failed",
                     logging.ERROR,
@@ -92,6 +121,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     task_id=request.path_params.get("task_id"),
                 )
                 raise
+            span.set_attribute("http.response.status_code", response.status_code)
+            span.set_attribute(
+                "http.route", getattr(request.scope.get("route"), "path", "unmatched")
+            )
+            if response.status_code >= 400 and request.url.path.startswith("/v1/"):
+                # The request dependency's context is isolated by Starlette's task.
+                # Use route identities directly; never persist request bodies/credentials.
+                identity = {}
+                for key in ("tenant_id", "case_id", "task_id"):
+                    try:
+                        identity[key] = UUID(str(request.path_params[key]))
+                    except (KeyError, ValueError):
+                        pass
+                await persist(
+                    request.app.state.database,
+                    make_event(
+                        event_type="action.result",
+                        actor_ref=getattr(request.state, "audit_actor", "anonymous"),
+                        action=request.method
+                        + " "
+                        + getattr(request.scope.get("route"), "path", "unmatched"),
+                        outcome="REJECTED" if response.status_code < 500 else "FAILED",
+                        reason_code="HTTP_REJECTED"
+                        if response.status_code < 500
+                        else "REQUEST_ERROR",
+                        details={"status_code": response.status_code},
+                        **identity,
+                    ),
+                )
             params = request.path_params
             case_id, workflow_id = params.get("case_id"), None
             if params.get("task_id") and response.status_code < 400:
@@ -133,7 +191,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/", include_in_schema=False)
     async def dashboard():
-        return FileResponse(static / "index.html")
+        return FileResponse(static / "index.html", headers={"Cache-Control": "no-cache"})
 
     async def temporal_client(request: Request):
         async with request.app.state.temporal_lock:

@@ -13,7 +13,7 @@ class Contract(BaseModel):
 
 
 class RecordRequirementInput(Contract):
-    record_type: Literal["RECORDS", "BILLS", "IMAGING"]
+    record_type: Literal["RECORDS", "BILLS", "IMAGING", "SURGICAL_NOTES"]
     all_dates: bool
     from_date: date | None = None
     through_date: date | None = None
@@ -35,7 +35,8 @@ class CreateRecordsTask(Contract):
     parent_task_id: UUID | None = None
     patient_contact_id: UUID
     provider_contact_id: UUID
-    agent_version: int = Field(default=3, gt=0)
+    agent_version: int = Field(default=5, gt=0)
+    reminder_interval_seconds: int = Field(default=3600, ge=10, le=604800)
     objective: str = Field(min_length=1, max_length=2000)
     requirements: list[RecordRequirementInput] = Field(min_length=1, max_length=20)
 

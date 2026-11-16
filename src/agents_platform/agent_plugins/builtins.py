@@ -100,17 +100,17 @@ async def create_check_in(session, scope, assignment, key):
 
 CAPABILITIES = (
     AgentCapability(
-        definition=load_definition("medical_records_collector", 3),
+        definition=load_definition("medical_records_collector", 5),
         adapter=MedicalRecordsAdapter(),
         assignment_type=RecordsAssignment,
         description=(
-            "Collect specified medical records, bills or imaging from a case provider. "
+            "Collect medical records, surgical notes, bills or imaging from a case provider. "
             "Requires explicit patient, provider and document/date scope; do not invent it."
         ),
         create_task=create_records,
     ),
     AgentCapability(
-        definition=load_definition("client_check_in", 1),
+        definition=load_definition("client_check_in", 2),
         adapter=ClientCheckInAdapter(),
         assignment_type=CheckInAssignment,
         description=(

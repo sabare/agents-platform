@@ -69,6 +69,7 @@ class DomainValidation:
     replan_reason: str | None = None
     rejected: bool = False
     notify_supervisor: bool = True
+    wait_for_event: bool = False
 
 
 class DomainAdapter(Protocol):

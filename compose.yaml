@@ -1,13 +1,25 @@
 name: agents-platform
 
 x-app: &app
+  image: agents-platform-app:local
   build: .
-  environment:
-    DATABASE_URL: postgresql+psycopg://agents:agents@postgres:5432/agents
+  environment: &app-env
+    DATABASE_URL: postgresql+psycopg://${DATABASE_APP_USER:-agents_app}:${DATABASE_APP_PASSWORD:-local-app-only}@postgres:5432/agents
     TEMPORAL_ADDRESS: temporal:7233
     TEMPORAL_NAMESPACE: default
     TEMPORAL_TASK_QUEUE: agents-platform
     LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    OTEL_ENABLED: ${OTEL_ENABLED:-false}
+    OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_DOCKER_ENDPOINT:-http://host.docker.internal:4318}
+    OTEL_ENVIRONMENT: ${OTEL_ENVIRONMENT:-local}
+    SERVICE_VERSION: ${SERVICE_VERSION:-0.1.0}
+    JAEGER_UI_URL: http://localhost:16686
+    LANGFUSE_BASE_URL: ${LANGFUSE_DOCKER_URL:-http://host.docker.internal:3000}
+    LANGFUSE_UI_URL: http://localhost:3000
+    LANGFUSE_PROJECT_ID: hellocounsel-agents
+    LANGFUSE_CONTENT_MODE: ${LANGFUSE_CONTENT_MODE:-redacted}
+    LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+    LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
     OPS_POLL_SECONDS: ${OPS_POLL_SECONDS:-15}
     OPS_OUTBOX_AGE_SECONDS: ${OPS_OUTBOX_AGE_SECONDS:-60}
     OPS_WORKER_DELAY_SECONDS: ${OPS_WORKER_DELAY_SECONDS:-120}
@@ -20,6 +32,7 @@ x-app: &app
     CONTEXT_INPUT_TOKENS: ${CONTEXT_INPUT_TOKENS:-12000}
     CONTEXT_OUTPUT_TOKENS: ${CONTEXT_OUTPUT_TOKENS:-1500}
     CONTEXT_RETRIEVAL_CALLS: ${CONTEXT_RETRIEVAL_CALLS:-4}
+    DEMO_ASSUME_ROUTINE_UPDATES: ${DEMO_ASSUME_ROUTINE_UPDATES:-false}
     DEMO_FOLLOW_UP_SECONDS: ${DEMO_FOLLOW_UP_SECONDS:-30}
     DEMO_MAX_ACTIVATIONS: ${DEMO_MAX_ACTIVATIONS:-6}
 
@@ -62,7 +75,12 @@ services:
 
   migrate:
     <<: *app
-    command: ["alembic", "upgrade", "head"]
+    environment:
+      <<: *app-env
+      DATABASE_URL: postgresql+psycopg://agents:agents@postgres:5432/agents
+      DATABASE_APP_USER: ${DATABASE_APP_USER:-agents_app}
+      DATABASE_APP_PASSWORD: ${DATABASE_APP_PASSWORD:-local-app-only}
+    command: ["sh", "-c", "alembic upgrade head && python -m agents_platform.audit_roles"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -84,7 +102,7 @@ services:
 
   worker:
     <<: *app
-    command: ["agents-worker"]
+    command: ["python", "-m", "agents_platform.orchestration.worker"]
     depends_on:
       migrate:
         condition: service_completed_successfully
